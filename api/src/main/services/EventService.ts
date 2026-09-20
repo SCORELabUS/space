@@ -9,6 +9,8 @@ import { createClient } from 'redis';
  */
 class EventService {
   private io: SocketIOServer | null = null;
+  private pubClient?: ReturnType<typeof createClient>;
+  private subClient?: ReturnType<typeof createClient>;
 
   /**
    * Inicializa el servicio de eventos con un servidor HTTP.
@@ -25,13 +27,25 @@ class EventService {
     });
 
     // Configuración del adaptador Redis para Socket.IO
-    // const pubClient = createClient({ url: process.env.REDIS_URL });
-    // const subClient = pubClient.duplicate();
-    // await pubClient.connect();
-    // await subClient.connect();
-    // this.io.adapter(createAdapter(pubClient, subClient));
+    if (process.env.REDIS_URL) {
+      this.pubClient = createClient({ url: process.env.REDIS_URL });
+      this.subClient = this.pubClient.duplicate();
+      this.pubClient.on('error', error => console.error('Event publisher', error.message));
+      this.subClient.on('error', error => console.error('Event subscriber', error.message));
+      await Promise.all([this.pubClient.connect(), this.subClient.connect()]);
+      this.io.adapter(createAdapter(this.pubClient, this.subClient, {
+        key: process.env.REDIS_SOCKET_KEY ?? 'space:socket.io'
+      }));
+    }
 
     this.setupEventHandlers();
+  }
+
+  async close() {
+    if (this.io) await new Promise<void>(resolve => this.io!.close(() => resolve()));
+    this.io = null;
+    if (this.pubClient?.isOpen) await this.pubClient.quit();
+    if (this.subClient?.isOpen) await this.subClient.quit();
   }
 
   /**

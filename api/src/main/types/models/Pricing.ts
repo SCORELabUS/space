@@ -49,6 +49,7 @@ export interface LeanPricingFeature {
 }
 
 export interface LeanUsageLimit {
+  unit?: string;
   name: string;
   description?: string;
   valueType: "BOOLEAN" | "NUMERIC";

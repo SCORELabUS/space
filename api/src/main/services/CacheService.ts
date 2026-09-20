@@ -1,14 +1,25 @@
 import dotenv from 'dotenv';
-import { RedisClientType } from 'redis';
+import { createClient } from 'redis';
+type CacheClient = ReturnType<typeof createClient>;
 dotenv.config();
 
 class CacheService {
-  private redisClient: RedisClientType | null = null;
+  private redisClient: CacheClient | null = null;
+  private readonly namespace = (process.env.REDIS_KEY_PREFIX ?? 'space:').replace(/:$/, '') + ':';
 
   constructor() {}
 
-  setRedisClient(client: RedisClientType) {
+  setRedisClient(client: CacheClient) {
     this.redisClient = client;
+  }
+
+  private key(value: string) {
+    return `${this.namespace}${value.toLowerCase()}`;
+  }
+
+  async close() {
+    if (this.redisClient?.isOpen) await this.redisClient.quit();
+    this.redisClient = null;
   }
 
   // --- Serialization Helpers ---
@@ -41,7 +52,7 @@ class CacheService {
       throw new Error('Redis client not initialized');
     }
 
-    const value = await this.redisClient?.get(key.toLowerCase());
+    const value = await this.redisClient?.get(this.key(key));
 
     // AÑADIDO: Pasamos this.reviver como segundo argumento
     return value ? JSON.parse(value, this.reviver) : null;
@@ -55,14 +66,14 @@ class CacheService {
     // AÑADIDO: Serializamos usando el replacer para comparar y para guardar
     const stringValue = JSON.stringify(value, this.replacer);
 
-    const previousValue = await this.redisClient?.get(key.toLowerCase());
+    const previousValue = await this.redisClient?.get(this.key(key));
     
     // Comparamos contra el stringValue generado con nuestro replacer
     if (previousValue && previousValue !== stringValue && !replaceIfExists) {
       throw new Error('Value already exists in cache, please use a different key.');
     }
 
-    await this.redisClient?.set(key.toLowerCase(), stringValue, {
+    await this.redisClient?.set(this.key(key), stringValue, {
       EX: expirationInSeconds,
     });
   }
@@ -72,11 +83,11 @@ class CacheService {
       throw new Error('Redis client not initialized');
     }
 
-    const normalizedPattern = keyLocationPattern.toLowerCase().replace(/\*\*/g, '*');
+    const normalizedPattern = this.key(keyLocationPattern.replace(/\*\*/g, '*'));
     const keys: string[] = [];
 
     for await (const key of this.redisClient.scanIterator({ MATCH: normalizedPattern })) {
-      keys.push(key as string);
+      keys.push((key as string).slice(this.namespace.length));
     }
 
     return keys;
@@ -88,13 +99,13 @@ class CacheService {
     }
 
     if (key.endsWith('.*')) {
-      const pattern = key.toLowerCase().slice(0, -2);
+      const pattern = this.key(key.slice(0, -2));
       const keysToDelete = await this.redisClient.keys(`${pattern}*`);
       if (keysToDelete.length > 0) {
         await this.redisClient.del(keysToDelete);
       }
     } else {
-      await this.redisClient.del(key.toLowerCase());
+      await this.redisClient.del(this.key(key));
     }
   }
 
@@ -111,14 +122,14 @@ class CacheService {
 
     // Separate keys with patterns from exact keys
     const patternKeys = keys.filter(k => k.endsWith('.*'));
-    const exactKeys = keys.filter(k => !k.endsWith('.*')).map(k => k.toLowerCase());
+    const exactKeys = keys.filter(k => !k.endsWith('.*')).map(k => this.key(k));
 
     // Process exact keys
     exactKeys.forEach(key => keysToDelete.add(key));
 
     // Process pattern keys in a single batch
     if (patternKeys.length > 0) {
-      const patterns = patternKeys.map(k => k.toLowerCase().slice(0, -2));
+      const patterns = patternKeys.map(k => this.key(k.slice(0, -2)));
 
       for (const pattern of patterns) {
         const matchedKeys = await this.redisClient.keys(`${pattern}*`);

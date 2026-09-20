@@ -134,3 +134,6 @@ If you have used the default configuration, i.e. you executed `pnpm run dev:setu
 
 > **DISCLAIMER**
 > This tool is part of ongoing research by the [ISA group](https://github.com/isa-group) in pricing-driven development and operation of SaaS. It is in a **very early stage** and is not intended for production use. The ISA group does not accept responsibility for any issues or damages that may arise from its use in real-world environments
+### Public SPHERE pricing synchronization
+
+Create a service from a SPHERE permanent pricing link and choose how new public versions affect contracts. See [configuration, policies, recovery, retention and testing](docs/sphere-synchronization.md). The periodic worker is opt-in through `SPHERE_SYNC_ENABLED=true`; manual synchronization is also available.

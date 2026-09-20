@@ -1,3 +1,7 @@
+import ServiceModel from '../repositories/mongoose/models/ServiceMongoose';
+import ContractModel from '../repositories/mongoose/models/ContractMongoose';
+import { withOrganizationLock } from './sphere/lock';
+import { enforceSpherePolicy } from './sphere/contractPolicy';
 import container from '../config/container';
 import {
   ContractToCreate,
@@ -36,6 +40,26 @@ class ContractService {
     this.contractRepository = container.resolve('contractRepository');
     this.serviceService = container.resolve('serviceService');
     this.cacheService = container.resolve('cacheService');
+    // Serialize binding mutations with synchronization. Consumption uses conditional atomic writes separately.
+    for (const method of ['create', 'novate', 'novateByGroupId', 'renew', 'destroy', 'novateUserContact', 'novateBillingPeriod', 'novateBillingPeriodByGroupId', 'resetUsageLevels', '_revertExpectedConsumption'] as const) {
+      const original = (this[method] as (...args: any[]) => Promise<any>).bind(this);
+      (this as any)[method] = async (...args: any[]) => {
+        const contract: any = method === 'create' || method.endsWith('ByGroupId') ? null :
+          await ContractModel.findOne({ 'userContact.userId': args[0] }).lean();
+        const org = method === 'create' ? args[0]?.organizationId : method.endsWith('ByGroupId') ? args[1] : contract?.organizationId;
+        if (!org || !await ServiceModel.exists({ organizationId: org, source: 'sphere' })) return original(...args);
+        return withOrganizationLock(org, async assertOwned => {
+          if (await ServiceModel.exists({ organizationId: org, source: 'sphere', 'sphere.status': 'applying' })) throw new Error('Synchronization is applying; retry shortly');
+          if (contract) await this.cacheService.del(`contracts.${contract.userContact.userId}`);
+          await assertOwned();
+          const result = await original(...args);
+          const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
+          for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
+          return result;
+        });
+      };
+    }
+
   }
 
   async index(queryParams: any, organizationId?: string): Promise<LeanContract[]> {
@@ -110,6 +134,8 @@ class ContractService {
         `CONFLICT: Contract for user ${contractData.userContact.userId} already exists`
       );
     }
+
+    await enforceSpherePolicy(contractData.organizationId, contractData);
 
     const servicesKeys = Object.keys(contractData.contractedServices || {}).map(key =>
       key.toLowerCase()
@@ -204,6 +230,7 @@ class ContractService {
       throw new Error(`Contract with userId ${userId} not found`);
     }
 
+    await enforceSpherePolicy(contract.organizationId, newSubscription, contract);
     await isSubscriptionValid(newSubscription, contract.organizationId);
 
     const newContract = performNovation(contract, newSubscription);
@@ -232,7 +259,8 @@ class ContractService {
     const updatedContracts: LeanContract[] = [];
 
     for (const contract of contracts) {
-      await isSubscriptionValid(newSubscription, contract.organizationId);
+      await enforceSpherePolicy(contract.organizationId, newSubscription, contract);
+    await isSubscriptionValid(newSubscription, contract.organizationId);
       const newContract = performNovation(contract, newSubscription);
       updatedContracts.push(newContract);
     }
@@ -619,9 +647,21 @@ class ContractService {
       throw new Error('PERMISSION ERROR: Only ADMIN users can prune organization contracts');
     }
 
-    const result: number = await this.contractRepository.prune(organizationId);
-
-    return result;
+    const organizations = organizationId ? [organizationId] : await ContractModel.distinct('organizationId');
+    let removed = 0;
+    for (const org of organizations) {
+      const clean = async (assertOwned: () => Promise<void>) => {
+        await assertOwned();
+        removed += await this.contractRepository.prune(org);
+        const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
+        for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
+      };
+      if (await ServiceModel.exists({ organizationId: org, source: 'sphere' })) await withOrganizationLock(org, clean);
+      else await clean(async () => {});
+    }
+    await this.cacheService.del('contracts.*');
+    await this.cacheService.del('features.*');
+    return removed;
   }
 
   async destroy(userId: string): Promise<void> {

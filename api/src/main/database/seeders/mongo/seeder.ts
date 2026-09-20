@@ -12,7 +12,7 @@ const __dirname = path.dirname(__filename);
 
 const config = {
   database: getMongoDBConnectionURI(),
-  dropDatabase: true
+  dropDatabase: false
 };
 
 const seeder = new Seeder(config);
@@ -21,6 +21,10 @@ const collections = seeder.readCollectionsFromPath(path.resolve(__dirname));
 
 export const seedDatabase = async () => {
   try {
+    if (process.env.SEED_RESET_DATABASE === 'true') {
+      const mongoose = (await import('mongoose')).default;
+      if (mongoose.connection.db) await mongoose.connection.db.dropDatabase();
+    }
     await seeder.import(collections);
     // Ensure indexes for all mongoose models after seeding
     await Promise.all([

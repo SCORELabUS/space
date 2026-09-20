@@ -4,7 +4,7 @@
   "description": "SPACE is an open-source project designed to provide a robust and scalable solution for pricing-driven self adaptation.",
   "scripts": {
     "dev": "concurrently \"pnpm run dev:server\" \"pnpm run dev:client\"",
-    "dev:setup": "concurrently \"cd api && pnpm run dev:setup\"",
+    "dev:setup": "bash scripts/dev-setup.sh",
     "dev:setup:test": "cd api && pnpm run dev:setup:test && cd .. && cd frontend && pnpm run dev:setup:test",
     "dev:server": "cd api && pnpm run dev",
     "dev:client": "cd frontend && pnpm run dev",

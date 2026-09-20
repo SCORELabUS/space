@@ -1,3 +1,5 @@
+import SphereSyncRepository from '../repositories/mongoose/SphereSyncRepository';
+import SphereSyncService from '../services/sphere/SphereSyncService';
 // deno-lint-ignore-file no-explicit-any
 import process from "node:process";
 
@@ -45,6 +47,8 @@ function initContainer(databaseType: string): AwilixContainer {
     organizationRepository: asValue(organizationRepository),
     analyticsRepository: asValue(analyticsRepository),
     userService: asClass(UserService).singleton(),
+    sphereSyncRepository: asClass(SphereSyncRepository).singleton(),
+    sphereSyncService: asClass(SphereSyncService).singleton(),
     serviceService: asClass(ServiceService).singleton(),
     cacheService: asClass(CacheService).singleton(),
     contractService: asClass(ContractService).singleton(),

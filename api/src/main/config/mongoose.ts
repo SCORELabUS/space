@@ -25,7 +25,8 @@ const getMongoDBConnectionURI = () => {
     databaseUsername && databasePassword ? databaseUsername + ':' + databasePassword + '@' : '';
 
     
-  const wholeUri = process.env.MONGO_URI || `mongodb://${dbCredentials}localhost:27017/${databaseName}?authSource=${databaseName}`;
+  const authSource = process.env.MONGO_AUTH_SOURCE ?? databaseName;
+  const wholeUri = process.env.MONGO_URI || `mongodb://${dbCredentials}localhost:27017/${databaseName}?authSource=${authSource}`;
 
   console.log("Using MongoDB URI: ", wholeUri);
 
@@ -42,7 +43,7 @@ const initMongoose = () => {
 
 const disconnectMongoose = async () => {
   console.log('Disconnecting from MongoDB');
-  await mongoose.connection.db!.dropDatabase();
+  // The local MongoDB instance is shared. Never erase it on API shutdown.
   return mongoose.disconnect();
 };
 

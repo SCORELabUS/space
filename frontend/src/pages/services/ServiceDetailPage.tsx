@@ -1,3 +1,6 @@
+import SphereSyncPanel from '@/components/services/SphereSyncPanel';
+import { getSynchronization } from '@/api/services/sphereApi';
+import type { SyncState } from '@/api/services/sphereApi';
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import {
@@ -19,6 +22,7 @@ export default function ServiceDetailPage() {
   const { name } = useParams<{ name: string }>();
   const { user } = useAuth();
   const { currentOrganization } = useOrganization();
+  const [syncState, setSyncState] = useState<SyncState | null>(null);
   const [activePricings, setActivePricings] = useState<Pricing[]>([]);
   const [archivedPricings, setArchivedPricings] = useState<Pricing[]>([]);
   const [loading, setLoading] = useState(true);
@@ -48,6 +52,16 @@ export default function ServiceDetailPage() {
     return () => {
       mounted = false;
     };
+  }, [name, user.apiKey, currentOrganization?.id]);
+
+  useEffect(() => {
+    if (!currentOrganization?.id || !name) return;
+    const controller = new AbortController();
+    const refresh = () => getSynchronization(user.apiKey, currentOrganization.id, name, controller.signal)
+      .then(state => { if (!controller.signal.aborted) setSyncState(state); }).catch(() => {});
+    void refresh();
+    const timer = setInterval(refresh, 5000);
+    return () => { clearInterval(timer); controller.abort(); };
   }, [name, user.apiKey, currentOrganization?.id]);
 
   function handleMove(pricing: Pricing, to: 'active' | 'archived' | 'deleted') {
@@ -128,20 +142,21 @@ export default function ServiceDetailPage() {
       {confirmElement}
       <div className="flex items-center justify-between mb-2">
         <h1 className="text-3xl font-bold text-indigo-800 dark:text-gray-100">{name}</h1>
-        <ServiceOptionsMenu
+        {syncState?.source !== 'sphere' && <ServiceOptionsMenu
           onAddVersion={() => setAddVersionOpen(true)}
           onDisableService={handleDisableService}
-        />
+        />}
       </div>
+      {syncState?.source === 'sphere' && currentOrganization && <SphereSyncPanel state={syncState} apiKey={user.apiKey} organizationId={currentOrganization.id} service={name!} onChange={setSyncState} canManage={user.role === 'ADMIN' || currentOrganization.owner === user.username || currentOrganization.members.some(member => member.username === user.username && ['ADMIN', 'MANAGER'].includes(member.role))} />}
       <AddVersionModal
         open={addVersionOpen}
         onClose={handleAddVersionClose}
         serviceName={name ?? ''}
       />
       <p className="text-gray-500 dark:text-gray-300 mb-6">
-        All pricing versions for this service. Drag & drop to archive a pricing.
+        {syncState?.source === 'sphere' ? 'Retained versions are managed automatically by the synchronization policy.' : 'All pricing versions for this service. Drag & drop to archive a pricing.'}
       </p>
-      {loading ? (
+      {syncState?.source === 'sphere' ? <ul className="space-y-2 text-gray-700 dark:text-gray-200">{syncState.retainedVersions.map(v => <li key={v.version} className="rounded-lg border border-gray-200 dark:border-gray-700 p-3">Version {v.version}</li>)}</ul> : loading ? (
         <div className="flex flex-col items-center py-20">
           <motion.div
             animate={{ rotate: 360 }}

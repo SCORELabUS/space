@@ -1,3 +1,4 @@
+import { assertOrganizationLease } from '../../../services/sphere/lock';
 import mongoose, { Schema } from 'mongoose';
 
 const usageLevelSchema = new Schema(
@@ -30,6 +31,7 @@ const contractSchema = new Schema(
     contractedServices: {type: Map, of: String},
     subscriptionPlans: { type: Map, of: String },
     subscriptionAddOns: { type: Map, of: {type: Map, of: Number} },
+    synchronizationHistory: { type: [Schema.Types.Mixed], default: [] },
     history: [{
       startDate: { type: Date, required: true },
       endDate: { type: Date, required: true },
@@ -52,6 +54,11 @@ const contractSchema = new Schema(
 
 // Adding unique index for [name, owner, version]
 contractSchema.index({ 'userContact.userId': 1 }, { unique: true });
+
+// Binding changes and synchronization share a renewable organization lease.
+for (const operation of ['save', 'updateOne', 'updateMany', 'findOneAndUpdate', 'deleteOne', 'deleteMany', 'findOneAndDelete'] as const) {
+  contractSchema.pre(operation, async function () { await assertOrganizationLease(); });
+}
 
 const contractModel = mongoose.model('Contract', contractSchema, 'contracts');
 
