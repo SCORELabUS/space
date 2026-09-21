@@ -1,9 +1,12 @@
+import { SphereSource } from '../../services/sphere/types';
 export interface PricingEntry {
   id?: string;
   url?: string;
 }
 
 export interface LeanService {
+  source?: 'manual' | 'sphere';
+  sphere?: SphereSource;
   id?: string;
   name: string;
   disabled: boolean;

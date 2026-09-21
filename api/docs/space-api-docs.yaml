@@ -103,6 +103,305 @@ tags:
     description: Service health verification (Public)
 
 paths:
+  /services/sphere/preview:
+    post:
+      security:
+        - ApiKeyAuth: []
+      summary: Preview a public SPHERE permanent link
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                permanentUrl:
+                  type: string
+                  format: uri
+                policy:
+                  type: string
+                  enum: [all_last, new_last, all_pick, new_pick]
+                selectedVersionId:
+                  type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereManifest'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
+        "202":
+          description: Synchronization queued
+        "409":
+          description: Synchronization is applying or configuration conflicts
+  /services/{serviceName}/synchronization:
+    get:
+      security:
+        - ApiKeyAuth: []
+      summary: Read or update SPHERE synchronization configuration
+      parameters:
+        - in: path
+          name: serviceName
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereSyncState'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
+        "202":
+          description: Synchronization queued
+        "409":
+          description: Synchronization is applying or configuration conflicts
+    put:
+      security:
+        - ApiKeyAuth: []
+      summary: Read or update SPHERE synchronization configuration
+      parameters:
+        - in: path
+          name: serviceName
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                permanentUrl:
+                  type: string
+                  format: uri
+                policy:
+                  type: string
+                  enum: [all_last, new_last, all_pick, new_pick]
+                selectedVersionId:
+                  type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereSyncState'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
+        "202":
+          description: Synchronization queued
+        "409":
+          description: Synchronization is applying or configuration conflicts
+  /services/{serviceName}/synchronization/run:
+    post:
+      security:
+        - ApiKeyAuth: []
+      summary: Queue synchronization and return persistent status
+      parameters:
+        - in: path
+          name: serviceName
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                permanentUrl:
+                  type: string
+                  format: uri
+                policy:
+                  type: string
+                  enum: [all_last, new_last, all_pick, new_pick]
+                selectedVersionId:
+                  type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereSyncState'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
+        "202":
+          description: Synchronization queued
+        "409":
+          description: Synchronization is applying or configuration conflicts
+  /organizations/{organizationId}/services/sphere/preview:
+    post:
+      security:
+        - ApiKeyAuth: []
+      summary: Preview a public SPHERE permanent link
+      parameters:
+        - in: path
+          name: organizationId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                permanentUrl:
+                  type: string
+                  format: uri
+                policy:
+                  type: string
+                  enum: [all_last, new_last, all_pick, new_pick]
+                selectedVersionId:
+                  type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereManifest'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
+        "202":
+          description: Synchronization queued
+        "409":
+          description: Synchronization is applying or configuration conflicts
+  /organizations/{organizationId}/services/{serviceName}/synchronization:
+    get:
+      security:
+        - ApiKeyAuth: []
+      summary: Read or update SPHERE synchronization configuration
+      parameters:
+        - in: path
+          name: organizationId
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: serviceName
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereSyncState'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
+        "202":
+          description: Synchronization queued
+        "409":
+          description: Synchronization is applying or configuration conflicts
+    put:
+      security:
+        - ApiKeyAuth: []
+      summary: Read or update SPHERE synchronization configuration
+      parameters:
+        - in: path
+          name: organizationId
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: serviceName
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                permanentUrl:
+                  type: string
+                  format: uri
+                policy:
+                  type: string
+                  enum: [all_last, new_last, all_pick, new_pick]
+                selectedVersionId:
+                  type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereSyncState'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
+        "202":
+          description: Synchronization queued
+        "409":
+          description: Synchronization is applying or configuration conflicts
+  /organizations/{organizationId}/services/{serviceName}/synchronization/run:
+    post:
+      security:
+        - ApiKeyAuth: []
+      summary: Queue synchronization and return persistent status
+      parameters:
+        - in: path
+          name: organizationId
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: serviceName
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                permanentUrl:
+                  type: string
+                  format: uri
+                policy:
+                  type: string
+                  enum: [all_last, new_last, all_pick, new_pick]
+                selectedVersionId:
+                  type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereSyncState'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
+        "202":
+          description: Synchronization queued
+        "409":
+          description: Synchronization is applying or configuration conflicts
   /users/authenticate:
     post:
       summary: Authenticate user and obtain API Key
@@ -1406,12 +1705,19 @@ paths:
       requestBody:
         required: true
         content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/SphereCreateService'
+                - type: object
+                  required: [pricing]
+                  properties:
+                    pricing: { type: string, format: uri }
           multipart/form-data:
             schema:
               type: object
               required:
-                - name
-                - description
+                - pricing
               properties:
                 name:
                   type: string
@@ -1921,12 +2227,19 @@ paths:
       requestBody:
         required: true
         content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/SphereCreateService'
+                - type: object
+                  required: [pricing]
+                  properties:
+                    pricing: { type: string, format: uri }
           multipart/form-data:
             schema:
               type: object
               required:
-                - name
-                - description
+                - pricing
               properties:
                 name:
                   type: string
@@ -3616,6 +3929,87 @@ paths:
 
 components:
   schemas:
+    SphereVersion:
+      type: object
+      required: [versionId, version, createdAt, contentHash]
+      properties:
+        versionId: { type: string, pattern: '^[a-f0-9]{24}$' }
+        version: { type: string }
+        createdAt: { type: string, format: date-time }
+        contentHash: { type: string, description: SHA-256 of canonical functional pricing content }
+    SphereConfiguration:
+      type: object
+      required: [permanentUrl, policy]
+      properties:
+        permanentUrl: { type: string, format: uri }
+        policy:
+          type: string
+          enum: [all_last, new_last, all_pick, new_pick]
+          description: All migrates current bindings with cheapest-valid-plan fallback. New preserves them. Last orders public versions by pricing date. Pick requires selectedVersionId.
+        selectedVersionId:
+          type: string
+          description: Required for all_pick and new_pick; immutable public SPHERE version ID.
+        acceptedSyntaxUpgradeVersionId:
+          type: string
+          description: Required only when preview reports a syntax upgrade; must equal that inspected public version ID.
+        pollIntervalMinutes:
+          type: integer
+          enum: [1, 5, 15]
+          default: 5
+          description: How often SPACE checks SPHERE for a newer public version for this linked service.
+    SphereCreateService:
+      allOf:
+        - $ref: '#/components/schemas/SphereConfiguration'
+        - type: object
+          required: [source]
+          properties:
+            source: { type: string, enum: [sphere] }
+    SphereManifest:
+      type: object
+      required: [pricingId, name, permanentUrl, latestVersionId, versions]
+      properties:
+        pricingId: { type: string }
+        name: { type: string }
+        permanentUrl: { type: string, format: uri }
+        latestVersionId: { type: string }
+        versions:
+          type: array
+          items: { $ref: '#/components/schemas/SphereVersion' }
+        syntaxUpgrade:
+          type: object
+          nullable: true
+          description: The selected source version requires explicit confirmation before SPACE stores its upgraded YAML snapshot.
+          properties:
+            versionId: { type: string }
+            from: { type: string }
+            to: { type: string }
+    SphereSyncState:
+      type: object
+      properties:
+        source: { type: string, enum: [manual, sphere] }
+        configuration:
+          allOf:
+            - $ref: '#/components/schemas/SphereConfiguration'
+            - type: object
+              properties:
+                target: { $ref: '#/components/schemas/SphereVersion' }
+                revision: { type: integer }
+                status: { type: string, enum: [ready, queued, checking, applying, blocked, degraded] }
+                error: { type: string, nullable: true }
+                lastCheckedAt: { type: string, format: date-time }
+                lastSyncedAt: { type: string, format: date-time }
+                migrated: { type: integer }
+                replaced: { type: integer }
+        retainedVersions:
+          type: array
+          items:
+            type: object
+            properties:
+              version: { type: string }
+        run:
+          type: object
+          nullable: true
+          description: Persistent execution including ID, candidate, status, migrated/replaced counts and recoverable error.
     Username:
       type: string
       description: Username of the user
@@ -4168,4 +4562,3 @@ components:
         API Key for authentication. Two types are supported:
         - **User API Key** (format: `usr_*`): Obtained from POST /users/authenticate endpoint
         - **Organization API Key** (format: `org_*`): Created in organization settings
-

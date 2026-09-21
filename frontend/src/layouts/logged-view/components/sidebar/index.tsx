@@ -65,11 +65,11 @@ export default function Sidebar({
 
   return (
     <motion.aside
-      initial={{ width: 280 }}
+      initial={false}
       animate={{ width: collapsed ? 64 : 280 }}
       transition={{ type: 'spring', stiffness: 300, damping: 30 }}
       className={
-        `h-screen shadow-xl border-l flex flex-col items-stretch fixed left-0 top-0 z-30 bg-white/80 border-gray-200 ` +
+        `h-screen overflow-y-auto shadow-xl border-l flex flex-col items-stretch fixed left-0 top-0 z-30 bg-white/80 border-gray-200 ` +
         `dark:bg-gray-900 dark:border-gray-800`
       }
       style={{ backdropFilter: 'blur(8px)' }}
@@ -106,7 +106,8 @@ export default function Sidebar({
               (selected === tab.path
                 ? 'bg-indigo-100 dark:bg-gray-800 font-bold' : '')
             }
-            onClick={() => navigate(tab.path)}
+            onClick={() => { navigate(tab.path); if (window.matchMedia('(max-width: 767px)').matches) setCollapsed(true); }}
+            aria-label={tab.label}
             aria-current={selected === tab.path ? 'page' : undefined}
           >
             {tab.icon}
@@ -155,7 +156,8 @@ export default function Sidebar({
                       (selected === tab.path
                         ? 'bg-indigo-100 dark:bg-gray-800 font-bold' : '')
                     }
-                    onClick={() => navigate(tab.path)}
+                    onClick={() => { navigate(tab.path); if (window.matchMedia('(max-width: 767px)').matches) setCollapsed(true); }}
+            aria-label={tab.label}
                     aria-current={selected === tab.path ? 'page' : undefined}
                   >
                     {tab.icon}
@@ -182,7 +184,8 @@ export default function Sidebar({
                   (selected === tab.path
                     ? 'bg-indigo-100 dark:bg-gray-800 font-bold' : '')
                 }
-                onClick={() => navigate(tab.path)}
+                onClick={() => { navigate(tab.path); if (window.matchMedia('(max-width: 767px)').matches) setCollapsed(true); }}
+            aria-label={tab.label}
                 aria-current={selected === tab.path ? 'page' : undefined}
               >
                 {tab.icon}

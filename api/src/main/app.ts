@@ -1,4 +1,7 @@
+import mongoose from 'mongoose';
 import * as dotenv from 'dotenv';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import express, { Application } from 'express';
 import type { Server } from 'http';
 import type { AddressInfo } from 'net';
@@ -17,16 +20,20 @@ const reset = '\x1b[0m';
 const bold = '\x1b[1m';
 
 const initializeApp = async (seedDatabase: boolean = true) => {
+  // Root scripts start this package from `api/`, while the shared development
+  // configuration lives at the workspace root. Load it before the local file
+  // so existing API-only values may still fill any missing setting.
+  const workspaceEnv = resolve(process.cwd(), '..', '.env');
+  // Preserve variables supplied by CI/test runners. The workspace .env only
+  // fills values that are not already present in the process environment.
+  if (existsSync(workspaceEnv)) dotenv.config({ path: workspaceEnv });
   dotenv.config();
   const app: Application = express();
   loadGlobalMiddlewares(app);
   await routes(app);
   await initializeDatabase(seedDatabase);
   const redisClient = await initRedis();
-  if (['development', 'testing'].includes(process.env.ENVIRONMENT ?? '')) {
-    await redisClient.sendCommand(['FLUSHALL']);
-    console.log(`${green}➜${reset}  ${bold}Redis cache cleared.${reset}`);
-  }
+  // Redis is shared locally; CacheService scopes cleanup to SPACE's prefix.
   container.resolve('cacheService').setRedisClient(redisClient);
   // await postInitializeDatabase(app)
   return app;
@@ -39,7 +46,7 @@ const initializeServer = async (
   app: Application;
 }> => {
   const app: Application = await initializeApp(seedDatabase);
-  const port = 3000;
+  const port = Number(process.env.SERVER_PORT ?? 3000);
 
   // Using a promise to ensure the server is started before returning it
   const server: Server = await new Promise((resolve, reject) => {
@@ -52,7 +59,27 @@ const initializeServer = async (
   const addressInfo: AddressInfo = server.address() as AddressInfo;
 
   // Inicializar el servicio de eventos con el servidor HTTP
-  container.resolve('eventService').initialize(server);
+  await container.resolve('eventService').initialize(server);
+  container.resolve('sphereSyncService').start();
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const closed = server.listening ? new Promise<void>(resolve => server.close(() => resolve())) : Promise.resolve();
+    await container.resolve('sphereSyncService').stop();
+    await container.resolve('eventService').close();
+    await closed;
+    await container.resolve('cacheService').close();
+    await mongoose.disconnect();
+  };
+  const onSignal = () => { void shutdown().catch(error => console.error('Shutdown failed', error)); };
+  process.once('SIGTERM', onSignal);
+  process.once('SIGINT', onSignal);
+  server.on('close', () => {
+    process.off('SIGTERM', onSignal);
+    process.off('SIGINT', onSignal);
+    void container.resolve('sphereSyncService').stop();
+  });
 
   console.log(
     `  ${green}➜${reset}  ${bold}API:${reset}     ${blue}http://localhost${addressInfo.port !== 80 ? `:${bold}${addressInfo.port}${reset}` : ''}`
@@ -80,7 +107,7 @@ const initializeDatabase = async (seedDatabaseFlag: boolean = true) => {
       case 'mongoDB':
         connection = await initMongoose();
         if (['development'].includes(process.env.ENVIRONMENT ?? '')) {
-          if (seedDatabaseFlag) {
+          if (seedDatabaseFlag && process.env.SEED_ON_STARTUP === 'true') {
             await seedDatabase();
           }
         } else {
@@ -94,11 +121,15 @@ const initializeDatabase = async (seedDatabaseFlag: boolean = true) => {
     }
   } catch (error) {
     console.error(error);
+    throw error;
   }
   return connection;
 };
 
 const disconnectDatabase = async () => {
+  await container.resolve('sphereSyncService').stop();
+  await container.resolve('eventService').close();
+  await container.resolve('cacheService').close();
   try {
     switch (process.env.DATABASE_TECHNOLOGY ?? 'mongoDB') {
       case 'mongoDB':
