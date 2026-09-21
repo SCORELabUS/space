@@ -2,8 +2,12 @@ export const policies = ['all_last', 'new_last', 'all_pick', 'new_pick'] as cons
 export const pollingIntervals = [1, 5, 15] as const;
 export type PollingIntervalMinutes = typeof pollingIntervals[number];
 export type SyncPolicy = typeof policies[number];
-export function isSphereSyncEnabled(value = process.env.SPHERE_SYNC_ENABLED) {
-  return value !== 'false';
+export function isSphereSyncEnabled(
+  value = process.env.SPHERE_SYNC_ENABLED,
+  environment = process.env.ENVIRONMENT
+) {
+  if (value !== undefined) return value === 'true';
+  return environment !== 'testing';
 }
 export interface SphereVersion { versionId: string; version: string; createdAt: string; contentHash: string }
 export interface SyntaxUpgrade { versionId: string; from: string; to: string }

@@ -24,7 +24,9 @@ const initializeApp = async (seedDatabase: boolean = true) => {
   // configuration lives at the workspace root. Load it before the local file
   // so existing API-only values may still fill any missing setting.
   const workspaceEnv = resolve(process.cwd(), '..', '.env');
-  if (existsSync(workspaceEnv)) dotenv.config({ path: workspaceEnv, override: true });
+  // Preserve variables supplied by CI/test runners. The workspace .env only
+  // fills values that are not already present in the process environment.
+  if (existsSync(workspaceEnv)) dotenv.config({ path: workspaceEnv });
   dotenv.config();
   const app: Application = express();
   loadGlobalMiddlewares(app);

@@ -1,4 +1,7 @@
-test_files=$(find src/test -name "*.test.ts")
+#!/usr/bin/env bash
+set -euo pipefail
+
+test_files=$(find src/test -name "*.test.ts" -print)
 command=""
 
 for file in $test_files; do
@@ -9,4 +12,4 @@ for file in $test_files; do
   fi
 done
 
-eval $command
+eval "$command"

@@ -23,9 +23,10 @@ describe('SPHERE policy', () => {
     expect(() => validateConfiguration({ policy: 'new_last', permanentUrl: '', pollIntervalMinutes: 10 as any })).toThrow('polling interval');
   });
   it('enables the periodic worker unless explicitly disabled', () => {
-    expect(isSphereSyncEnabled(undefined)).toBe(true);
-    expect(isSphereSyncEnabled('true')).toBe(true);
-    expect(isSphereSyncEnabled('false')).toBe(false);
+    expect(isSphereSyncEnabled(undefined, 'development')).toBe(true);
+    expect(isSphereSyncEnabled(undefined, 'testing')).toBe(false);
+    expect(isSphereSyncEnabled('true', 'testing')).toBe(true);
+    expect(isSphereSyncEnabled('false', 'development')).toBe(false);
   });
   it('never downgrades automatically when the current public version disappears', () => {
     expect(() => selectVersion({ ...manifest, versions: [a] }, { policy: 'all_last', permanentUrl: '' }, b)).toThrow();
