@@ -1,3 +1,4 @@
+import { assertOrganizationLease } from '../../../services/sphere/lock';
 import mongoose, { Schema } from 'mongoose';
 import Feature from './schemas/Feature';
 import UsageLimit from './schemas/UsageLimit';
@@ -8,6 +9,7 @@ const pricingSchema = new Schema(
   {
     _serviceName: { type: String },
     _organizationId: { type: String },
+    sphere: { type: Schema.Types.Mixed },
     yamlPath: { type: String },
     version: { type: String, required: true },
     currency: { type: String, required: true },
@@ -57,6 +59,11 @@ pricingSchema.virtual('organization', {
 
 // Adding unique index for [name, owner, version]
 pricingSchema.index({ _serviceName: 1, version: 1, _organizationId: 1 }, { unique: true });
+
+// Binding changes and synchronization share a renewable organization lease.
+for (const operation of ['save', 'updateOne', 'updateMany', 'findOneAndUpdate', 'deleteOne', 'deleteMany', 'findOneAndDelete'] as const) {
+  pricingSchema.pre(operation, async function () { await assertOrganizationLease(); });
+}
 
 const pricingModel = mongoose.model('Pricing', pricingSchema, 'pricings');
 

@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx --watch src/main/index.ts",
-    "dev:setup": "cd docker/dev && docker compose up -d --build",
+    "dev:setup": "cd .. && bash scripts/dev-setup.sh",
     "dev:setup:test": "pnpm run generate-test-env && pnpm run dev:setup && tsx scripts/seedMongodb.ts",
     "test": "chmod +x run-tests.sh && ./run-tests.sh",
     "test:ci": "chmod +x run-tests:ci.sh && ./run-tests:ci.sh",

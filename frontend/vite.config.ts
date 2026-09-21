@@ -13,6 +13,9 @@ export default defineConfig(({ mode }) => {
 
   return {
     base: safeBase,
+    server: {
+      port: Number(env.VITE_PORT || 5174),
+    },
     plugins: [
       react(),
       tailwindcss(),

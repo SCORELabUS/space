@@ -9,6 +9,7 @@ interface FileOrUrlInputProps {
   accept?: string;
   placeholder?: string;
   error?: string;
+  showUrl?: boolean;
 }
 
 export default function FileOrUrlInput({
@@ -19,6 +20,7 @@ export default function FileOrUrlInput({
   accept = '.yml,.yaml',
   placeholder = 'Enter direct URL to .yml or .yaml pricing file',
   error,
+  showUrl = true,
 }: FileOrUrlInputProps) {
   const [dragActive, setDragActive] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -91,6 +93,15 @@ export default function FileOrUrlInput({
           onDragOver={handleDrag}
           onDragEnter={handleDrag}
           onDragLeave={handleDrag}
+          role="button"
+          tabIndex={0}
+          aria-label="Select a YAML pricing file"
+          onKeyDown={event => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              inputRef.current?.click();
+            }
+          }}
           style={{ minHeight: 120 }}
           initial={{ opacity: 0, y: 4 }}
           animate={{ opacity: 1, y: 0 }}
@@ -121,7 +132,7 @@ export default function FileOrUrlInput({
         </motion.div>
       </AnimatePresence>
 
-      <div className="mt-3">
+      {showUrl && <div className="mt-3">
         <label className="block text-xs font-semibold text-indigo-700 dark:text-white mb-1">Or provide URL</label>
         <input
           type="url"
@@ -131,7 +142,8 @@ export default function FileOrUrlInput({
           className="w-full rounded px-3 py-2 border border-indigo-700 bg-white dark:bg-gray-900 dark:border-gray-700 text-sm text-indigo-700 dark:text-indigo-200 placeholder:text-gray-500 dark:placeholder:text-white"
         />
         {error && <div className="text-red-500 dark:text-red-400 text-sm mt-2">{error}</div>}
-      </div>
+      </div>}
+      {!showUrl && error && <div className="text-red-500 dark:text-red-400 text-sm mt-2">{error}</div>}
     </div>
   );
 }

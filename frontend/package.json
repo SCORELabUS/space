@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --port 5174",
     "dev:setup:test": "pnpm run generate-test-env",
     "generate-test-env": "chmod +x generate-test-env.sh && chmod +x retrieve-space-api-key.sh && ./generate-test-env.sh",
     "build": "tsc -b && vite build",

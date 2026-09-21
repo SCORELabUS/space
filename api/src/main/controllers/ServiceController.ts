@@ -160,6 +160,11 @@ class ServiceController {
         return res.status(400).send({ error: 'Organization ID is required. You can either provide an organization scoped API key or use the /organizations/*/services/** paths' });
       }
 
+      if (req.body.source === 'sphere') {
+        if (receivedFile || req.body.pricing) return res.status(400).json({ error: 'Invalid mixed pricing sources' });
+        const linked = await container.resolve('sphereSyncService').create(req.body, organizationId);
+        return res.status(201).json(linked);
+      }
       let service;
 
       if (!receivedFile) {

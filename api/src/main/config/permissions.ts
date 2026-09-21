@@ -22,6 +22,15 @@ import { RoutePermission } from "../types/permissions";
  * If no rule matches, access is denied by default.
  */
 export const ROUTE_PERMISSIONS: RoutePermission[] = [
+  // SPHERE synchronization (before general service routes).
+  { path: '/organizations/*/services/sphere/preview', methods: ['POST'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
+  { path: '/services/sphere/preview', methods: ['POST'], allowedUserRoles: [], allowedOrgRoles: ['ALL', 'MANAGEMENT'] },
+  { path: '/organizations/*/services/*/synchronization', methods: ['GET', 'PUT'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
+  { path: '/services/*/synchronization', methods: ['GET'], allowedUserRoles: [], allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'] },
+  { path: '/services/*/synchronization', methods: ['PUT'], allowedUserRoles: [], allowedOrgRoles: ['ALL', 'MANAGEMENT'] },
+  { path: '/organizations/*/services/*/synchronization/run', methods: ['POST'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
+  { path: '/services/*/synchronization/run', methods: ['POST'], allowedUserRoles: [], allowedOrgRoles: ['ALL', 'MANAGEMENT'] },
+
   // ============================================
   // User Management Routes (User API Keys ONLY)
   // ============================================

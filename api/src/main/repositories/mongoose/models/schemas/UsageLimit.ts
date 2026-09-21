@@ -17,6 +17,7 @@ const usageLimitSchema = new Schema(
   {
     name: { type: String, required: true },
     description: { type: String },
+    unit: { type: String },
     valueType: {
       type: String,
       enum: ["BOOLEAN", "NUMERIC"],

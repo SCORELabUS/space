@@ -1,3 +1,5 @@
+import { withOrganizationLock } from './sphere/lock';
+import ServiceModel from '../repositories/mongoose/models/ServiceMongoose';
 import { retrievePricingFromPath, retrievePricingFromText } from 'pricing4ts/server';
 import container from '../config/container';
 import ServiceRepository, { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository';
@@ -36,6 +38,30 @@ class ServiceService {
     this.organizationRepository = container.resolve('organizationRepository');
     this.eventService = container.resolve('eventService');
     this.cacheService = container.resolve('cacheService');
+    for (const method of ['disable', 'destroy'] as const) {
+      const original = this[method].bind(this);
+      (this as any)[method] = async (name: string, organizationId: string) => {
+        const linked: any = await ServiceModel.findOne({ name, organizationId, source: 'sphere' }).lean();
+        if (!linked) return original(name, organizationId);
+        return withOrganizationLock(organizationId, async assertOwned => {
+          const current: any = await ServiceModel.findById(linked._id).lean();
+          if (current?.sphere.status === 'applying') throw new Error('Synchronization is applying; retry after recovery');
+          await assertOwned();
+          return container.resolve('sphereSyncService').removeLinkedService(String(linked._id), method === 'disable', assertOwned);
+        });
+      };
+    }
+    for (const method of ['addPricingToService', 'updatePricingAvailability', 'destroyPricing', 'update'] as const) {
+      const original = (this[method] as (...args: any[]) => Promise<any>).bind(this);
+      (this as any)[method] = async (...args: any[]) => {
+        const organizationId = args[args.length - 1];
+        if (await ServiceModel.exists({ name: args[0], organizationId, source: 'sphere' })) {
+          throw new Error('Invalid operation: manage linked pricing through SPHERE synchronization settings');
+        }
+        return original(...args);
+      };
+    }
+
   }
 
   async index(queryParams: ServiceQueryFilters, organizationId?: string) {
@@ -161,6 +187,7 @@ class ServiceService {
       service.archivedPricings?.get(formattedPricingVersion);
 
     if (!pricingLocator) {
+      if (service.source === 'sphere') return container.resolve('sphereSyncService').historicalPricing(organizationId, serviceName, pricingVersion);
       throw new Error(`Pricing version ${pricingVersion} not found for service ${serviceName}`);
     }
 
@@ -678,9 +705,9 @@ class ServiceService {
   async update(serviceName: string, newServiceData: any, organizationId: string) {
     const cacheKey = `service.${organizationId}.${serviceName}`;
     let service = await this.cacheService.get(cacheKey);
-    let dataToUpdate: any = {};
-    let contractsToRemoveService: LeanContract[] = [];
-    let contractsToUpdateOrgId: LeanContract[] = [];
+    const dataToUpdate: any = {};
+    const contractsToRemoveService: LeanContract[] = [];
+    const contractsToUpdateOrgId: LeanContract[] = [];
 
     if (!service) {
       service = await this.serviceRepository.findByName(serviceName, organizationId);
@@ -895,6 +922,8 @@ class ServiceService {
   }
 
   async prune(organizationId?: string) {
+    const linked = await ServiceModel.find({ ...(organizationId ? { organizationId } : {}), source: 'sphere' }).lean();
+    for (const service of linked) await this.destroy(service.name, service.organizationId);
     if (organizationId) {
       const organizationServices: LeanService[] = await this.index({}, organizationId);
       const organizationServiceNames: string[] = organizationServices.map(s => s.name) as string[];

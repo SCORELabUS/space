@@ -2,6 +2,8 @@ services:
   mongodb:
       image: mongo:7.0.16
       container_name: space-mongodb
+      ports:
+        - "27017:27017"
       environment:
         MONGO_INITDB_ROOT_USERNAME: ${DATABASE_ROOT_USERNAME:-root}
         MONGO_INITDB_ROOT_PASSWORD: ${DATABASE_ROOT_PASSWORD:-4dm1n}
@@ -23,6 +25,8 @@ services:
   redis:
     image: redis:7.4.2
     container_name: space-redis
+    ports:
+      - "6378:6379"
     healthcheck:
       test: [ "CMD", "redis-cli", "--raw", "incr", "ping" ]
       interval: 5s
