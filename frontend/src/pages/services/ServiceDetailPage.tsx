@@ -137,9 +137,10 @@ export default function ServiceDetailPage() {
   }
 
   return (
-    <div className="max-w-2xl mx-auto py-10 px-2 md:px-0">
+    <div className={`${syncState?.source === 'sphere' ? 'max-w-6xl' : 'max-w-2xl'} mx-auto py-8 px-4 sm:px-6`}>
       {alertElement}
       {confirmElement}
+      {syncState?.source === 'sphere' && <button type="button" onClick={() => router('/services')} className="cursor-pointer mb-5 min-h-11 text-sm font-medium text-gray-500 hover:text-indigo-600 focus-visible:outline-2 focus-visible:outline-indigo-500 dark:text-gray-400 dark:hover:text-indigo-300">← Services / Pricing overview</button>}
       <div className="flex items-center justify-between mb-2">
         <h1 className="text-3xl font-bold text-indigo-800 dark:text-gray-100">{name}</h1>
         {syncState?.source !== 'sphere' && <ServiceOptionsMenu
@@ -147,16 +148,15 @@ export default function ServiceDetailPage() {
           onDisableService={handleDisableService}
         />}
       </div>
+      {syncState?.source === 'sphere' && <p className="mb-7 text-sm text-gray-500 dark:text-gray-400">Monitor pricing releases, synchronization and contract updates in one place.</p>}
       {syncState?.source === 'sphere' && currentOrganization && <SphereSyncPanel state={syncState} apiKey={user.apiKey} organizationId={currentOrganization.id} service={name!} onChange={setSyncState} canManage={user.role === 'ADMIN' || currentOrganization.owner === user.username || currentOrganization.members.some(member => member.username === user.username && ['ADMIN', 'MANAGER'].includes(member.role))} />}
       <AddVersionModal
         open={addVersionOpen}
         onClose={handleAddVersionClose}
         serviceName={name ?? ''}
       />
-      <p className="text-gray-500 dark:text-gray-300 mb-6">
-        {syncState?.source === 'sphere' ? 'Retained versions are managed automatically by the synchronization policy.' : 'All pricing versions for this service. Drag & drop to archive a pricing.'}
-      </p>
-      {syncState?.source === 'sphere' ? <ul className="space-y-2 text-gray-700 dark:text-gray-200">{syncState.retainedVersions.map(v => <li key={v.version} className="rounded-lg border border-gray-200 dark:border-gray-700 p-3">Version {v.version}</li>)}</ul> : loading ? (
+      {syncState?.source !== 'sphere' && <p className="text-gray-500 dark:text-gray-300 mb-6">All pricing versions for this service. Drag & drop to archive a pricing.</p>}
+      {syncState?.source === 'sphere' ? null : loading ? (
         <div className="flex flex-col items-center py-20">
           <motion.div
             animate={{ rotate: 360 }}

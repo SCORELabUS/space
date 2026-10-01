@@ -16,8 +16,10 @@ export function functionalHash(text: string): string {
 export default class SphereClient {
   private base() {
     const url = new URL(process.env.SPHERE_PUBLIC_URL || 'https://sphere.score.us.es');
+    const localHosts = new Set(['localhost', '127.0.0.1', '[::1]',
+      ...(process.env.SPHERE_LOCAL_HTTP_HOSTS ?? '').split(',').map(host => host.trim()).filter(Boolean)]);
     if (url.protocol !== 'https:' && !(process.env.SPHERE_ALLOW_LOCAL_HTTP === 'true' &&
-      process.env.ENVIRONMENT !== 'production' && url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) {
+      process.env.ENVIRONMENT !== 'production' && url.protocol === 'http:' && localHosts.has(url.hostname))) {
       throw new Error('Invalid SPHERE origin: HTTPS is required');
     }
     return url;
