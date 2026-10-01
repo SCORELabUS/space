@@ -81,6 +81,7 @@ services:
         VITE_ENVIRONMENT: ${ENVIRONMENT:-production}
         VITE_BASE_PATH: ${BASE_PATH:-}
         VITE_SPACE_BASE_URL: ${SPACE_HOST:-http://localhost:5403}${BASE_PATH:-}/api/v1
+        SPHERE_PUBLIC_URL: ${SPHERE_PUBLIC_URL:-https://sphere.score.us.es}
     depends_on:
       space-server:
         condition: service_healthy
