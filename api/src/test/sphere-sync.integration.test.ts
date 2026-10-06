@@ -97,6 +97,31 @@ suite('SPHERE synchronization with isolated MongoDB', () => {
     expect((await Contract.findOne({}).lean())?.contractedServices).toEqual({ demo: '1_0', other: 'old' });
     expect(await Pricing.countDocuments()).toBe(1);
   });
+  describe('createdAt precision', () => {
+    // A new SPHERE version whose YAML says `yamlCreatedAt` while SPHERE lists `sphereCreatedAt`.
+    async function publishSecond(yamlCreatedAt: string, sphereCreatedAt: string) {
+      const service = await create();
+      const text = yaml('2.0', 'cheap').replace(/createdAt: '[^']*'/, `createdAt: '${yamlCreatedAt}'`);
+      remote([v(one, '1.0', yaml('1.0')), { ...v(two, '2.0', text), createdAt: sphereCreatedAt }], { [two]: text });
+      await sync.enqueue('org', 'demo'); await sync.synchronize(String(service.id));
+      return (await sync.get('org', 'demo')).configuration;
+    }
+    it('imports a version whose YAML carries the exact release date-time', async () => {
+      const configuration = await publishSecond('2025-03-04T10:20:30.456Z', '2025-03-04T10:20:30.456Z');
+      expect(configuration.status).toBe('ready');
+      const stored = await Pricing.findOne({ 'sphere.versionId': two }).lean();
+      expect(stored?.createdAt.toISOString()).toBe('2025-03-04T10:20:30.456Z');
+      expect(await fs.readFile(`public${stored!.yamlPath}`, 'utf8')).toContain('2025-03-04T10:20:30.456Z');
+    });
+    it('still accepts a date-only YAML published on the same UTC day as SPHERE lists', async () => {
+      expect((await publishSecond('2025-03-04', '2025-03-04T10:20:30.456Z')).status).toBe('ready');
+    });
+    it('rejects a YAML date-time that is not the instant SPHERE lists', async () => {
+      const configuration = await publishSecond('2025-03-04T10:20:30.456Z', '2025-03-04T10:20:31.456Z');
+      expect(configuration.status).toBe('degraded');
+      expect(configuration.error).toContain('Invalid SPHERE snapshot metadata');
+    });
+  });
   it('keeps the target and allows new bindings during an origin outage', async () => {
     const service = await create(); nock(origin).get(`/api/v1/public/pricings/${id}`).reply(503);
     await sync.enqueue('org', 'demo'); await sync.synchronize(String(service.id));

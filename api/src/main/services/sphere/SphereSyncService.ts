@@ -10,7 +10,7 @@ import { escapeVersion, resetEscapeVersion } from '../../utils/helpers';
 import { isSubscriptionValidInPricing } from '../../controllers/validation/ContractValidation';
 import { validatePricingData } from '../validation/PricingServiceValidation';
 import SphereClient, { functionalHash } from './SphereClient';
-import { SphereConfiguration, SphereManifest, SphereVersion, SyntaxUpgrade, isSphereSyncEnabled, selectVersion, validateConfiguration } from './types';
+import { SphereConfiguration, SphereManifest, SphereVersion, SyntaxUpgrade, isSphereSyncEnabled, sameSnapshotCreatedAt, selectVersion, validateConfiguration } from './types';
 import { migrateSubscription, migrateUsage } from './migration';
 import { withOrganizationLock } from './lock';
 
@@ -228,7 +228,7 @@ export default class SphereSyncService {
     const text = await this.client.yaml(service.sphere.pricingId, version.versionId);
     if (functionalHash(text) !== version.contentHash) throw new Error('SPHERE snapshot changed while downloading; retry');
     const parsed = retrievePricingFromText(text);
-    if (parsed.version !== version.version || new Date(parsed.createdAt).getTime() !== Date.parse(version.createdAt)) throw new Error('Invalid SPHERE snapshot metadata');
+    if (parsed.version !== version.version || !sameSnapshotCreatedAt(parsed.createdAt, version.createdAt)) throw new Error(`Invalid SPHERE snapshot metadata: SPHERE lists version ${version.version} created ${version.createdAt}, the YAML says ${parsed.version} created ${new Date(parsed.createdAt).toISOString()}`);
     const data = parsePricingToSpacePricingObject(parsed);
     const errors = validatePricingData(data);
     if (errors.length) throw new Error(`Invalid pricing: ${errors.join(', ')}`);
