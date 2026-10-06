@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import mongoose from 'mongoose';
 import nock from 'nock';
@@ -23,12 +24,19 @@ function remote(versions: any[], files: Record<string, string> = {}) {
   nock(origin).get(`/api/v1/public/pricings/${id}`).reply(200, { pricingId: id, name: 'Demo', permanentUrl: `${origin}/p/${id}`, latestVersionId: versions[versions.length - 1].versionId, versions });
   for (const [versionId, text] of Object.entries(files)) nock(origin).get(`/api/v1/public/pricings/${id}/versions/${versionId}/yaml`).times(2).reply(200, text);
 }
-const suite = process.env.SPHERE_SYNC_TEST_MONGO === 'true' ? describe : describe.skip;
-suite('SPHERE synchronization with isolated MongoDB', () => {
+// Runs against the same MongoDB server as the rest of the suite, but in its own
+// database so dropping it at the end never touches the shared test data.
+const syncTestDatabase = 'space_sphere_sync_test';
+const syncTestMongoUri = () => {
+  const url = new URL(process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017');
+  url.pathname = `/${syncTestDatabase}`;
+  return url.toString();
+};
+describe('SPHERE synchronization with isolated MongoDB', () => {
   let sync: SphereSyncService;
   const files = new Set<string>();
   beforeAll(async () => {
-    await mongoose.connect('mongodb://127.0.0.1:27981/space_sphere_sync_test');
+    await mongoose.connect(syncTestMongoUri());
     await Promise.all([Service.init(), Pricing.init(), Contract.init(), SphereLease.init(), SphereRun.init()]);
   });
   beforeEach(async () => {

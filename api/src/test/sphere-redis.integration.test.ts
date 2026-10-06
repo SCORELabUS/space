@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createServer, Server } from 'node:http';
 import { AddressInfo } from 'node:net';
@@ -6,15 +7,14 @@ import { io, Socket } from 'socket.io-client';
 import CacheService from '../main/services/CacheService';
 import EventService from '../main/services/EventService';
 
-const suite = process.env.SPHERE_SYNC_TEST_REDIS === 'true' ? describe : describe.skip;
-suite('synchronization cache and events with isolated Redis', () => {
+describe('synchronization cache and events with isolated Redis', () => {
   const cache = new CacheService();
   const publisher = new EventService(), receiver = new EventService();
   const servers: Server[] = [];
   const previousUrl = process.env.REDIS_URL;
   let client: Socket;
   beforeAll(async () => {
-    process.env.REDIS_URL = 'redis://127.0.0.1:63991';
+    process.env.REDIS_URL = previousUrl ?? 'redis://127.0.0.1:6379';
     const redis = createClient({ url: process.env.REDIS_URL });
     await redis.connect(); cache.setRedisClient(redis);
     for (const service of [publisher, receiver]) {
