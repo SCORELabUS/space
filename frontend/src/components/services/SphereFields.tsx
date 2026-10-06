@@ -74,7 +74,7 @@ export default function SphereFields({ value, onChange, apiKey, organizationId, 
       }}>
         <option value="" disabled>Check pricing to select a version</option>
         {!manifest && value.selectedVersionId && <option value={value.selectedVersionId}>Current selection (check availability)</option>}
-        {manifest?.versions.map(v => <option key={v.versionId} value={v.versionId}>{v.version} · {new Date(v.createdAt).toLocaleDateString()}</option>)}
+        {manifest?.versions.map(v => <option key={v.versionId} value={v.versionId}>{v.version} · {new Date(v.createdAt).toLocaleString()}</option>)}
       </CustomSelect>
     </label>}
     {value.policy.startsWith('all_') && <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">{allWarning}</p>}

@@ -40,3 +40,16 @@ export function selectVersion(manifest: SphereManifest, config: SphereConfigurat
   }
   return selected;
 }
+/**
+ * Pricing2Yaml's `createdAt` may be a date (UTC midnight) or a date-time. SPHERE
+ * stamps the exact instant into the YAML, so they normally agree to the
+ * millisecond. A YAML that only holds a date (versions published before date-times
+ * were supported) can only be checked at day precision.
+ */
+export function sameSnapshotCreatedAt(yamlCreatedAt: string | Date, sphereCreatedAt: string): boolean {
+  const fromYaml = new Date(yamlCreatedAt).getTime();
+  const fromSphere = Date.parse(sphereCreatedAt);
+  if (!Number.isFinite(fromYaml) || !Number.isFinite(fromSphere)) return false;
+  const dayMs = 24 * 60 * 60 * 1000;
+  return fromYaml % dayMs === 0 ? Math.floor(fromSphere / dayMs) === fromYaml / dayMs : fromYaml === fromSphere;
+}

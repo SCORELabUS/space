@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import nock from 'nock';
-import { isSphereSyncEnabled, selectVersion, validateConfiguration, SphereManifest } from '../../main/services/sphere/types';
+import { isSphereSyncEnabled, sameSnapshotCreatedAt, selectVersion, validateConfiguration, SphereManifest } from '../../main/services/sphere/types';
 import { migrateSubscription, migrateUsage, numericPrice } from '../../main/services/sphere/migration';
 import SphereClient, { functionalHash } from '../../main/services/sphere/SphereClient';
 const a = { versionId: '111111111111111111111111', version: '2030', createdAt: '2024-01-01', contentHash: 'a'.repeat(64) };
@@ -107,5 +107,24 @@ describe('trusted source and immutable content', () => {
   it('hashes functional changes but not SaaS renames or YAML field order', () => {
     expect(functionalHash('saasName: A\nversion: 1\nplans: {free: {price: 0}}')).toBe(functionalHash('plans: {free: {price: 0}}\nversion: 1\nsaasName: B'));
     expect(functionalHash('version: 1')).not.toBe(functionalHash('version: 2'));
+  });
+});
+
+describe('SPHERE snapshot createdAt check', () => {
+  it('requires the exact instant when the YAML carries a time of day', () => {
+    expect(sameSnapshotCreatedAt(new Date('2026-10-05T21:25:07.123Z'), '2026-10-05T21:25:07.123Z')).toBe(true);
+    expect(sameSnapshotCreatedAt(new Date('2026-10-05T21:25:07.123Z'), '2026-10-05T21:25:08.000Z')).toBe(false);
+    expect(sameSnapshotCreatedAt(new Date('2026-10-05T21:25:07.123Z'), '2026-10-05T00:00:00.000Z')).toBe(false);
+  });
+  it('compares only the UTC day when the YAML holds just a date', () => {
+    const yamlDate = new Date('2025-05-25');
+    expect(sameSnapshotCreatedAt(yamlDate, '2025-05-25T00:00:00.000Z')).toBe(true);
+    expect(sameSnapshotCreatedAt(yamlDate, '2025-05-25T23:59:59.999Z')).toBe(true);
+    expect(sameSnapshotCreatedAt(yamlDate, '2025-05-26T00:00:00.000Z')).toBe(false);
+    expect(sameSnapshotCreatedAt(yamlDate, '2025-05-24T23:59:59.999Z')).toBe(false);
+  });
+  it('rejects values that are not dates', () => {
+    expect(sameSnapshotCreatedAt('nope', '2025-05-25T00:00:00.000Z')).toBe(false);
+    expect(sameSnapshotCreatedAt(new Date('2025-05-25'), 'nope')).toBe(false);
   });
 });

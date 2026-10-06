@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import mongoose from 'mongoose';
 import nock from 'nock';
@@ -23,12 +24,19 @@ function remote(versions: any[], files: Record<string, string> = {}) {
   nock(origin).get(`/api/v1/public/pricings/${id}`).reply(200, { pricingId: id, name: 'Demo', permanentUrl: `${origin}/p/${id}`, latestVersionId: versions[versions.length - 1].versionId, versions });
   for (const [versionId, text] of Object.entries(files)) nock(origin).get(`/api/v1/public/pricings/${id}/versions/${versionId}/yaml`).times(2).reply(200, text);
 }
-const suite = process.env.SPHERE_SYNC_TEST_MONGO === 'true' ? describe : describe.skip;
-suite('SPHERE synchronization with isolated MongoDB', () => {
+// Runs against the same MongoDB server as the rest of the suite, but in its own
+// database so dropping it at the end never touches the shared test data.
+const syncTestDatabase = 'space_sphere_sync_test';
+const syncTestMongoUri = () => {
+  const url = new URL(process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017');
+  url.pathname = `/${syncTestDatabase}`;
+  return url.toString();
+};
+describe('SPHERE synchronization with isolated MongoDB', () => {
   let sync: SphereSyncService;
   const files = new Set<string>();
   beforeAll(async () => {
-    await mongoose.connect('mongodb://127.0.0.1:27981/space_sphere_sync_test');
+    await mongoose.connect(syncTestMongoUri());
     await Promise.all([Service.init(), Pricing.init(), Contract.init(), SphereLease.init(), SphereRun.init()]);
   });
   beforeEach(async () => {
@@ -96,6 +104,31 @@ suite('SPHERE synchronization with isolated MongoDB', () => {
     expect((await sync.get('org', 'demo')).configuration.status).toBe('blocked');
     expect((await Contract.findOne({}).lean())?.contractedServices).toEqual({ demo: '1_0', other: 'old' });
     expect(await Pricing.countDocuments()).toBe(1);
+  });
+  describe('createdAt precision', () => {
+    // A new SPHERE version whose YAML says `yamlCreatedAt` while SPHERE lists `sphereCreatedAt`.
+    async function publishSecond(yamlCreatedAt: string, sphereCreatedAt: string) {
+      const service = await create();
+      const text = yaml('2.0', 'cheap').replace(/createdAt: '[^']*'/, `createdAt: '${yamlCreatedAt}'`);
+      remote([v(one, '1.0', yaml('1.0')), { ...v(two, '2.0', text), createdAt: sphereCreatedAt }], { [two]: text });
+      await sync.enqueue('org', 'demo'); await sync.synchronize(String(service.id));
+      return (await sync.get('org', 'demo')).configuration;
+    }
+    it('imports a version whose YAML carries the exact release date-time', async () => {
+      const configuration = await publishSecond('2025-03-04T10:20:30.456Z', '2025-03-04T10:20:30.456Z');
+      expect(configuration.status).toBe('ready');
+      const stored = await Pricing.findOne({ 'sphere.versionId': two }).lean();
+      expect(stored?.createdAt.toISOString()).toBe('2025-03-04T10:20:30.456Z');
+      expect(await fs.readFile(`public${stored!.yamlPath}`, 'utf8')).toContain('2025-03-04T10:20:30.456Z');
+    });
+    it('still accepts a date-only YAML published on the same UTC day as SPHERE lists', async () => {
+      expect((await publishSecond('2025-03-04', '2025-03-04T10:20:30.456Z')).status).toBe('ready');
+    });
+    it('rejects a YAML date-time that is not the instant SPHERE lists', async () => {
+      const configuration = await publishSecond('2025-03-04T10:20:30.456Z', '2025-03-04T10:20:31.456Z');
+      expect(configuration.status).toBe('degraded');
+      expect(configuration.error).toContain('Invalid SPHERE snapshot metadata');
+    });
   });
   it('keeps the target and allows new bindings during an origin outage', async () => {
     const service = await create(); nock(origin).get(`/api/v1/public/pricings/${id}`).reply(503);
