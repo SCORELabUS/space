@@ -45,7 +45,8 @@ export default function DragDropPricings({
     const withoutPublicPrefix = path.startsWith('public/') ? path.replace(/^public\/+/, '') : path;
     const normalizedPath = withoutPublicPrefix.startsWith('/') ? withoutPublicPrefix : `/${withoutPublicPrefix}`;
 
-    return `${apiOrigin}${normalizedPath}`;
+    // The API URL may be relative (/api/v1) in the release image; resolve it against this origin.
+    return `${new URL(apiOrigin || '/', window.location.origin).href.replace(/\/+$/, '')}${normalizedPath}`;
   }
 
   async function resolvePublicYamlUrl(pricing: Pricing): Promise<string | null> {
