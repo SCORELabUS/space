@@ -77,6 +77,45 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     loadUserRole();
   }, [isDevelopmentEnvironment, user.apiKey, user.role]);
 
+  // Log out when SPACE no longer recognises the stored API key (e.g. the user was
+  // deleted or the database was reset). Some routes also answer 401 to a valid key
+  // that lacks organization membership, so a 401 only triggers a check against
+  // /users/me, and only a 401 from there ends the session.
+  const logoutRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    if (isDevelopmentEnvironment || !user.apiKey) {
+      return;
+    }
+
+    const apiKey = user.apiKey;
+    let checkingSession = false;
+
+    const interceptor = axios.interceptors.response.use(undefined, error => {
+      const sentApiKey = error.config?.headers?.["x-api-key"];
+
+      if (error.response?.status === 401 && sentApiKey === apiKey && !checkingSession) {
+        checkingSession = true;
+        axios
+          .get("/users/me", { headers: { "x-api-key": apiKey }, timeout: 5000 })
+          .catch(checkError => {
+            if (checkError.response?.status === 401) {
+              logoutRef.current();
+            }
+          })
+          .finally(() => {
+            checkingSession = false;
+          });
+      }
+
+      return Promise.reject(error);
+    });
+
+    return () => {
+      axios.interceptors.response.eject(interceptor);
+    };
+  }, [isDevelopmentEnvironment, user.apiKey]);
+
   // Load organizations when user is authenticated (for dev mode or after login)
   useEffect(() => {
     if (!isAuthenticated || !user.apiKey || !organizationContext) {
@@ -100,10 +139,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
           
           organizationContext.setOrganizations(organizations);
           
-          // Set default organization
-          const defaultOrg = organizations.find(org => org.default) || organizations[0];
-          if (defaultOrg) {
-            organizationContext.setCurrentOrganization(defaultOrg);
+          // Keep the organization selected before a reload; fall back to the default one
+          const savedOrgId = localStorage.getItem('currentOrganizationId');
+          const initialOrg =
+            organizations.find(org => org.id === savedOrgId) ||
+            organizations.find(org => org.default) ||
+            organizations[0];
+          if (initialOrg) {
+            organizationContext.setCurrentOrganization(initialOrg);
           } else {
             console.warn('[AuthContext] No default organization found, and organizations list is not empty');
           }
@@ -185,6 +228,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     localStorage.removeItem('currentOrganizationId');
     localStorage.removeItem('organizations');
   };
+  logoutRef.current = logout;
 
   // Allows updating the user from outside (e.g., after editing username or role)
   const updateUser = (newUser: Partial<UserData>) => {
