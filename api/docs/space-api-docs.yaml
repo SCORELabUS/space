@@ -126,7 +126,14 @@ info:
     be novated to other services or deleted with `DELETE /contracts/{userId}`. Each contract is written only if it did
     not change since it was read (a concurrent novation is never overwritten; the removal is retried). The contracts
     are updated before the services are deleted, so a failure (`500`, or `409` when a contract keeps changing) deletes
-    nothing and the request can be repeated.
+    nothing and the request can be repeated. The stored pricings of the deleted services (and their Pricing2Yaml files)
+    are deleted with them, so the same pricing can be uploaded again afterwards. Exactly the services that were read
+    are deleted: a service created while the request runs stays, with its pricings.
+
+    Disabling and deleting only ever affect the services of the organization of the request. Service names are
+    matched exactly (case-insensitively; characters such as `.`, `(` or `+` are literal), so `zoom` never affects
+    `zoom-pro`, and another organization's service with the same name, its pricings and its contracts are never
+    touched.
 
     ## Renaming and moving services
 
@@ -2471,7 +2478,7 @@ paths:
           required: false
           schema:
             type: string
-          description: Case-insensitive partial match on service name (regex "contains").
+          description: Case-insensitive partial match on service name ("contains"); the text is matched literally, not as a regular expression.
         - name: page
           in: query
           required: false
