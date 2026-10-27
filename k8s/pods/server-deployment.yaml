@@ -44,8 +44,14 @@ spec:
         volumeMounts:
           - mountPath: /usr/src/server/public
             name: space-statics
+          # Files that must not be served without authorisation (private SPHERE snapshots).
+          - mountPath: /usr/src/server/private
+            name: space-private
       restartPolicy: Always
       volumes:
         - name: space-statics
           persistentVolumeClaim:
             claimName: space-statics
+        - name: space-private
+          persistentVolumeClaim:
+            claimName: space-private

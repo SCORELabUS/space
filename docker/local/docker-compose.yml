@@ -57,6 +57,8 @@ services:
       JWT_EXPIRATION: ${JWT_EXPIRATION:-1h}
     volumes:
       - 'space-statics:/usr/src/server/public'
+      # Files that must not be served without authorisation (private SPHERE snapshots).
+      - 'space-private:/usr/src/server/private'
     depends_on:
       mongodb:
         condition: service_healthy
@@ -128,6 +130,8 @@ volumes:
   space-mongodb:
     driver: local
   space-statics:
+    driver: local
+  space-private:
     driver: local
   redis_data:
     driver: local

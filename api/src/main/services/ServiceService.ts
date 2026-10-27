@@ -24,6 +24,7 @@ import CacheService from './CacheService';
 import OrganizationRepository from '../repositories/mongoose/OrganizationRepository';
 import yaml from 'js-yaml';
 import { SphereVersionNotListedError } from './sphere/errors';
+import { isPrivateSnapshotPath, storedYamlFile } from './sphere/snapshots';
 
 /** A pricing version exists, but its Pricing2Yaml file cannot be provided. */
 export class PricingYamlUnavailableError extends Error {
@@ -423,11 +424,14 @@ class ServiceService {
     return { body, syntaxVersion: readSyntaxVersion(body) };
   }
 
-  /** Read a file under `public/static/pricings` by its public path, or undefined. */
+  /**
+   * Read a stored Pricing2Yaml file by its `yamlPath`, or undefined: files under
+   * `public/static/pricings`, and private SPHERE snapshots, which are stored
+   * outside `public/` (see sphere/snapshots.ts).
+   */
   _readStoredPricingYaml(publicPath: string): Buffer | undefined {
-    const root = path.resolve('public', 'static', 'pricings');
-    const file = path.resolve('public', `.${publicPath.startsWith('/') ? '' : '/'}${publicPath}`);
-    if (!file.startsWith(root + path.sep)) {
+    const file = storedYamlFile(publicPath);
+    if (!file) {
       return undefined;
     }
     try {
@@ -439,6 +443,12 @@ class ServiceService {
 
   async showPublicPricingUrl(serviceName: string, pricingVersion: string, organizationId: string) {
     const pricing = await this.showPricing(serviceName, pricingVersion, organizationId);
+
+    if (isPrivateSnapshotPath(pricing?.yamlPath)) {
+      throw new Error(
+        `NOT FOUND: Pricing version ${pricingVersion} of service ${serviceName} is private and has no public URL; read it with GET .../pricings/${pricingVersion}?format=yaml`
+      );
+    }
 
     if (pricing?.yamlPath) {
       return pricing.yamlPath;

@@ -102,7 +102,13 @@ describe('Private SPHERE pricings (sphereApiKey)', () => {
       if (copy.yamlPath?.startsWith('/static/pricings/sphere/')) {
         fs.rmSync(path.dirname(path.resolve('public', `.${copy.yamlPath}`)), { recursive: true, force: true });
       }
+      if (copy.yamlPath?.startsWith('/private/sphere/')) {
+        fs.rmSync(path.dirname(path.resolve(`.${copy.yamlPath}`)), { recursive: true, force: true });
+      }
     }
+    process.env.SPHERE_PUBLIC_URL = origin;
+    process.env.SPHERE_API_URL = `${origin}/api/v1`;
+    delete process.env.SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS;
     await Pricing.deleteMany({ _organizationId: organization.id });
     await Service.deleteMany({ organizationId: organization.id });
     await deleteTestOrganization(organization.id);
@@ -248,6 +254,89 @@ describe('Private SPHERE pricings (sphereApiKey)', () => {
       expect(document.sphere.target.versionId).toBe(privateId);
       const imported: any = await Pricing.findOne({ 'sphere.serviceId': id, 'sphere.versionId': privateId }).lean();
       expect(imported?.sphere.private).toBe(true);
+    });
+
+    it('stores private snapshots outside public/: not served statically, only through the authorised route', async () => {
+      const id = await linkService();
+      sphereWithKey();
+      await configure({ sphereApiKey: SPHERE_KEY });
+      sphereWithKey(true);
+      await container.resolve('sphereSyncService').synchronize(id);
+      const imported: any = await Pricing.findOne({ 'sphere.serviceId': id, 'sphere.versionId': privateId }).lean();
+
+      const publicCopy = path.resolve('public', 'static', 'pricings', 'sphere', id, `${privateId}.yaml`);
+      expect(fs.existsSync(publicCopy)).toBe(false);
+      expect(imported.yamlPath.startsWith('/static/')).toBe(false);
+      // Anonymous requests get what a file that does not exist gets, and no content.
+      const missing = await request(app).get(`/static/pricings/sphere/${id}/000000000000000000000000.yaml`);
+      const anonymous = await request(app).get(`/static/pricings/sphere/${id}/${privateId}.yaml`);
+      const anonymousStored = await request(app).get(imported.yamlPath);
+      expect(missing.status).not.toBe(200);
+      for (const response of [anonymous, anonymousStored]) {
+        expect(response.status).toBe(missing.status);
+        expect(String(response.text ?? '')).not.toContain('saasName');
+      }
+
+      const authorised = await request(app)
+        .get(`${baseUrl}/services/${serviceName}/pricings/2.0?format=yaml`)
+        .set('x-api-key', allKey)
+        .buffer(true)
+        .parse((res, done) => {
+          let body = '';
+          res.on('data', (chunk: any) => (body += chunk));
+          res.on('end', () => done(null, body));
+        });
+      expect(authorised.status).toBe(200);
+      expect(String(authorised.body)).toContain('saasName');
+      // No public URL for it either (what GET .../public-url answers).
+      await expect(
+        container.resolve('serviceService').showPublicPricingUrl(serviceName, '2.0', organization.id)
+      ).rejects.toThrow(/NOT FOUND: .*private/);
+    });
+
+    it('never sends the key to another SPHERE origin: the service is degraded instead', async () => {
+      const id = await linkService();
+      sphereWithKey();
+      await configure({ sphereApiKey: SPHERE_KEY });
+      const moved = 'https://sphere.example.org';
+      process.env.SPHERE_PUBLIC_URL = moved;
+      process.env.SPHERE_API_URL = `${moved}/api/v1`;
+      const leaked = nock(moved, { reqheaders: { 'x-api-key': SPHERE_KEY } })
+        .get(() => true)
+        .times(5)
+        .reply(200, manifest(true));
+
+      await container.resolve('sphereSyncService').synchronize(id);
+
+      expect(leaked.isDone()).toBe(false);
+      expect(leaked.pendingMocks()).toHaveLength(1);
+      const document = await stored();
+      expect(document.sphere.status).toBe('degraded');
+      expect(document.sphere.error).toContain('origin');
+      expect(document.sphere.error).not.toContain(SPHERE_KEY);
+    });
+
+    it('decrypts with SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS after a rotation and re-encrypts with the new key', async () => {
+      const id = await linkService();
+      sphereWithKey();
+      await configure({ sphereApiKey: SPHERE_KEY });
+      const before = (await stored()).sphere.encryptedApiKey;
+      process.env.SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS = process.env.SPHERE_KEY_ENCRYPTION_KEY;
+      process.env.SPHERE_KEY_ENCRYPTION_KEY = randomBytes(32).toString('base64');
+
+      const first = sphereWithKey(true);
+      await container.resolve('sphereSyncService').synchronize(id);
+      expect(first.isDone()).toBe(true);
+      expect((await stored()).sphere.status, (await stored()).sphere.error).toBe('ready');
+      expect((await stored()).sphere.encryptedApiKey.data).not.toBe(before.data);
+
+      // The previous key can now be retired: the next synchronization still sends the key.
+      delete process.env.SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS;
+      await Service.collection.updateOne({ _id: new mongoose.Types.ObjectId(id) }, { $set: { 'sphere.nextCheckAt': new Date(0) } });
+      const second = sphereWithKey();
+      await container.resolve('sphereSyncService').synchronize(id);
+      expect(second.isDone()).toBe(true);
+      expect((await stored()).sphere.status, (await stored()).sphere.error).toBe('ready');
     });
 
     it('stays on public versions without a key', async () => {

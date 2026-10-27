@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import yaml from 'js-yaml';
 import { SphereManifest } from './types';
 import { escapeVersion } from '../../utils/helpers';
+import { SphereAuthError } from './errors';
 
 export function functionalHash(text: string): string {
   const value = yaml.load(text) as Record<string, unknown>;
@@ -41,7 +42,8 @@ export default class SphereClient {
    *        visible. Redirects are refused, so the key never leaves the pinned
    *        SPHERE host.
    */
-  private async request(path: string, apiKey?: string) {
+  /** Base URL of the SPHERE API, pinned to the configured SPHERE host and protocol. */
+  private apiBase(): string {
     const base = this.base();
     const apiBase = process.env.SPHERE_API_URL || `${base.origin}${base.pathname.replace(/\/$/, '')}/api/v1`;
     const api = new URL(apiBase);
@@ -51,6 +53,14 @@ export default class SphereClient {
     if (api.protocol !== base.protocol || api.hostname !== base.hostname) {
       throw new Error('SPHERE API must use the configured host and protocol');
     }
+    return apiBase;
+  }
+  /** Origin that requests (and API keys) are sent to; stored keys are bound to it. */
+  apiOrigin(): string {
+    return new URL(this.apiBase()).origin;
+  }
+  private async request(path: string, apiKey?: string) {
+    const apiBase = this.apiBase();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
     try {
@@ -59,7 +69,7 @@ export default class SphereClient {
         headers: apiKey ? { 'x-api-key': apiKey, 'cache-control': 'no-store' } : undefined,
       });
       if (apiKey && (response.status === 401 || response.status === 403)) {
-        throw new Error(`SPHERE rejected the API key of this service (${response.status}); check sphereApiKey`);
+        throw new SphereAuthError(response.status);
       }
       if (!response.ok) throw new Error(`SPHERE unavailable (${response.status}); keeping local copies`);
       return await response.text();

@@ -1,6 +1,8 @@
 import container from '../config/container.js';
 import { createHash } from 'node:crypto';
 import ServiceService, { PricingYamlUnavailableError, PricingYamlUpstreamError } from '../services/ServiceService.js';
+import { SphereCredentialError } from '../services/sphere/credentials.js';
+import { SphereAuthError } from '../services/sphere/errors.js';
 import { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository.js';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import { FallBackSubscription } from '../types/models/Contract.js';
@@ -240,7 +242,7 @@ class ServiceController {
           return res.status(201).json(linked);
         } catch (error: any) {
           // SPHERE key problems are the caller's to fix (missing SPHERE_KEY_ENCRYPTION_KEY, rejected key).
-          if (error?.name === 'SphereCredentialError' || /SPHERE rejected the API key/.test(error?.message ?? '')) {
+          if (error instanceof SphereCredentialError || error instanceof SphereAuthError) {
             return res.status(400).json({ error: error.message });
           }
           throw error;

@@ -15,6 +15,7 @@ import { decryptSphereApiKey, encryptSphereApiKey, isValidSphereApiKey } from '.
 import { migrateSubscription, migrateUsage } from './migration';
 import { withOrganizationLock } from './lock';
 import { SphereVersionNotListedError } from './errors';
+import { PUBLIC_SNAPSHOT_PREFIX, isPrivateSnapshotPath, snapshotYamlPath, storedYamlFile } from './snapshots';
 
 export default class SphereSyncService {
   private client = new SphereClient();
@@ -36,16 +37,41 @@ export default class SphereSyncService {
     const target = selectVersion(manifest, config);
     return { ...manifest, ...link, syntaxUpgrade: await this.inspectSyntaxUpgrade(link.pricingId, target, apiKey) };
   }
-  /** Decrypted SPHERE API key of a linked service, or undefined (public versions only). */
-  private apiKey(service: any): string | undefined {
+  /** What a stored key of `service` is bound to: the service, its SPHERE pricing and the current SPHERE origin. */
+  private credentialContext(serviceId: unknown, pricingId: string) {
+    return { serviceId: String(serviceId), pricingId, origin: this.client.apiOrigin() };
+  }
+  /**
+   * Decrypted SPHERE API key of a linked service, or undefined (public versions
+   * only). Refuses (SphereCredentialError) when SPHERE is no longer the origin
+   * the key was entered for. A key that only SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS
+   * decrypts is re-encrypted with the current key and stored again.
+   */
+  private async apiKey(service: any): Promise<string | undefined> {
     const credential = service?.sphere?.encryptedApiKey;
-    return credential ? decryptSphereApiKey(credential, String(service._id)) : undefined;
+    if (!credential) return undefined;
+    const context = this.credentialContext(service._id, service.sphere.pricingId);
+    const { apiKey, rotated } = decryptSphereApiKey(credential, context);
+    if (rotated && service._id) {
+      const fresh = encryptSphereApiKey(apiKey, context);
+      try {
+        // Conditional on the credential that was read, so a key entered meanwhile is kept.
+        await this.repository.updateService({ _id: service._id, 'sphere.encryptedApiKey.data': credential.data },
+          { $set: { 'sphere.encryptedApiKey': fresh } });
+        service.sphere.encryptedApiKey = fresh;
+      } catch (error) {
+        console.error('SPHERE API key could not be re-encrypted with the current key', (error as Error).message);
+      }
+    }
+    return apiKey;
   }
   async create(config: SphereConfiguration, organizationId: string) {
     validateConfiguration(config);
     const serviceId = new mongoose.Types.ObjectId();
     // Encrypt first, so a missing SPHERE_KEY_ENCRYPTION_KEY fails before any SPHERE call or import.
-    const encryptedApiKey = config.sphereApiKey ? encryptSphereApiKey(config.sphereApiKey, String(serviceId)) : undefined;
+    const encryptedApiKey = config.sphereApiKey
+      ? encryptSphereApiKey(config.sphereApiKey, this.credentialContext(serviceId, this.client.parseLink(config.permanentUrl).pricingId))
+      : undefined;
     return withOrganizationLock(organizationId, async assertOwned => {
       const manifest = await this.preview(config);
       const version = selectVersion(manifest, config);
@@ -81,7 +107,7 @@ export default class SphereSyncService {
   async historicalPricingYaml(organizationId: string, name: string, version: string): Promise<string> {
     const service: any = await this.repository.service({ organizationId, name, source: 'sphere' });
     if (!service) throw new SphereVersionNotListedError('Historical pricing not found');
-    const apiKey = this.apiKey(service);
+    const apiKey = await this.apiKey(service);
     const manifest = await this.client.manifest(service.sphere.pricingId, apiKey);
     const remote = manifest.versions.find(v => v.version === resetEscapeVersion(version));
     if (!remote) throw new SphereVersionNotListedError('Historical version is no longer public in SPHERE');
@@ -104,8 +130,10 @@ export default class SphereSyncService {
       if (service.sphere.status === 'applying') throw new Error('Synchronization is applying; retry after recovery');
       if (config.permanentUrl && config.permanentUrl !== service.sphere.permanentUrl) throw new Error('Changing pricing identity is not supported');
       // sphereApiKey: a string replaces the stored key, null removes it, omitted keeps it.
-      const encryptedApiKey = config.sphereApiKey ? encryptSphereApiKey(config.sphereApiKey, String(service._id)) : undefined;
-      const apiKey = config.sphereApiKey === undefined ? this.apiKey(service) : config.sphereApiKey ?? undefined;
+      const encryptedApiKey = config.sphereApiKey
+        ? encryptSphereApiKey(config.sphereApiKey, this.credentialContext(service._id, service.sphere.pricingId))
+        : undefined;
+      const apiKey = config.sphereApiKey === undefined ? await this.apiKey(service) : config.sphereApiKey ?? undefined;
       // Validate the policy (and the new key) against what SPHERE shows with that key.
       const manifest = await this.client.manifest(service.sphere.pricingId, apiKey);
       selectVersion(manifest, config);
@@ -190,7 +218,7 @@ export default class SphereSyncService {
       try {
         if (!run) {
           await this.repository.updateService({ _id: id }, { $set: { 'sphere.status': 'checking', 'sphere.lastCheckedAt': new Date() } });
-          const manifest = await this.client.manifest(service.sphere.pricingId, this.apiKey(service));
+          const manifest = await this.client.manifest(service.sphere.pricingId, await this.apiKey(service));
           const candidate = selectVersion(manifest, service.sphere, service.sphere.target);
           // Check every retained public snapshot for content changes, even when the target is unchanged.
           const retained: any[] = await this.repository.pricings({ 'sphere.serviceId': id });
@@ -252,15 +280,17 @@ export default class SphereSyncService {
       if (existing.sphere.contentHash !== version.contentHash) throw new Error('An imported version changed content; publish a new SPHERE version');
       return existing;
     }
-    const text = await this.client.yaml(service.sphere.pricingId, version.versionId, this.apiKey(service));
+    const text = await this.client.yaml(service.sphere.pricingId, version.versionId, await this.apiKey(service));
     if (functionalHash(text) !== version.contentHash) throw new Error('SPHERE snapshot changed while downloading; retry');
     const parsed = retrievePricingFromText(text);
     if (parsed.version !== version.version || !sameSnapshotCreatedAt(parsed.createdAt, version.createdAt)) throw new Error(`Invalid SPHERE snapshot metadata: SPHERE lists version ${version.version} created ${version.createdAt}, the YAML says ${parsed.version} created ${new Date(parsed.createdAt).toISOString()}`);
     const data = parsePricingToSpacePricingObject(parsed);
     const errors = validatePricingData(data);
     if (errors.length) throw new Error(`Invalid pricing: ${errors.join(', ')}`);
-    const yamlPath = `/static/pricings/sphere/${service._id}/${version.versionId}.yaml`;
-    const file = path.resolve('public', '.' + yamlPath);
+    // Private versions are stored outside public/ (see snapshots.ts).
+    const yamlPath = snapshotYamlPath(String(service._id), version.versionId, version.private === true);
+    const file = storedYamlFile(yamlPath);
+    if (!file) throw new Error('Invalid SPHERE snapshot path');
     await fs.mkdir(path.dirname(file), { recursive: true });
     // Persist the parsed Pricing2Yaml model, not the remote source text. This
     // makes a confirmed legacy-syntax upgrade explicit and reproducible.
@@ -397,7 +427,10 @@ export default class SphereSyncService {
     }
   }
   private async removeCopy(copy: any) {
-    if (copy.yamlPath?.startsWith('/static/pricings/sphere/')) await fs.rm(path.resolve('public', '.' + copy.yamlPath), { force: true });
+    if (copy.yamlPath?.startsWith(PUBLIC_SNAPSHOT_PREFIX) || isPrivateSnapshotPath(copy.yamlPath)) {
+      const file = storedYamlFile(copy.yamlPath);
+      if (file) await fs.rm(file, { force: true });
+    }
     await this.repository.deletePricing({ _id: copy._id });
     await container.resolve('cacheService').del(`pricing.id.${copy._id}`);
   }

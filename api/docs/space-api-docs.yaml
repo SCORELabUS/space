@@ -92,7 +92,7 @@ info:
     - `novation-preview`: `POST /contracts/{userId}/novation/preview`.
     - `token-subscription`: the pricing token carries the `subscription` claim.
     - `contract-events`: authenticated Socket.IO namespace `/contracts` with contract events.
-    - `sphere-private`: SPHERE-linked services accept a write-only `sphereApiKey` to read private versions (`sphere.hasApiKey`).
+    - `sphere-private`: SPHERE-linked services accept a write-only `sphereApiKey` to read private versions (`sphere.hasApiKey`); private versions are never served statically.
 
   contact:
     email: agarcia29@us.es
@@ -4551,8 +4551,13 @@ components:
             Optional SPHERE API key (`sk-...`). SPACE sends it as `x-api-key` on every SPHERE request of this service,
             so that private versions the key may read are listed and imported. Use a MANAGEMENT or ALL key of the organisation
             that owns the pricing; a VIEW key only reveals what its user may read. Write-only: stored encrypted
-            (AES-256-GCM with the key in `SPHERE_KEY_ENCRYPTION_KEY`) and never returned. Rejected with 400 when
-            `SPHERE_KEY_ENCRYPTION_KEY` is not set.
+            (AES-256-GCM with the key in `SPHERE_KEY_ENCRYPTION_KEY`, bound to the service, its SPHERE pricing and the
+            SPHERE API origin) and never returned; if the SPHERE origin changes, SPACE does not send it there and the
+            service reports `degraded` until the key is entered again. Rotate the encryption key with
+            `SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS`. Rejected with 400 when `SPHERE_KEY_ENCRYPTION_KEY` is not set.
+            Private versions are stored outside the statically served files: they are only available through
+            `GET .../pricings/{version}?format=yaml` (authorised) and have no public URL (`.../public-url` answers
+            `404`).
     SphereCreateService:
       allOf:
         - $ref: '#/components/schemas/SphereConfiguration'
