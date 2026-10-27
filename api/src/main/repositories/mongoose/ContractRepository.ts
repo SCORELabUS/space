@@ -2,6 +2,10 @@ import RepositoryBase from '../RepositoryBase';
 import ContractMongoose from './models/ContractMongoose';
 import { ContractToCreate, LeanContract } from '../../types/models/Contract';
 import { toPlainObject } from '../../utils/mongoose';
+import { contractVersionGuard } from '../../utils/contracts/version';
+
+/** Escape a string for use as a literal inside a regular expression. */
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 type ContractMatchPipeline = {
   pipeline: any[];
@@ -385,6 +389,103 @@ class ContractRepository extends RepositoryBase {
     }
 
     return rejected;
+  }
+
+  /**
+   * userIds of every contract of the organization that names any of these
+   * services in `contractedServices`, `subscriptionPlans`,
+   * `subscriptionAddOns` or `usageLevels`, compared case-insensitively (keys
+   * are lowercased on write, but older documents may not be). Not paginated.
+   */
+  async findUserIdsReferencingServices(organizationId: string, serviceNames: string[]): Promise<string[]> {
+    if (!organizationId) throw new Error('An organization is required to look for the contracts of a service');
+    if (serviceNames.length === 0) return [];
+    const names = serviceNames.map(name => new RegExp(`^${escapeRegex(name)}$`, 'i'));
+    const keysOf = (field: string) => ({
+      $map: { input: { $objectToArray: { $ifNull: [`$${field}`, {}] } }, in: '$$this.k' },
+    });
+    const rows = await ContractMongoose.aggregate([
+      { $match: { organizationId } },
+      {
+        $project: {
+          userId: '$userContact.userId',
+          keys: {
+            $concatArrays: [
+              keysOf('contractedServices'),
+              keysOf('subscriptionPlans'),
+              keysOf('subscriptionAddOns'),
+              keysOf('usageLevels'),
+            ],
+          },
+        },
+      },
+      { $match: { keys: { $in: names } } },
+      { $project: { _id: 0, userId: 1 } },
+    ]);
+    return rows.map(row => String(row.userId));
+  }
+
+  /**
+   * Remove services from one contract, as it was read (`contract`): their
+   * entries in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns`
+   * and `usageLevels` (keys compared case-insensitively) are unset, the
+   * previous subscription is recorded in `history`, and a contract left without
+   * services ends now and stops renewing (it is kept: its user contact and
+   * history stay, and it can be novated to other services).
+   *
+   * Targeted (`$unset`/`$push`/`$set` of those paths only) and conditional on
+   * the version of the contract that was read (`contractVersionGuard`): when a
+   * novation, renewal or synchronization changed the contract in between,
+   * nothing is written and null is returned, so the caller re-reads and
+   * retries. Consumption is not part of the version and is never overwritten.
+   *
+   * @returns the contract after the write, `contract` itself when it names
+   *          none of the services, or null when the guard no longer held.
+   */
+  async removeServicesFromContract(contract: LeanContract, serviceNames: string[]): Promise<LeanContract | null> {
+    const names = new Set(serviceNames.map(name => name.toLowerCase()));
+    const plain = (value: any): Record<string, any> =>
+      value instanceof Map ? Object.fromEntries(value) : value ?? {};
+    const matching = (value: any) => Object.keys(plain(value)).filter(key => names.has(key.toLowerCase()));
+
+    const $unset: Record<string, ''> = {};
+    let subscriptionChanged = false;
+    for (const field of ['contractedServices', 'subscriptionPlans', 'subscriptionAddOns', 'usageLevels'] as const) {
+      for (const key of matching(contract[field])) {
+        $unset[`${field}.${key}`] = '';
+        if (field !== 'usageLevels') subscriptionChanged = true;
+      }
+    }
+    if (Object.keys($unset).length === 0) return contract;
+
+    const update: Record<string, any> = { $unset };
+    const now = new Date();
+    if (subscriptionChanged) {
+      update.$push = {
+        history: {
+          startDate: contract.billingPeriod.startDate,
+          endDate: now,
+          contractedServices: plain(contract.contractedServices),
+          subscriptionPlans: plain(contract.subscriptionPlans),
+          subscriptionAddOns: plain(contract.subscriptionAddOns),
+        },
+      };
+    }
+    const remaining = Object.keys(plain(contract.contractedServices)).filter(key => !names.has(key.toLowerCase()));
+    if (subscriptionChanged && remaining.length === 0) {
+      const endDate = new Date(contract.billingPeriod.endDate);
+      update.$set = {
+        'billingPeriod.endDate': endDate.getTime() < now.getTime() ? endDate : now,
+        'billingPeriod.autoRenew': false,
+      };
+    }
+
+    const written = await ContractMongoose.findOneAndUpdate(
+      { ...contractVersionGuard(contract), ...byUserId(contract.userContact.userId, contract.organizationId) },
+      update,
+      { new: true }
+    );
+    return written ? toPlainObject<LeanContract>(written.toJSON()) : null;
   }
 
   /** userId, organization and contracted services of every contract of an organization (for events). */

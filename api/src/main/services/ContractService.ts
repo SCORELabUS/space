@@ -12,7 +12,7 @@ import {
 } from '../types/models/Contract';
 import ContractRepository from '../repositories/mongoose/ContractRepository';
 import { validateContractQueryFilters } from './validation/ContractServiceValidation';
-import ServiceService from './ServiceService';
+import ServiceService, { DormantReason, DormantServiceError } from './ServiceService';
 import { LeanPricing, LeanUsageLimit } from '../types/models/Pricing';
 import { addDays, isAfter } from 'date-fns';
 import {
@@ -64,6 +64,11 @@ export interface NovationPreview {
   usageWarnings: { service: string; usageLimit: string; consumed: number; newLimit: number }[];
   billingPeriod: { startDate: string; endDate: string; restarts: boolean };
   contractVersion: string;
+  /**
+   * Services of the resulting subscription that are dormant (disabled): kept
+   * unchanged, their features stay unavailable until they are enabled again.
+   */
+  dormantServices: string[];
 }
 
 /**
@@ -118,6 +123,13 @@ export interface ContractPricing {
   newContractsVersion: string | null;
   plan?: string;
   addOns: Record<string, number>;
+  /**
+   * Whether the service itself is enabled. `disabled`: its features are not
+   * available until a pricing with its saasName is uploaded again (all its
+   * versions are archived meanwhile); `not-found`: the organization no longer
+   * has it.
+   */
+  serviceStatus: 'enabled' | 'disabled' | 'not-found';
 }
 
 /** Options shared by the novation routes (see S8 in the API docs). */
@@ -319,6 +331,10 @@ class ContractService {
     const novated = performNovation(structuredClone(contract), subscription, {
       keepBillingPeriod: options.keepBillingPeriod,
     });
+    const dormant = await this.serviceService.dormantServices(
+      Object.keys(subscription.contractedServices),
+      contract.organizationId
+    );
 
     return {
       valid: errors.length === 0,
@@ -338,6 +354,7 @@ class ContractService {
         restarts: !options.keepBillingPeriod,
       },
       contractVersion: computeContractVersion(contract),
+      dormantServices: Object.keys(dormant),
     };
   }
 
@@ -417,6 +434,14 @@ class ContractService {
   ): Promise<{ contract: LeanContract; services: Record<string, ContractPricing> }> {
     const contract = await this.show(userId, organizationId);
     const services: Record<string, ContractPricing> = {};
+    const dormant = await this.serviceService.dormantServices(
+      Object.keys(contract.contractedServices),
+      contract.organizationId
+    );
+    const serviceStatus = (serviceName: string): ContractPricing['serviceStatus'] => {
+      const reason = dormant[serviceName.toLowerCase()];
+      return reason === 'SERVICE_DISABLED' ? 'disabled' : reason === 'SERVICE_NOT_FOUND' ? 'not-found' : 'enabled';
+    };
 
     for (const [serviceName, version] of Object.entries(contract.contractedServices)) {
       const status = await this.serviceService.pricingVersionStatus(serviceName, version, contract.organizationId);
@@ -440,6 +465,7 @@ class ContractService {
         newContractsVersion,
         plan: contract.subscriptionPlans?.[serviceName],
         addOns: contract.subscriptionAddOns?.[serviceName] ?? {},
+        serviceStatus: serviceStatus(serviceName),
       };
     }
 
@@ -902,16 +928,27 @@ class ContractService {
     organizationId: string
   ): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
+    // Usage levels of dormant services are kept as they are: they cannot be
+    // consumed, and resets leave them alone.
+    const dormant = await this.serviceService.dormantServices(
+      [...Object.keys(contract.contractedServices ?? {}), ...Object.keys(contract.usageLevels ?? {})],
+      contract.organizationId
+    );
 
     if (queryParams.usageLimit) {
       await this._resetUsageLimitUsageLevels(
         contract,
         queryParams.usageLimit,
-        contract.organizationId
+        contract.organizationId,
+        dormant
       );
     } else if (queryParams.reset) {
-      await this._resetUsageLevels(contract, queryParams.renewableOnly, contract.organizationId);
+      await this._resetUsageLevels(contract, queryParams.renewableOnly, contract.organizationId, dormant);
     } else if (usageLevelsIncrements) {
+      for (const serviceName in usageLevelsIncrements) {
+        const reason = dormant[serviceName.toLowerCase()];
+        if (reason) throw new DormantServiceError(serviceName.toLowerCase(), reason);
+      }
       for (const serviceName in usageLevelsIncrements) {
         for (const usageLimit in usageLevelsIncrements[serviceName]) {
           if (contract.usageLevels[serviceName][usageLimit]) {
@@ -1057,6 +1094,11 @@ class ContractService {
     const serviceName: string = featureId.split('-')[0].toLowerCase();
     const featureName: string = featureId.split('-')[1];
 
+    const dormant = (await this.serviceService.dormantServices([serviceName], contract.organizationId))[serviceName];
+    if (dormant && contract.contractedServices[serviceName] !== undefined) {
+      throw new DormantServiceError(serviceName, dormant);
+    }
+
     const pricing: LeanPricing = await this.serviceService.showPricing(
       serviceName,
       contract.contractedServices[serviceName],
@@ -1190,9 +1232,14 @@ class ContractService {
     return usageLevels;
   }
 
-  _discoverUsageLimitServices(contract: LeanContract, usageLimit: string): string[] {
+  _discoverUsageLimitServices(
+    contract: LeanContract,
+    usageLimit: string,
+    dormant: Record<string, DormantReason> = {}
+  ): string[] {
     const serviceNames: string[] = [];
     for (const serviceName in contract.usageLevels) {
+      if (dormant[serviceName.toLowerCase()]) continue;
       if (contract.usageLevels[serviceName][usageLimit]) {
         serviceNames.push(serviceName);
       }
@@ -1203,11 +1250,14 @@ class ContractService {
   async _resetUsageLimitUsageLevels(
     contract: LeanContract,
     usageLimit: string,
-    organizationId: string
+    organizationId: string,
+    dormant: Record<string, DormantReason> = {}
   ): Promise<void> {
-    const serviceNames: string[] = this._discoverUsageLimitServices(contract, usageLimit);
+    const serviceNames: string[] = this._discoverUsageLimitServices(contract, usageLimit, dormant);
 
     if (serviceNames.length === 0) {
+      const [dormantService] = this._discoverUsageLimitServices(contract, usageLimit);
+      if (dormantService) throw new DormantServiceError(dormantService.toLowerCase(), dormant[dormantService.toLowerCase()]);
       throw new Error(
         `Usage limit: ${usageLimit} not found in the contract. Maybe it's not being tracked as usage level`
       );
@@ -1245,9 +1295,11 @@ class ContractService {
   async _resetUsageLevels(
     contract: LeanContract,
     renewableOnly: boolean,
-    organizationId: string
+    organizationId: string,
+    dormant: Record<string, DormantReason> = {}
   ): Promise<void> {
     for (const serviceName in contract.usageLevels) {
+      if (dormant[serviceName.toLowerCase()]) continue;
       for (const usageLimit in contract.usageLevels[serviceName]) {
         if (renewableOnly && !contract.usageLevels[serviceName][usageLimit].resetTimeStamp) {
           continue;

@@ -31,7 +31,8 @@ async function generateTokenFromEvalResult(
   subscriptionContext: SubscriptionContext,
   evalResult: DetailedFeatureEvaluation,
   subscription: PricingTokenSubscription | undefined,
-  organizationId: string
+  organizationId: string,
+  dormantServices: string[] = []
 ): Promise<string> {
   if (!JWT_SECRET) {
     throw new Error('JWT_SECRET environment variable is not defined!');
@@ -60,6 +61,9 @@ async function generateTokenFromEvalResult(
     pricingContext: pricingContext,
     subscriptionContext: subscriptionContext,
     ...(subscription ? { subscription } : {}),
+    // Services of the subscription that are disabled (or gone): their features
+    // are not in `features`. Only present when there are any.
+    ...(dormantServices.length > 0 ? { dormantServices } : {}),
   };
 
   const token = await new SignJWT(payload)
