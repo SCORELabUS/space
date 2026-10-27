@@ -9,6 +9,7 @@
     "generate-test-env": "chmod +x generate-test-env.sh && chmod +x retrieve-space-api-key.sh && ./generate-test-env.sh",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test": "tsx --test tests/*.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -34,6 +35,7 @@
     "globals": "^16.0.0",
     "prettier-plugin-tailwindcss": "^0.6.11",
     "tailwindcss": "^4.1.8",
+    "tsx": "^4.19.4",
     "typescript": "~5.8.3",
     "typescript-eslint": "^8.30.1",
     "vite": "^6.3.5",
