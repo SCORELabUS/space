@@ -114,6 +114,7 @@ info:
     - `novation-preview`: `POST /contracts/{userId}/novation/preview`.
     - `token-subscription`: the pricing token carries the `subscription` claim.
     - `contract-events`: authenticated Socket.IO namespace `/contracts` with contract events.
+    - `contract-event-ids`: every event (`/contracts` and `/pricings`) carries `eventId` and `occurredAt` (see the `Events` tag for what they guarantee and what they do not).
     - `sphere-private`: SPHERE-linked services accept a write-only `sphereApiKey` to read private versions (`sphere.hasApiKey`); private versions are never served statically.
     - `contract-userid-per-org`: a `userId` is unique per organization (see above), pricing tokens identify the contract by organization (`sub` = `urn:space:<organizationId>:<percent-encoded userId>`, `userId`, `organizationId`, `aud`, `iss`; see `PricingTokenPayload`), and platform ADMIN users name the organization (`organizationId`) on the direct routes that address contracts by `userId` or `groupId` (`400 ORGANIZATION_ID_REQUIRED` otherwise).
 
@@ -157,13 +158,13 @@ tags:
       WebSocket events (Socket.IO, path `/events`, transport `websocket`).
 
       - Namespace `/pricings` (public): `message` events `{ code: PRICING_CREATED | PRICING_ARCHIVED |
-        PRICING_ACTIVED | SERVICE_DISABLED, details: { serviceName, pricingVersion? } }`.
+        PRICING_ACTIVED | SERVICE_DISABLED, eventId, occurredAt, details: { serviceName, pricingVersion? } }`.
       - Namespace `/contracts` (authenticated): handshake `auth: { apiKey }` or an `x-api-key` header. Organization
         API keys of any scope receive the events of their organization; user API keys must also send
         `auth.organizationId` of an organization they own or belong to (ADMIN users: any organization). Only events
         of that organization are delivered, as `message` events
-        `{ code: CONTRACT_CREATED | CONTRACT_NOVATED | CONTRACT_DELETED | CONTRACT_RENEWED,
-        details: { userId, organizationId, contractVersion, services } }` (`contractVersion` is `null` for
+        `{ code: CONTRACT_CREATED | CONTRACT_NOVATED | CONTRACT_DELETED | CONTRACT_RENEWED, eventId, occurredAt,
+        details: { userId, organizationId, contractVersion, services } }` (schema `ContractEvent`) (`contractVersion` is `null` for
         `CONTRACT_DELETED`; `services` are the contracted services). Events are emitted after the change is stored,
         including novations by group (also the contracts a partly rejected guarded group novation did write),
         billing period changes (`CONTRACT_NOVATED`, since they change `contractVersion`), SPHERE synchronization,
@@ -175,6 +176,44 @@ tags:
         Authorization is checked once, at the handshake. A connection stays open after its API key is removed or
         its user leaves the organization, until it disconnects; revoke access by restarting the connection
         (for example after rotating keys) if that matters.
+
+      **Event identity** (capability `contract-event-ids`). Every event of both namespaces also carries, next to
+      `code` and `details` (unchanged):
+      - `eventId`: a UUIDv7 that identifies the event. Every copy of one event (every connection, on every
+        instance) has the same `eventId`, and two events never share one. Compare it for equality only: it sorts
+        roughly by emission time, which is not the order in which the changes were stored.
+      - `occurredAt`: ISO 8601 in UTC with milliseconds (`2026-10-27T10:00:00.123Z`), the clock of the API
+        instance that stored the change, taken when the write returned. Clocks of different instances may differ.
+
+      **Delivery guarantees.** Events are notifications that something changed, not a log of the changes:
+      - *At most once per connection, no replay.* An event goes to the connections open when it is emitted.
+        Nothing is stored or replayed (Socket.IO connection state recovery is not enabled), so a consumer that is
+        disconnected or reconnecting misses what happens meanwhile; so does every connection of an instance that
+        has lost its Redis subscription. An instance that stops after storing a change and before emitting its
+        event loses that event.
+      - *Several API instances* (Socket.IO Redis adapter, enabled by `REDIS_URL`): the emitting instance sends the
+        event to its own connections and publishes it once to Redis, and every other instance sends it to its own
+        connections. Each connection gets one copy. A consumer with several connections (several replicas, or a new
+        connection opened before the old one closed) gets one copy per connection, all with the same `eventId`.
+        Events relayed through Redis may arrive later than local ones (for example while the publisher reconnects).
+      - *No ordering.* Events of concurrent requests may be emitted in another order than their changes were
+        stored, and `contractVersion` is an opaque hash, not a counter. For group novations, SPHERE synchronization
+        and the contracts a partly rejected guarded group novation wrote, `details` are read again after the
+        write, so their `contractVersion` may already be that of a later change.
+      - *Not every change is announced.* Consumption, usage level resets and user contact changes emit nothing
+        (they are not part of `contractVersion`), and neither does renaming a service or moving it to another
+        organization (`PUT /services/{serviceName}`), although that changes contracts.
+
+      **Consuming them.**
+      - Drop duplicates by `eventId`: remember the ids seen in a short window (a few minutes, or the last few
+        thousand ids) and ignore repeats. Copies of one event are emitted together, so a short window is enough.
+      - Treat a contract event as a hint to re-read the contract, not as its state: `GET /contracts/{userId}`
+        returns the current contract and `contractVersion` (unchanged from what you hold: nothing to do; `404`:
+        deleted). A duplicate, late or out-of-order event then costs one read and changes nothing.
+      - Resynchronize after every (re)connection, and periodically if missing a change matters: re-read the
+        contracts you hold, or page through `GET /contracts` (at most 100 per page) comparing `contractVersion`;
+        contracts that are no longer listed were deleted. There is no "changed since" query: contracts do not
+        store when they were last modified.
   - name: Healthcheck
     description: Service health verification (Public)
 
@@ -4928,12 +4967,26 @@ components:
 
     ContractEvent:
       type: object
-      description: Socket.IO `message` event of the `/contracts` namespace (not an HTTP response).
-      required: [code, details]
+      description: |
+        Socket.IO `message` event of the `/contracts` namespace (not an HTTP response). A hint to re-read the
+        contract: delivery is at most once per connection, without replay or ordering (see the `Events` tag).
+      required: [code, eventId, occurredAt, details]
       properties:
         code:
           type: string
           enum: [CONTRACT_CREATED, CONTRACT_NOVATED, CONTRACT_DELETED, CONTRACT_RENEWED]
+        eventId:
+          type: string
+          format: uuid
+          description: |
+            UUIDv7 of this event, the same in every copy of it (every connection and instance); drop repeats.
+            Compare for equality only, never to order changes. Capability `contract-event-ids`.
+        occurredAt:
+          type: string
+          format: date-time
+          description: |
+            When the change was stored (ISO 8601, UTC, milliseconds), by the clock of the API instance that stored
+            it. Capability `contract-event-ids`.
         details:
           type: object
           required: [userId, organizationId, contractVersion, services]
@@ -4952,6 +5005,8 @@ components:
                 type: string
       example:
         code: CONTRACT_NOVATED
+        eventId: 019a2a6b-7c1e-7d3f-9b2a-5c4e8f1a2b3c
+        occurredAt: '2026-10-27T10:00:00.123Z'
         details:
           userId: 01c36d29-0d6a-4b41-83e9-8c6d9310c508
           organizationId: 507f1f77bcf86cd799439012

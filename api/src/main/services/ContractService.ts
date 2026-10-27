@@ -566,11 +566,12 @@ class ContractService {
     };
 
     const contract = await this.contractRepository.create(contractDataToCreate);
+    const occurredAt = new Date();
 
     contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
 
     await this.cacheService.set(contractCacheKey(contract.organizationId, contract.userContact.userId), contract, 3600, true); // Cache for 1 hour
-    this._events()?.emitContractEvent('CONTRACT_CREATED', contract);
+    this._events()?.emitContractEvent('CONTRACT_CREATED', contract, { occurredAt });
 
     return contract;
   }
@@ -629,6 +630,7 @@ class ContractService {
       contract.organizationId,
       guard
     );
+    const occurredAt = new Date();
 
     if (!result && expected !== undefined) {
       const latest = await this.contractRepository.findByUserId(userId, contract.organizationId);
@@ -647,7 +649,7 @@ class ContractService {
 
     await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
     await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
-    this._events()?.emitContractEvent('CONTRACT_NOVATED', result);
+    this._events()?.emitContractEvent('CONTRACT_NOVATED', result, { occurredAt });
 
     return result;
   }
@@ -697,6 +699,7 @@ class ContractService {
     }
 
     const updatedContracts: LeanContract[] = [];
+    let occurredAt: Date;
 
     for (const contract of contracts) {
       // Resolved per contract: kept versions and the SPHERE policy may differ.
@@ -718,6 +721,7 @@ class ContractService {
           guard: guards.get(contract.userContact.userId)!,
         }))
       );
+      occurredAt = new Date();
       if (rejected.length > 0) {
         const changed: Record<string, string | null> = {};
         for (const userId of rejected) {
@@ -737,12 +741,13 @@ class ContractService {
         // Those writes are persisted: announce them before reporting the failure.
         for (const userId of novated) {
           const written = await this.contractRepository.findByUserId(userId, organizationId);
-          if (written) this._events()?.emitContractEvent('CONTRACT_NOVATED', written);
+          if (written) this._events()?.emitContractEvent('CONTRACT_NOVATED', written, { occurredAt });
         }
         throw new ContractChangedError(changed, novated);
       }
     } else {
       const result = await this.contractRepository.bulkUpdate(updatedContracts);
+      occurredAt = new Date();
 
       if (!result) {
         throw new Error(`Failed to update contracts for groupId ${groupId} within organization ${organizationId}`);
@@ -755,7 +760,7 @@ class ContractService {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
       this.cacheService.set(contractCacheKey(contract.organizationId, contract.userContact.userId), contract, 3600, true); // Cache for 1 hour
       this.cacheService.del(featuresCachePattern(contract.organizationId, contract.userContact.userId));
-      this._events()?.emitContractEvent('CONTRACT_NOVATED', contract);
+      this._events()?.emitContractEvent('CONTRACT_NOVATED', contract, { occurredAt });
     }
 
     return contractsToReturn;
@@ -777,6 +782,7 @@ class ContractService {
     contract.billingPeriod.endDate = newEndDate;
 
     const result = await this.contractRepository.update(userId, contract, contract.organizationId);
+    const occurredAt = new Date();
 
     if (!result) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -786,7 +792,7 @@ class ContractService {
 
     await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
     await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
-    this._events()?.emitContractEvent('CONTRACT_RENEWED', result);
+    this._events()?.emitContractEvent('CONTRACT_RENEWED', result, { occurredAt });
 
     return result;
   }
@@ -834,6 +840,7 @@ class ContractService {
     };
 
     const result = await this.contractRepository.update(userId, contract, contract.organizationId);
+    const occurredAt = new Date();
 
     if (!result) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -844,7 +851,7 @@ class ContractService {
     await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
     await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
     // The billing period is part of contractVersion.
-    this._events()?.emitContractEvent('CONTRACT_NOVATED', result);
+    this._events()?.emitContractEvent('CONTRACT_NOVATED', result, { occurredAt });
 
     return result;
   }
@@ -876,6 +883,7 @@ class ContractService {
     }
 
     const result = await this.contractRepository.bulkUpdate(updatedContracts);
+    const occurredAt = new Date();
 
     if (!result) {
       throw new Error(`Failed to update contracts for groupId ${groupId} within organization ${organizationId}`);
@@ -889,7 +897,7 @@ class ContractService {
 
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
-      this._events()?.emitContractEvent('CONTRACT_NOVATED', contract);
+      this._events()?.emitContractEvent('CONTRACT_NOVATED', contract, { occurredAt });
     }
 
     return contractsToReturn;
@@ -1117,7 +1125,8 @@ class ContractService {
         // What each deleted contract was, for its CONTRACT_DELETED event.
         const deleted = await this.contractRepository.findEventSummaries(org);
         removed += await this.contractRepository.prune(org);
-        for (const contract of deleted) this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true });
+        const occurredAt = new Date();
+        for (const contract of deleted) this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true, occurredAt });
         const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
         for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
       };
@@ -1137,9 +1146,10 @@ class ContractService {
     const contract = await this._findContract(userId, organizationId);
 
     await this.contractRepository.destroy(userId, contract.organizationId);
+    const occurredAt = new Date();
 
     await this.cacheService.delMany(contractCacheKeys(contract));
-    this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true });
+    this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true, occurredAt });
   }
 
   async _getCachedUsageLevel(

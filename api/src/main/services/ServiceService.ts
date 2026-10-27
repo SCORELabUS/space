@@ -1378,6 +1378,7 @@ class ServiceService {
       });
 
       const resultNovations = await this.contractRepository.bulkUpdate(pricingVersionContracts);
+      const occurredAt = new Date();
 
       if (!resultNovations) {
         throw new Error(`Failed to novate contracts for service ${serviceName}`);
@@ -1386,7 +1387,7 @@ class ServiceService {
       // The cached copies still have the archived version.
       await this.cacheService.delMany(pricingVersionContracts.flatMap(contract => contractCacheKeys(contract)));
       for (const contract of pricingVersionContracts) {
-        this.eventService.emitContractEvent?.('CONTRACT_NOVATED', contract);
+        this.eventService.emitContractEvent?.('CONTRACT_NOVATED', contract, { occurredAt });
       }
     }
   }

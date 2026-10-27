@@ -360,10 +360,11 @@ export default class SphereSyncService {
         contractedServices: contract.contractedServices, subscriptionPlans: contract.subscriptionPlans,
         subscriptionAddOns: contract.subscriptionAddOns,
         [usagePath]: contract.usageLevels?.[service.name] ?? { $exists: false } }, update);
+      const occurredAt = new Date();
       if (result.modifiedCount) {
         await this.repository.updateRun({ _id: run._id }, { $inc: { migrated: 1, replaced: migrated.replaced ? 1 : 0 } });
         for (const key of contractCacheKeys(contract)) await container.resolve('cacheService').del(key);
-        await this.emitNovated(contract._id);
+        await this.emitNovated(contract._id, occurredAt);
         return;
       }
       contract = await this.repository.contract({ _id: contract._id });
@@ -397,8 +398,9 @@ export default class SphereSyncService {
           fromVersion: resetEscapeVersion(contract.contractedServices[service.name]), reason: 'service_removed', at: new Date() } } };
       if (Object.keys(contract.contractedServices).length === 1) update.$set = { 'billingPeriod.endDate': new Date(), 'billingPeriod.autoRenew': false };
       const removed = await this.repository.updateContract({ _id: contract._id, contractedServices: contract.contractedServices }, update);
+      const removedAt = new Date();
       for (const key of contractCacheKeys(contract)) await container.resolve('cacheService').del(key);
-      if (removed?.modifiedCount) await this.emitNovated(contract._id);
+      if (removed?.modifiedCount) await this.emitNovated(contract._id, removedAt);
     }
     await assertOwned();
     if (disable) {
@@ -413,13 +415,13 @@ export default class SphereSyncService {
     await this.invalidate(service);
     return true;
   }
-  /** Tell the contract's organization that synchronization changed its binding (after the write). */
-  private async emitNovated(contractId: unknown) {
+  /** Tell the contract's organization that synchronization changed its binding (`occurredAt`: when it was written). */
+  private async emitNovated(contractId: unknown, occurredAt: Date) {
     try {
       const events = container.resolve('eventService');
       if (typeof events?.emitContractEvent !== 'function') return;
       const updated = await this.repository.contract({ _id: contractId });
-      if (updated) events.emitContractEvent('CONTRACT_NOVATED', updated);
+      if (updated) events.emitContractEvent('CONTRACT_NOVATED', updated, { occurredAt });
     } catch (error) {
       console.error('Contract event could not be emitted', (error as Error).message);
     }
