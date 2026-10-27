@@ -7,6 +7,7 @@ import { deletePricingVersion, getPricingYaml } from '@/api/services/servicesApi
 import useAuth from '@/hooks/useAuth';
 import { useOrganization } from '@/hooks/useOrganization';
 import { useCustomAlert } from '@/hooks/useCustomAlert';
+import { sphereViewLink } from '@/lib/sphereUrl';
 
 interface DragDropPricingsProps {
   activePricings: Pricing[];
@@ -152,19 +153,19 @@ export default function DragDropPricings({
   }
 
   /**
-   * The SPHERE editor loads a pricing from a public URL. Files stored by SPACE
-   * have none (they need credentials), so only URL pricings can be opened there.
+   * SPHERE opens SPHERE snapshots through its permanent link (with its own permissions) and
+   * pricings defined by an external URL in its editor. Files stored by SPACE need the
+   * organization's credentials, so SPHERE cannot open them and the action is not offered.
    */
-  function sphereEditorUrl(pricing: Pricing): string | null {
-    const url = pricing.url && /^https?:\/\//.test(pricing.url) ? pricing.url : null;
-    return url ? `https://sphere.score.us.es/editor?pricingUrl=${encodeURI(url)}` : null;
+  function sphereLink(pricing: Pricing) {
+    return sphereViewLink(pricing, import.meta.env.SPHERE_PUBLIC_URL);
   }
 
   function handleOpenInSphere(pricing: Pricing) {
-    const sphereUrl = sphereEditorUrl(pricing);
+    const link = sphereLink(pricing);
 
-    if (sphereUrl) {
-      window.open(sphereUrl, '_blank', 'noopener,noreferrer');
+    if (link) {
+      window.open(link.url, '_blank', 'noopener,noreferrer');
     }
   }
 
@@ -355,7 +356,7 @@ export default function DragDropPricings({
                         >
                           <FiDownload size={13} /> Download YAML
                         </button>
-                        {sphereEditorUrl(pricing) && (
+                        {sphereLink(pricing) && (
                           <button
                             type="button"
                             disabled={menuActionLoadingVersion === pricing.version}
