@@ -24,6 +24,7 @@ const EXPECTED = [
   'contract-events',
   'sphere-private',
   'contract-userid-per-org',
+  'service-disable-dormant',
 ];
 
 const tokens = (response: request.Response) =>
