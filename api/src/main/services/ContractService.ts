@@ -80,9 +80,10 @@ function usageBelowConsumption(
     const limits: Record<string, number | boolean | undefined> = { ...(planKey ? pricing.plans![planKey].usageLimits ?? {} : {}) };
     const selected = subscription.subscriptionAddOns[service] ?? {};
 
-    for (const [addOnName, quantity] of Object.entries(selected)) {
-      const addOn = pricing.addOns?.[addOnName];
-      if (!addOn || !(quantity > 0)) continue;
+    // In pricing order, as feature evaluation applies them (later add-ons win).
+    for (const [addOnName, addOn] of Object.entries(pricing.addOns ?? {})) {
+      const quantity = selected[addOnName];
+      if (!(quantity > 0)) continue;
       for (const [limit, value] of Object.entries(addOn.usageLimits ?? {})) limits[limit] = value;
       for (const [limit, value] of Object.entries(addOn.usageLimitsExtensions ?? {})) {
         if (typeof limits[limit] === 'number') limits[limit] = (limits[limit] as number) + value * quantity;
@@ -197,10 +198,20 @@ class ContractService {
     contract: LeanContract,
     requested: any
   ): Promise<{
-    subscription: { contractedServices: Record<string, string>; subscriptionPlans: Record<string, string>; subscriptionAddOns: Record<string, Record<string, number>> };
+    subscription: {
+      contractedServices: Record<string, string>;
+      subscriptionPlans: Record<string, string>;
+      subscriptionAddOns: Record<string, Record<string, number>>;
+      billingPeriod?: { autoRenew?: boolean };
+    };
     reasons: Record<string, string>;
   }> {
-    const subscription = {
+    const subscription: {
+      contractedServices: Record<string, string>;
+      subscriptionPlans: Record<string, string>;
+      subscriptionAddOns: Record<string, Record<string, number>>;
+      billingPeriod?: { autoRenew?: boolean };
+    } = {
       contractedServices: convertKeysToLowercase<string>(structuredClone(requested?.contractedServices ?? {})),
       subscriptionPlans: convertKeysToLowercase<string>(structuredClone(requested?.subscriptionPlans ?? {})),
       subscriptionAddOns: convertKeysToLowercase<Record<string, number>>(structuredClone(requested?.subscriptionAddOns ?? {})),
@@ -228,13 +239,15 @@ class ContractService {
     }
 
     const beforePolicy = { ...subscription.contractedServices };
-    await enforceSpherePolicy(contract.organizationId, subscription, contract);
+    const decidedBy = await enforceSpherePolicy(contract.organizationId, subscription, contract);
     for (const [service, version] of Object.entries(subscription.contractedServices)) {
       if (escapeVersion(String(version)) !== escapeVersion(String(beforePolicy[service]))) {
-        const linked: any = await ServiceModel.findOne({ organizationId: contract.organizationId, source: 'sphere', name: { $regex: `^${service.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } }).lean();
-        reasons[service] = `policy:${linked?.sphere?.policy ?? 'sphere'}`;
+        reasons[service] = `policy:${decidedBy[service] ?? 'sphere'}`;
       }
     }
+
+    // Billing period fields of the body (autoRenew) are applied by performNovation, as before.
+    if (requested?.billingPeriod !== undefined) subscription.billingPeriod = structuredClone(requested.billingPeriod);
 
     return { subscription, reasons };
   }

@@ -181,6 +181,41 @@ describe('Novation preview (dry run)', function () {
     expect(response.body.usageWarnings).toEqual([]);
   });
 
+  it('applies add-ons in pricing order, as feature evaluation does', async function () {
+    // petPack (first in the pricing) sets maxPets to 2; extraPets then extends it by 1 per unit.
+    await addPetclinicVersion(app, allKey, storedName, '3.0', '2025-07-01', pricing => {
+      pricing.plans.BASIC.usageLimits = { maxPets: { value: 1 } };
+      pricing.addOns = {
+        petPack: { availableFor: ['BASIC', 'GOLD', 'PLATINUM'], price: 5, usageLimits: { maxPets: { value: 2 } } },
+        ...pricing.addOns,
+      };
+    });
+    await request(app)
+      .put(`${baseUrl}/contracts/${userId}/usageLevels`)
+      .set('x-api-key', allKey)
+      .send({ [serviceName]: { maxPets: 3 } });
+
+    // Selected in the other order: 2 + 1 = 3 is not below 3.
+    const response = await preview(subscription('BASIC', { extraPets: 1, petPack: 1 }, '3.0'));
+
+    expect(response.body.valid, JSON.stringify(response.body.errors)).toBe(true);
+    expect(response.body.usageWarnings).toEqual([]);
+  });
+
+  it('keeps applying billingPeriod.autoRenew of a novation body, as before', async function () {
+    // The contract was created without autoRenew (false); the novation body turns it on.
+    expect((await stored()).billingPeriod.autoRenew).toBe(false);
+    const body = { ...subscription('PLATINUM'), billingPeriod: { autoRenew: true } };
+
+    const previewed = await preview(body);
+    const applied = await request(app).put(`${baseUrl}/contracts/${userId}`).set('x-api-key', allKey).send(body);
+
+    expect(previewed.status).toBe(200);
+    expect(applied.status, JSON.stringify(applied.body)).toBe(200);
+    expect(applied.body.billingPeriod.autoRenew).toBe(true);
+    expect((await stored()).billingPeriod.autoRenew).toBe(true);
+  });
+
   it('keeps the billing period with keepBillingPeriod (query or body)', async function () {
     const before = await stored();
 
