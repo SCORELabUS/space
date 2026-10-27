@@ -4688,14 +4688,19 @@ components:
         status:
           type: string
           enum: [active, archived]
-          description: '`archived` also covers versions no longer listed by the service (e.g. SPHERE history).'
+          description: |
+            `archived` also covers versions no longer listed by the service (e.g. SPHERE history) and services
+            that no longer exist in the organization (deleted or disabled); for those, `yamlUrl` answers `404`
+            and `newContractsVersion` is `null`.
         yamlUrl:
           type: string
           description: Path of its Pricing2Yaml file (`format=yaml`), on the same kind of route as the request.
         newContractsVersion:
           type: string
           nullable: true
-          description: Version new contracts of the service get; `null` if it cannot be determined.
+          description: |
+            Version new contracts of the service get; `null` if there is none (unknown service, no active
+            version). Other failures answer `500` instead of `null`.
         plan:
           type: string
           description: '`subscriptionPlans[service]`, when the service has plans.'

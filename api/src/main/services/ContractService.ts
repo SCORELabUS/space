@@ -207,8 +207,10 @@ class ContractService {
         const forNewContracts = await this.serviceService.newContractsPricing(serviceName, contract.organizationId);
         storedName = forNewContracts.serviceName;
         newContractsVersion = forNewContracts.version;
-      } catch {
+      } catch (error) {
         // Unknown service or no active version: newContractsVersion stays null.
+        // Anything else (database or cache failure) is not hidden as "unknown".
+        if (!(error as Error).message.toLowerCase().includes('not found')) throw error;
       }
 
       services[serviceName] = {

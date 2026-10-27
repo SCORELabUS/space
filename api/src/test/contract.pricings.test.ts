@@ -1,7 +1,8 @@
 import request from 'supertest';
 import { Server } from 'http';
 import { v4 as uuidv4 } from 'uuid';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import container from '../main/config/container';
 import { baseUrl, getApp, shutdownApp } from './utils/testApp';
 import { createTestUser, deleteTestUser } from './utils/users/userTestUtils';
 import {
@@ -159,6 +160,23 @@ describe('Pricing versions of a contract', function () {
     const entry = (await pricingsOf()).body.services[serviceName];
 
     expect(entry.newContractsVersion).toBe(PETCLINIC_BASE_VERSION);
+  });
+
+  it('reports newContractsVersion null only when it cannot be determined, not on failures', async function () {
+    const serviceService = container.resolve('serviceService');
+    const spy = vi.spyOn(serviceService, 'newContractsPricing');
+    try {
+      spy.mockRejectedValueOnce(new Error('NOT FOUND: No active pricing version for service x'));
+      const unknown = await pricingsOf();
+      spy.mockRejectedValueOnce(new Error('connection to the database lost'));
+      const failure = await pricingsOf();
+
+      expect(unknown.status).toBe(200);
+      expect(Object.values(unknown.body.services).map((entry: any) => entry.newContractsVersion)).toEqual([null]);
+      expect(failure.status).toBe(500);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('changes contractVersion after a novation', async function () {
