@@ -13,6 +13,17 @@ type ContractMatchPipeline = {
   order?: 'asc' | 'desc';
 };
 
+/**
+ * Filter that addresses one contract by `userId`, optionally confined to an
+ * organization. `userId` is chosen by the host application and is not secret,
+ * so callers acting for an organization must always pass its id: a contract of
+ * another organization then simply does not match.
+ */
+const byUserId = (userId: string, organizationId?: string): Record<string, unknown> => ({
+  'userContact.userId': userId,
+  ...(organizationId ? { organizationId } : {}),
+});
+
 const buildMatchPipeline = (queryFilters: any): ContractMatchPipeline => {
   const {
     username,
@@ -162,8 +173,8 @@ class ContractRepository extends RepositoryBase {
     return result[0]?.total ?? 0;
   }
 
-  async findByUserId(userId: string): Promise<LeanContract | null> {
-    const contract = await ContractMongoose.findOne({ 'userContact.userId': userId });
+  async findByUserId(userId: string, organizationId?: string): Promise<LeanContract | null> {
+    const contract = await ContractMongoose.findOne(byUserId(userId, organizationId));
     return contract ? toPlainObject<LeanContract>(contract.toJSON()) : null;
   }
 
@@ -175,10 +186,11 @@ class ContractRepository extends RepositoryBase {
 
   async update(
     userId: string,
-    contractData: Partial<ContractToCreate>
+    contractData: Partial<ContractToCreate>,
+    organizationId?: string
   ): Promise<LeanContract | null> {
     const contract = await ContractMongoose.findOneAndUpdate(
-      { 'userContact.userId': userId },
+      byUserId(userId, organizationId),
       { $set: contractData },
       { new: true }
     );
@@ -206,9 +218,10 @@ class ContractRepository extends RepositoryBase {
    */
   async incrementUsageLevels(
     userId: string,
-    increments: Record<string, number>
+    increments: Record<string, number>,
+    organizationId?: string
   ): Promise<LeanContract | null> {
-    const filter: Record<string, unknown> = { 'userContact.userId': userId };
+    const filter: Record<string, unknown> = byUserId(userId, organizationId);
     const inc: Record<string, number> = {};
 
     for (const [path, amount] of Object.entries(increments)) {
@@ -311,8 +324,8 @@ class ContractRepository extends RepositoryBase {
     return result.deletedCount;
   }
 
-  async destroy(userId: string): Promise<void> {
-    const result = await ContractMongoose.deleteOne({ 'userContact.userId': userId });
+  async destroy(userId: string, organizationId?: string): Promise<void> {
+    const result = await ContractMongoose.deleteOne(byUserId(userId, organizationId));
     if (result.deletedCount === 0) {
       throw new Error(`Contract with userId ${userId} not found`);
     }

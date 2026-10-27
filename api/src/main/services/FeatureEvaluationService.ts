@@ -117,16 +117,14 @@ class FeatureEvaluationService {
   }
 
   async generatePricingToken(userId: string, reqOrg: any, options: { server: boolean }): Promise<string> {
+    // Resolve the contract within the caller's organization before anything
+    // cached under this userId is returned.
+    const contract = await this.contractService.show(userId, reqOrg.id);
+
     const cachedToken = await this.cacheService.get(`features.${userId}.pricingToken`);
 
     if (cachedToken) {
       return cachedToken;
-    }
-
-    const contract = await this.contractService.show(userId);
-
-    if (!contract) {
-      throw new Error(`Contract with userId ${userId} not found`);
     }
 
     const result = (await this.eval(userId, reqOrg, {
@@ -158,7 +156,11 @@ class FeatureEvaluationService {
     reqOrg: any,
     options: SingleFeatureEvalQueryParams
   ): Promise<boolean | FeatureEvaluationResult> {
-    let evaluation = await this.cacheService.get(`features.${userId}.eval.${featureId}`);
+    // Resolve the contract within the caller's organization before anything
+    // cached under this userId is returned.
+    await this.contractService.show(userId, reqOrg.id);
+
+    const evaluation = await this.cacheService.get(`features.${userId}.eval.${featureId}`);
 
     if (evaluation && !options.revert && !expectedConsumption) {
       return evaluation as FeatureEvaluationResult;
@@ -171,7 +173,12 @@ class FeatureEvaluationService {
       await this._retrieveContextsByUserId(userId, options.server, reqOrg);
 
     if (options.revert) {
-      await this.contractService._revertExpectedConsumption(userId, featureId, options.latest);
+      await this.contractService._revertExpectedConsumption(
+        userId,
+        featureId,
+        options.latest,
+        reqOrg.id
+      );
       return true;
     } else {
       // Step 2: Perform the evaluation
@@ -180,7 +187,12 @@ class FeatureEvaluationService {
         pricingContext,
         subscriptionContext,
         evaluationContext,
-        { simple: false, expectedConsumption: expectedConsumption, userId: userId }
+        {
+          simple: false,
+          expectedConsumption: expectedConsumption,
+          userId: userId,
+          organizationId: reqOrg.id,
+        }
       );
       if (!(evaluationResults as FeatureEvaluationResult).limit) {
         await this.cacheService.set(
@@ -400,17 +412,8 @@ class FeatureEvaluationService {
     pricingContext: PricingContext;
     evaluationContext: Record<string, string>;
   }> {
-    // Step 1.1: Retrieve the user contract
-    let contract = await this.cacheService.get(`contracts.${userId}`);
-
-    if (!contract) {
-      contract = await this.contractService.show(userId);
-      await this.cacheService.set(`contracts.${userId}`, contract, 3600, true);
-    }
-
-    if (!contract) {
-      throw new Error(`Contract with userId ${userId} not found`);
-    }
+    // Step 1.1: Retrieve the user contract, within the caller's organization
+    let contract: LeanContract = await this.contractService.show(userId, reqOrg.id);
 
     // Step 1.2: Check if the user's contract has expired and if it can be renewed
     const isContractExpired = isAfter(new Date(), contract.billingPeriod.endDate);
@@ -420,7 +423,7 @@ class FeatureEvaluationService {
         'Invalid subscription: Your susbcription has expired and it is not set to renew automatically. To continue accessing the features, please purchase any subscription.'
       );
     } else if (isContractExpired) {
-      await this.contractService.renew(userId);
+      await this.contractService.renew(userId, reqOrg.id);
     }
 
     // Step 1.3: Reset all expired renewable usage levels
