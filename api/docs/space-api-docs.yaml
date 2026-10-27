@@ -88,6 +88,7 @@ info:
     - `reject-private`: the opt-in `rejectPrivate` option (query or body) of contract creation and novations, which rejects private plans and add-ons.
     - `pricing-yaml`: `GET .../pricings/{version}?format=yaml` returns the stored Pricing2Yaml file.
     - `new-contracts-version`: `GET .../pricings/new-contracts` and the optional service `defaultVersion`.
+    - `contract-pricings`: `GET /contracts/{userId}/pricings`.
 
   contact:
     email: agarcia29@us.es
@@ -3206,6 +3207,47 @@ paths:
         '404':
           $ref: '#/components/responses/ContractNotFound'
 
+  /organizations/{organizationId}/contracts/{userId}/pricings:
+    get:
+      summary: Pricing versions of a contract
+      description: |
+        For each contracted service: the pricing version of the contract, whether it is still active, where to get
+        its Pricing2Yaml file, the version new contracts get (see `GET .../pricings/new-contracts`) and the
+        subscribed plan and add-ons; plus the `contractVersion` to send back in `If-Match` when novating.
+        Organization scoping as for `GET /contracts/{userId}`.
+
+        **Authentication**: User API Key
+
+        **Permission**: organization member with any role (OWNER/ADMIN/MANAGER/EVALUATOR), or ADMIN user
+
+      tags:
+        - Contracts
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pricing versions of the contract
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContractPricings'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+
   /contracts:
     get:
       summary: List all contracts
@@ -3640,6 +3682,42 @@ paths:
       responses:
         '204':
           description: Contract deleted
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+
+  /contracts/{userId}/pricings:
+    get:
+      summary: Pricing versions of a contract
+      description: |
+        For each contracted service: the pricing version of the contract, whether it is still active, where to get
+        its Pricing2Yaml file, the version new contracts get (see `GET .../pricings/new-contracts`) and the
+        subscribed plan and add-ons; plus the `contractVersion` to send back in `If-Match` when novating.
+        Organization scoping as for `GET /contracts/{userId}`.
+
+        **Authentication**: User API Key (ADMIN) | Organization API Key
+
+        **Organization Permission**: ALL or MANAGEMENT scope (same as `GET /contracts/{userId}`)
+
+      tags:
+        - Contracts
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pricing versions of the contract
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContractPricings'
         '404':
           $ref: '#/components/responses/ContractNotFound'
 
@@ -4576,6 +4654,56 @@ components:
             $ref: '#/components/schemas/SubscriptionSnapshot'
         contractVersion:
           $ref: '#/components/schemas/ContractVersion'
+
+    ContractPricings:
+      type: object
+      required: [services, contractVersion]
+      properties:
+        services:
+          type: object
+          description: Keyed by contracted service name (lowercase, as in `contractedServices`).
+          additionalProperties:
+            $ref: '#/components/schemas/ContractServicePricing'
+        contractVersion:
+          $ref: '#/components/schemas/ContractVersion'
+      example:
+        services:
+          acme:
+            version: "2024-06-08"
+            status: archived
+            yamlUrl: /api/v1/services/acme/pricings/2024-06-08?format=yaml
+            newContractsVersion: "2025-01-10"
+            plan: growth
+            addOns:
+              extraStorage: 2
+        contractVersion: 3-9f86d081884c7d65
+
+    ContractServicePricing:
+      type: object
+      required: [version, status, yamlUrl, newContractsVersion, addOns]
+      properties:
+        version:
+          type: string
+          description: '`contractedServices[service]`, unescaped.'
+        status:
+          type: string
+          enum: [active, archived]
+          description: '`archived` also covers versions no longer listed by the service (e.g. SPHERE history).'
+        yamlUrl:
+          type: string
+          description: Path of its Pricing2Yaml file (`format=yaml`), on the same kind of route as the request.
+        newContractsVersion:
+          type: string
+          nullable: true
+          description: Version new contracts of the service get; `null` if it cannot be determined.
+        plan:
+          type: string
+          description: '`subscriptionPlans[service]`, when the service has plans.'
+        addOns:
+          type: object
+          description: '`subscriptionAddOns[service]` (empty object when none).'
+          additionalProperties:
+            type: integer
 
     ContractVersion:
       type: string

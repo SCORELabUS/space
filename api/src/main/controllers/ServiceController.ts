@@ -4,16 +4,7 @@ import ServiceService, { PricingYamlUnavailableError, PricingYamlUpstreamError }
 import { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository.js';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import { FallBackSubscription } from '../types/models/Contract.js';
-import { resetEscapePricingVersion } from '../utils/services/helpers.js';
-
-/**
- * Path of the Pricing2Yaml file of a version, on the same kind of route as the
- * request (organization-scoped for user API keys, direct for organization keys).
- */
-export function pricingYamlUrl(req: any, serviceName: string, version: string): string {
-  const scope = req.params.organizationId ? `/organizations/${req.params.organizationId}` : '';
-  return `/api/v1${scope}/services/${encodeURIComponent(serviceName)}/pricings/${encodeURIComponent(version)}?format=yaml`;
-}
+import { pricingYamlUrl, resetEscapePricingVersion } from '../utils/services/helpers.js';
 
 class ServiceController {
   private readonly serviceService: ServiceService;
@@ -191,7 +182,7 @@ class ServiceController {
         organizationId
       );
 
-      res.json({ version, yamlUrl: pricingYamlUrl(req, serviceName, version), source });
+      res.json({ version, yamlUrl: pricingYamlUrl(req.params.organizationId, serviceName, version), source });
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });

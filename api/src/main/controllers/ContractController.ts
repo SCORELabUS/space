@@ -104,6 +104,7 @@ class ContractController {
     this._scope = this._scope.bind(this);
     this.index = this.index.bind(this);
     this.show = this.show.bind(this);
+    this.pricings = this.pricings.bind(this);
     this.create = this.create.bind(this);
     this.novate = this.novate.bind(this);
     this.novateByGroupId = this.novateByGroupId.bind(this);
@@ -159,6 +160,27 @@ class ContractController {
       const userId = req.params.userId;
       const contract = await this.contractService.show(userId, this._scope(req));
       sendContract(req, res, 200, contract);
+    } catch (err: any) {
+      if (err.message.toLowerCase().includes('not found')) {
+        res.status(404).send({ error: err.message });
+      } else {
+        res.status(500).send({ error: err.message });
+      }
+    }
+  }
+
+  /** GET /contracts/{userId}/pricings */
+  async pricings(req: any, res: any) {
+    try {
+      const { contract, services } = await this.contractService.pricings(
+        req.params.userId,
+        this._scope(req),
+        req.params.organizationId
+      );
+      const contractVersion = computeContractVersion(contract);
+      delete req.headers['if-none-match'];
+      res.set('ETag', `"${contractVersion}"`);
+      res.json({ services, contractVersion });
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
