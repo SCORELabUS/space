@@ -18,6 +18,8 @@ const serviceSchema = new Schema(
     source: { type: String, enum: ['manual', 'sphere'], default: 'manual' },
     sphere: { type: Schema.Types.Mixed },
     disabled: { type: Boolean, default: false },
+    // Manual services: version for new contracts that omit one (must be active).
+    defaultVersion: { type: String },
     activePricings: {type: Map, of: pricingDataSchema},
     archivedPricings: {type: Map, of: pricingDataSchema}
   },

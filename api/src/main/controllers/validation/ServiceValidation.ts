@@ -8,6 +8,12 @@ const update = [
     .isLength({ min: 1, max: 255 })
     .withMessage('The name must be between 1 and 255 characters long')
     .trim(),
+  check('defaultVersion')
+    .optional({ values: 'null' })
+    .isString()
+    .withMessage('The defaultVersion field must be a string (an active pricing version) or null')
+    .isLength({ min: 1 })
+    .withMessage('The defaultVersion field cannot be empty'),
   check('organizationId')
     .optional()
     .isString()

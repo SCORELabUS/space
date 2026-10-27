@@ -58,10 +58,10 @@ const create = [
     .isInt({ min: 1 })
     .withMessage('billingPeriod.renewalDays must be a positive integer'),
 
-  // contractedServices (optional)
+  // contractedServices (optional): services of subscriptionPlans/subscriptionAddOns
+  // that it omits get the version for new contracts of the service.
   check('contractedServices')
-    .exists({ checkNull: true })
-    .withMessage('The contractedServices field is required')
+    .optional()
     .isObject()
     .withMessage(
       'contractedServices must be an object where keys are service names and values are pricing versions'

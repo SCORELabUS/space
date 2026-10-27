@@ -6,6 +6,15 @@ import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import { FallBackSubscription } from '../types/models/Contract.js';
 import { resetEscapePricingVersion } from '../utils/services/helpers.js';
 
+/**
+ * Path of the Pricing2Yaml file of a version, on the same kind of route as the
+ * request (organization-scoped for user API keys, direct for organization keys).
+ */
+export function pricingYamlUrl(req: any, serviceName: string, version: string): string {
+  const scope = req.params.organizationId ? `/organizations/${req.params.organizationId}` : '';
+  return `/api/v1${scope}/services/${encodeURIComponent(serviceName)}/pricings/${encodeURIComponent(version)}?format=yaml`;
+}
+
 class ServiceController {
   private readonly serviceService: ServiceService;
 
@@ -15,6 +24,7 @@ class ServiceController {
     this.indexPricings = this.indexPricings.bind(this);
     this.show = this.show.bind(this);
     this.showPricing = this.showPricing.bind(this);
+    this.showNewContractsPricing = this.showNewContractsPricing.bind(this);
     this.showPublicPricingUrl = this.showPublicPricingUrl.bind(this);
     this.create = this.create.bind(this);
     this.update = this.update.bind(this);
@@ -160,6 +170,30 @@ class ServiceController {
       } else if (err instanceof PricingYamlUpstreamError) {
         res.status(502).send({ error: 'SPHERE_UNAVAILABLE', message: err.message });
       } else if (err.message.toLowerCase().includes('not found')) {
+        res.status(404).send({ error: err.message });
+      } else {
+        res.status(500).send({ error: err.message });
+      }
+    }
+  }
+
+  /** GET .../pricings/new-contracts: `{ version, yamlUrl, source }`. */
+  async showNewContractsPricing(req: any, res: any) {
+    try {
+      const organizationId = req.org ? req.org.id : req.params.organizationId;
+
+      if (!organizationId) {
+        return res.status(400).send({ error: 'Organization ID is required. You can either provide an organization scoped API key or use the /organizations/*/services/** paths' });
+      }
+
+      const { version, source, serviceName } = await this.serviceService.newContractsPricing(
+        req.params.serviceName,
+        organizationId
+      );
+
+      res.json({ version, yamlUrl: pricingYamlUrl(req, serviceName, version), source });
+    } catch (err: any) {
+      if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
         res.status(500).send({ error: err.message });

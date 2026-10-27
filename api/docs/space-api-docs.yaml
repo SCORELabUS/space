@@ -87,6 +87,7 @@ info:
     - `keep-billing-period`: `keepBillingPeriod` on novations, and subscriptions validated strictly against the pricing (`400` with `errors`; archived versions rejected for new contracts and version changes).
     - `reject-private`: the opt-in `rejectPrivate` option (query or body) of contract creation and novations, which rejects private plans and add-ons.
     - `pricing-yaml`: `GET .../pricings/{version}?format=yaml` returns the stored Pricing2Yaml file.
+    - `new-contracts-version`: `GET .../pricings/new-contracts` and the optional service `defaultVersion`.
 
   contact:
     email: agarcia29@us.es
@@ -1881,6 +1882,15 @@ paths:
                   type: string
                 organizationId:
                   type: string
+                defaultVersion:
+                  type: string
+                  nullable: true
+                  description: |
+                    Manual services only: pricing version assigned to new contracts that omit one (see
+                    `GET .../pricings/new-contracts`). Must be an active version; `null` removes it. It is removed
+                    automatically when that version is archived. SPHERE-linked services answer `400`: their
+                    synchronization policy decides.
+                  example: "2025"
       responses:
         '200':
           description: Service updated
@@ -2027,6 +2037,42 @@ paths:
           description: Forbidden
         '404':
           description: Service not found
+
+  /organizations/{organizationId}/services/{serviceName}/pricings/new-contracts:
+    get:
+      summary: Pricing version for new contracts
+      description: |
+        The pricing version SPACE assigns to new contracts of the service, which signed-out visitors of a pricing
+        page should see. `POST /contracts` uses it for services it subscribes without a `contractedServices` entry.
+
+        **Authentication**: User API Key
+
+        **Permission**: organization member with any role (OWNER/ADMIN/MANAGER/EVALUATOR), or ADMIN user
+
+      tags:
+        - Services
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Version for new contracts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NewContractsPricing'
+        '404':
+          description: Service not found in the organization, or it has no active version
 
   /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}:
     get:
@@ -2423,6 +2469,15 @@ paths:
                   type: string
                 organizationId:
                   type: string
+                defaultVersion:
+                  type: string
+                  nullable: true
+                  description: |
+                    Manual services only: pricing version assigned to new contracts that omit one (see
+                    `GET .../pricings/new-contracts`). Must be an active version; `null` removes it. It is removed
+                    automatically when that version is archived. SPHERE-linked services answer `400`: their
+                    synchronization policy decides.
+                  example: "2025"
       responses:
         '200':
           description: Service updated
@@ -2534,6 +2589,37 @@ paths:
                 $ref: '#/components/schemas/Pricing'
         '403':
           description: Forbidden
+
+  /services/{serviceName}/pricings/new-contracts:
+    get:
+      summary: Pricing version for new contracts
+      description: |
+        The pricing version SPACE assigns to new contracts of the service, which signed-out visitors of a pricing
+        page should see. `POST /contracts` uses it for services it subscribes without a `contractedServices` entry.
+
+        **Authentication**: Organization API Key
+
+        **Permission**: Org Key with any scope
+
+      tags:
+        - Services
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Version for new contracts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NewContractsPricing'
+        '404':
+          description: Service not found in the organization, or it has no active version
 
   /services/{serviceName}/pricings/{pricingVersion}:
     get:
@@ -4397,6 +4483,28 @@ components:
         createdAt:
           type: string
           format: date-time
+        defaultVersion:
+          type: string
+          description: Manual services only, optional. Version for new contracts (see `NewContractsPricing`).
+
+    NewContractsPricing:
+      type: object
+      required: [version, yamlUrl, source]
+      properties:
+        version:
+          type: string
+          description: Pricing version SPACE assigns to new contracts of the service (unescaped).
+          example: "2025-01-10"
+        yamlUrl:
+          type: string
+          description: Path of its Pricing2Yaml file (`format=yaml`), on the same kind of route as the request.
+          example: /api/v1/services/acme/pricings/2025-01-10?format=yaml
+        source:
+          type: string
+          enum: [sphere-policy, default, latest-active]
+          description: |
+            `sphere-policy`: target of the SPHERE synchronization policy (linked services). `default`: the service's
+            `defaultVersion`. `latest-active`: fallback, the most recently created (`createdAt`) active version.
 
     Pricing:
       type: object
@@ -4745,7 +4853,6 @@ components:
             type: object
             required:
               - userContact
-              - contractedServices
               - subscriptionPlans
               - subscriptionAddOns
             properties:
@@ -4762,7 +4869,12 @@ components:
                   renewalDays:
                     $ref: '#/components/schemas/RenewalDays'
               contractedServices:
-                $ref: '#/components/schemas/ContractedService'
+                allOf:
+                  - $ref: '#/components/schemas/ContractedService'
+                description: |
+                  Optional. Services subscribed in `subscriptionPlans`/`subscriptionAddOns` without an entry here get
+                  the version for new contracts (`GET /services/{serviceName}/pricings/new-contracts`). SPHERE-linked
+                  services always get their policy target.
               subscriptionPlans:
                 $ref: '#/components/schemas/SubscriptionPlans'
               rejectPrivate:
