@@ -171,6 +171,20 @@ const contractVersionPreconditions = [
     .withMessage('Each value in expectedContractVersions must be a string (contractVersion)'),
 ];
 
+/** `rejectPrivate` (opt-in), as a query parameter or a body field. */
+function rejectPrivateOption() {
+  return [
+    body('rejectPrivate')
+      .optional()
+      .isBoolean({ strict: true })
+      .withMessage('rejectPrivate must be a boolean'),
+    query('rejectPrivate')
+      .optional()
+      .isIn(['true', 'false'])
+      .withMessage('rejectPrivate must be true or false'),
+  ];
+}
+
 const novationOptions = [
   body('keepBillingPeriod')
     .optional()
@@ -180,19 +194,11 @@ const novationOptions = [
     .optional()
     .isIn(['true', 'false'])
     .withMessage('keepBillingPeriod must be true or false'),
-  body('allowPrivate')
-    .optional()
-    .isBoolean({ strict: true })
-    .withMessage('allowPrivate must be a boolean'),
+  ...rejectPrivateOption(),
 ];
 
 novate.push(...contractVersionPreconditions, ...novationOptions);
-create.push(
-  body('allowPrivate')
-    .optional()
-    .isBoolean({ strict: true })
-    .withMessage('allowPrivate must be a boolean')
-);
+create.push(...rejectPrivateOption());
 
 const incrementUsageLevels = [
   body()
@@ -392,6 +398,8 @@ function subscriptionErrorsInPricing(
   const planPath = `subscriptionPlans.${serviceName}`;
 
   if (!selectedPlan && !selectedAddOns) {
+    // Nothing selected for the service: reported as PLAN_NOT_FOUND (documented
+    // with the codes), since there is no dedicated code for an empty selection.
     errors.push({
       code: 'PLAN_NOT_FOUND',
       service: serviceName,
@@ -520,8 +528,12 @@ interface SubscriptionValidationOptions {
    * and its private plan or add-ons - stays allowed.
    */
   previous?: Pick<LeanContract, 'contractedServices' | 'subscriptionPlans' | 'subscriptionAddOns'>;
-  /** Accept private plans and add-ons the contract does not have yet (operator-assigned deals). */
-  allowPrivate?: boolean;
+  /**
+   * Opt-in: reject private plans and add-ons that the contract does not
+   * already have (customer-facing changes). Off by default, so operators keep
+   * assigning private plans as before.
+   */
+  rejectPrivate?: boolean;
 }
 
 const findKey = (record: Record<string, unknown> | undefined, key: string) =>
@@ -534,8 +546,8 @@ const findKey = (record: Record<string, unknown> | undefined, key: string) =>
  * Besides what `isSubscriptionValidInPricing` checks, it rejects pricing
  * versions that do not exist (`VERSION_NOT_FOUND`), archived versions for new
  * contracts and for version changes (`VERSION_ARCHIVED`), and private plans and
- * add-ons the contract does not already have (`PRIVATE_PLAN`, `PRIVATE_ADDON`)
- * unless `allowPrivate`. Usage below consumption is not an error.
+ * add-ons the contract does not already have (`PRIVATE_PLAN`, `PRIVATE_ADDON`),
+ * only with `rejectPrivate`. Usage below consumption is not an error.
  */
 async function collectSubscriptionErrors(
   subscription: Subscription,
@@ -621,7 +633,7 @@ async function collectSubscriptionErrors(
     const previousAddOnsKey = findKey(previous?.subscriptionAddOns, serviceName);
     errors.push(
       ...subscriptionErrorsInPricing(serviceName, subscription, pricing, {
-        rejectPrivate: !options.allowPrivate,
+        rejectPrivate: options.rejectPrivate === true,
         previousPlan: previousPlanKey ? previous!.subscriptionPlans[previousPlanKey] : undefined,
         previousAddOns: previousAddOnsKey ? previous!.subscriptionAddOns[previousAddOnsKey] : undefined,
       })

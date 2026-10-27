@@ -247,40 +247,74 @@ describe('Novation options and strict subscription validation', function () {
   });
 
   describe('private plans and add-ons', function () {
-    it('rejects a private plan or add-on on a new contract', async function () {
-      const plan = await create(subscription('PARTNER', {}, '2.0'));
-      const addOn = await create(subscription('GOLD', { vipSupport: 1 }, '2.0'));
+    it('are accepted by default, as before', async function () {
+      const created = await create(subscription('PARTNER', { vipSupport: 1 }, '2.0'));
+      const novated = await novate(subscription('PARTNER', { vipSupport: 1 }, '2.0'));
+
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+      expect(novated.status, JSON.stringify(novated.body)).toBe(200);
+    });
+
+    it('are rejected on a new contract with rejectPrivate (body or query), which is not stored', async function () {
+      const plan = await create({ ...subscription('PARTNER', {}, '2.0'), rejectPrivate: true });
+      const addOn = await request(app)
+        .post(`${baseUrl}/contracts?rejectPrivate=true`)
+        .set('x-api-key', orgKey)
+        .send({
+          userContact: { userId: uuidv4(), username: 'u-private' },
+          billingPeriod: { renewalDays: 30 },
+          ...subscription('GOLD', { vipSupport: 1 }, '2.0'),
+        });
+      const accepted = await create({ ...subscription('GOLD', {}, '2.0'), rejectPrivate: true });
 
       expect(plan.status).toBe(400);
       expect(codes(plan)).toEqual(['PRIVATE_PLAN']);
       expect(addOn.status).toBe(400);
       expect(codes(addOn)).toEqual(['PRIVATE_ADDON']);
       expect(addOn.body.errors[0].path).toBe(`subscriptionAddOns.${serviceName}.vipSupport`);
+      expect(accepted.status).toBe(201);
+      expect(accepted.body.rejectPrivate).toBeUndefined();
     });
 
-    it('rejects switching to a private plan or adding a private add-on', async function () {
-      const plan = await novate(subscription('PARTNER', {}, '2.0'));
-      const addOn = await novate(subscription('GOLD', { vipSupport: 1 }, '2.0'));
+    it('rejects switching to a private plan or adding a private add-on with rejectPrivate', async function () {
+      const plan = await novate(subscription('PARTNER', {}, '2.0'), '?rejectPrivate=true');
+      const addOn = await novate({ ...subscription('GOLD', { vipSupport: 1 }, '2.0'), rejectPrivate: true });
 
       expect(codes(plan)).toEqual(['PRIVATE_PLAN']);
       expect(codes(addOn)).toEqual(['PRIVATE_ADDON']);
+      expect((await stored()).subscriptionPlans[serviceName]).toBe('GOLD');
+      expect((await stored()).rejectPrivate).toBeUndefined();
     });
 
-    it('accepts them with allowPrivate: true, and keeps them on later novations', async function () {
-      const assigned = await novate({ ...subscription('PARTNER', { vipSupport: 1 }, '2.0'), allowPrivate: true });
+    it('lets a contract keep the private selection it already has with rejectPrivate', async function () {
+      // Assigned by an operator (no rejectPrivate), then changed by the customer.
+      const assigned = await novate(subscription('PARTNER', { vipSupport: 1 }, '2.0'));
       expect(assigned.status).toBe(200);
-      expect((await stored()).allowPrivate).toBeUndefined();
 
-      // A later customer-driven change that keeps the private selection is fine.
-      const kept = await novate(subscription('PARTNER', { vipSupport: 1, extraPets: 1 }, '2.0'));
-      expect(kept.status).toBe(200);
+      const kept = await novate(subscription('PARTNER', { vipSupport: 1, extraPets: 1 }, '2.0'), '?rejectPrivate=true');
+      expect(kept.status, JSON.stringify(kept.body)).toBe(200);
     });
 
-    it('accepts allowPrivate: true on contract creation', async function () {
-      const response = await create({ ...subscription('PARTNER', {}, '2.0'), allowPrivate: true });
+    it('applies rejectPrivate to group novations', async function () {
+      const groupId = `group-${uuidv4()}`;
+      await create({ ...subscription(), groupId });
 
-      expect(response.status).toBe(201);
-      expect(response.body.allowPrivate).toBeUndefined();
+      const rejected = await request(app)
+        .put(`${baseUrl}/contracts?groupId=${groupId}&rejectPrivate=true`)
+        .set('x-api-key', orgKey)
+        .send(subscription('PARTNER', {}, '2.0'));
+
+      expect(rejected.status).toBe(400);
+      expect(codes(rejected)).toEqual(['PRIVATE_PLAN']);
+    });
+
+    it('rejects a rejectPrivate that is not a boolean', async function () {
+      const body = await novate({ ...subscription(), rejectPrivate: 'yes' });
+      const query = await novate(subscription(), '?rejectPrivate=1');
+
+      // Request validation answers 422, as for keepBillingPeriod.
+      expect(body.status).toBe(422);
+      expect(query.status).toBe(422);
     });
   });
 

@@ -43,8 +43,8 @@ import { LeanUser } from '../types/models/User';
 export interface NovationOptions {
   /** Keep the billing period instead of restarting it. */
   keepBillingPeriod?: boolean;
-  /** Accept private plans and add-ons the contract does not have yet. */
-  allowPrivate?: boolean;
+  /** Opt-in: reject private plans and add-ons the contract does not have yet. */
+  rejectPrivate?: boolean;
 }
 
 class ContractService {
@@ -156,12 +156,12 @@ class ContractService {
   }
 
   /**
-   * @param options.allowPrivate accept private plans and add-ons (see
+   * @param options.rejectPrivate reject private plans and add-ons (opt-in, see
    *        `validateSubscription`).
    */
   async create(
     contractData: ContractToCreate,
-    options: { allowPrivate?: boolean } = {}
+    options: { rejectPrivate?: boolean } = {}
   ): Promise<LeanContract> {
     // Prevent creating more than one contract per userId
     if (!contractData || !contractData.userContact || !contractData.userContact.userId) {
@@ -218,7 +218,7 @@ class ContractService {
           subscriptionAddOns: contractData.subscriptionAddOns,
         },
         contractData.organizationId,
-        { allowPrivate: options.allowPrivate }
+        { rejectPrivate: options.rejectPrivate }
       );
     } catch (error) {
       if (error instanceof SubscriptionValidationError) throw error;
@@ -312,7 +312,7 @@ class ContractService {
     await enforceSpherePolicy(contract.organizationId, newSubscription, contract);
     await validateSubscription(newSubscription, contract.organizationId, {
       previous: contract,
-      allowPrivate: options.allowPrivate,
+      rejectPrivate: options.rejectPrivate,
     });
 
     const newContract = performNovation(contract, newSubscription, {
@@ -400,7 +400,7 @@ class ContractService {
       await enforceSpherePolicy(contract.organizationId, subscription, contract);
       await validateSubscription(subscription, contract.organizationId, {
         previous: contract,
-        allowPrivate: options.allowPrivate,
+        rejectPrivate: options.rejectPrivate,
       });
       const newContract = performNovation(contract, subscription, {
         keepBillingPeriod: options.keepBillingPeriod,

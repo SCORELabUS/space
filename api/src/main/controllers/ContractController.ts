@@ -60,21 +60,20 @@ function sendInvalidSubscription(res: any, err: SubscriptionValidationError, nov
 }
 
 /**
- * Novation options from the query (`keepBillingPeriod=true`) or the body
- * (`keepBillingPeriod: true`, `allowPrivate: true`); the body fields are
- * removed so that only the subscription remains.
+ * A boolean option from the query (`name=true`) or the body (`name: true`).
+ * The body field is removed so that only the subscription remains.
  */
+function flagOf(req: any, name: string): boolean {
+  const value = req.body?.[name];
+  if (req.body && typeof req.body === 'object' && name in req.body) delete req.body[name];
+  return req.query?.[name] === 'true' || value === true;
+}
+
+/** Novation options: `keepBillingPeriod` and the opt-in `rejectPrivate`. */
 function novationOptionsOf(req: any): NovationOptions {
-  const fromBody = (name: string) => {
-    const value = req.body?.[name];
-    if (req.body && name in req.body) delete req.body[name];
-    return value === true;
-  };
-  const keepFromBody = fromBody('keepBillingPeriod');
-  const allowPrivate = fromBody('allowPrivate');
   return {
-    keepBillingPeriod: req.query?.keepBillingPeriod === 'true' || keepFromBody,
-    allowPrivate,
+    keepBillingPeriod: flagOf(req, 'keepBillingPeriod'),
+    rejectPrivate: flagOf(req, 'rejectPrivate'),
   };
 }
 
@@ -192,9 +191,8 @@ class ContractController {
         }
       }
 
-      const allowPrivate = (contractData as any).allowPrivate === true;
-      delete (contractData as any).allowPrivate;
-      const contract = await this.contractService.create(contractData, { allowPrivate });
+      const rejectPrivate = flagOf(req, 'rejectPrivate');
+      const contract = await this.contractService.create(contractData, { rejectPrivate });
       sendContract(req, res, 201, contract);
     } catch (err: any) {
       if (err instanceof SubscriptionValidationError) {

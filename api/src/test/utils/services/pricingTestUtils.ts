@@ -82,9 +82,6 @@ export function generatePricing(version?: string): TestPricing {
   for (let i = 0; i < planCount; i++) {
     const planName = faker.word.noun({ length: { min: 4, max: 20 } }).toUpperCase();
     plans[planName] = generatePlan(features, usageLimits);
-    // Tests pick the first plan for subscriptions, and private plans can only
-    // be selected with `allowPrivate`: keep the first one public.
-    if (i === 0) plans[planName].private = false;
   }
 
   const planKeys = Object.keys(plans);

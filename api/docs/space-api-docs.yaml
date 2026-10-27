@@ -84,7 +84,8 @@ info:
 
     - `contract-org-scope`: `userId` lookups are confined to the caller's organization (see above).
     - `contract-version`: contracts carry `contractVersion` and an `ETag`; novations accept `If-Match` / `expectedContractVersion` and answer `412 CONTRACT_CHANGED`.
-    - `keep-billing-period`: `keepBillingPeriod` on novations, and subscriptions validated strictly against the pricing (`400` with `errors`).
+    - `keep-billing-period`: `keepBillingPeriod` on novations, and subscriptions validated strictly against the pricing (`400` with `errors`; archived versions rejected for new contracts and version changes).
+    - `reject-private`: the opt-in `rejectPrivate` option (query or body) of contract creation and novations, which rejects private plans and add-ons.
 
   contact:
     email: agarcia29@us.es
@@ -2779,6 +2780,7 @@ paths:
           required: true
           schema:
             type: string
+        - $ref: '#/components/parameters/RejectPrivate'
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCreation'
       responses:
@@ -2816,6 +2818,7 @@ paths:
         - ApiKeyAuth: []
       parameters:
         - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
         - name: userId
           in: path
           required: true
@@ -2935,6 +2938,7 @@ paths:
         - ApiKeyAuth: []
       parameters:
         - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
         - $ref: '#/components/parameters/IfMatchContractVersion'
         - name: organizationId
           in: path
@@ -3199,6 +3203,8 @@ paths:
         - Contracts
       security:
         - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RejectPrivate'
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCreation'
       responses:
@@ -3234,6 +3240,7 @@ paths:
         - ApiKeyAuth: []
       parameters:
         - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
         - name: groupId
           in: query
           required: true
@@ -3380,6 +3387,7 @@ paths:
         - ApiKeyAuth: []
       parameters:
         - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
         - $ref: '#/components/parameters/IfMatchContractVersion'
         - name: userId
           in: path
@@ -4366,7 +4374,8 @@ components:
       type: string
       description: |
         Stable code of a subscription validation problem:
-        - `PLAN_NOT_FOUND`: the plan does not exist in the pricing version (or no plan nor add-on was selected).
+        - `PLAN_NOT_FOUND`: the plan does not exist in the pricing version. Also reported, with the path
+          `subscriptionPlans.<service>`, when the service has neither a plan nor add-ons selected.
         - `ADDON_NOT_FOUND`: the add-on does not exist in the pricing version (names are case-sensitive).
         - `ADDON_NOT_AVAILABLE`: the add-on is not available for the selected plan.
         - `ADDON_DEPENDENCY_MISSING`: an add-on it depends on is not selected.
@@ -4375,7 +4384,8 @@ components:
         - `VERSION_NOT_FOUND`: the service or its pricing version does not exist in the organization.
         - `VERSION_ARCHIVED`: the version is archived; new contracts and version changes cannot use it (a
           contract keeps an archived version it already has).
-        - `PRIVATE_PLAN` / `PRIVATE_ADDON`: private, and the contract does not already have it (see `allowPrivate`).
+        - `PRIVATE_PLAN` / `PRIVATE_ADDON`: private, and the contract does not already have it. Only reported
+          when the request opts in with `rejectPrivate`.
         Limits below the current consumption are not an error.
       enum:
         - PLAN_NOT_FOUND
@@ -4656,12 +4666,13 @@ components:
                 $ref: '#/components/schemas/ContractedService'
               subscriptionPlans:
                 $ref: '#/components/schemas/SubscriptionPlans'
-              allowPrivate:
+              rejectPrivate:
                 type: boolean
                 default: false
                 description: |
-                  Accept private plans and add-ons (operator-assigned deals). Without it, selecting one fails with
-                  `PRIVATE_PLAN` / `PRIVATE_ADDON`.
+                  Opt-in: reject private plans and add-ons (`PRIVATE_PLAN` / `PRIVATE_ADDON`), for contracts a
+                  customer configures. Without it they are accepted, as before. Same as the query parameter
+                  `rejectPrivate=true`; not stored.
               subscriptionAddOns:
                 $ref: '#/components/schemas/SubscriptionAddons'
           example:
@@ -4709,12 +4720,14 @@ components:
                 description: |
                   Keep the current billing period (start and end date) instead of starting a new one. The previous
                   subscription is still added to `history`. Same as the query parameter `keepBillingPeriod=true`.
-              allowPrivate:
+              rejectPrivate:
                 type: boolean
                 default: false
                 description: |
-                  Accept private plans and add-ons the contract does not have yet (operator-assigned deals).
-                  Private plans and add-ons the contract already has can always be kept.
+                  Opt-in: reject private plans and add-ons the contract does not have yet (`PRIVATE_PLAN` /
+                  `PRIVATE_ADDON`), for changes a customer makes. Private plans and add-ons the contract already
+                  has can always be kept. Without it they are accepted, as before (operator-assigned deals).
+                  Same as the query parameter `rejectPrivate=true`; not stored.
               expectedContractVersion:
                 type: string
                 description: |
@@ -4855,6 +4868,17 @@ components:
                   $ref: '#/components/schemas/FieldValidationError'
 
   parameters:
+    RejectPrivate:
+      name: rejectPrivate
+      in: query
+      required: false
+      description: |
+        Opt-in: `true` rejects private plans and add-ons that the contract does not already have
+        (`PRIVATE_PLAN` / `PRIVATE_ADDON`), for subscriptions a customer configures. Default: they are accepted,
+        as before. Same as the body field `rejectPrivate: true`.
+      schema:
+        type: boolean
+        default: false
     KeepBillingPeriod:
       name: keepBillingPeriod
       in: query
