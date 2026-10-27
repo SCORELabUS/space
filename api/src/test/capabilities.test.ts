@@ -19,6 +19,7 @@ const EXPECTED = [
   'reject-private',
   'pricing-yaml',
   'new-contracts-version',
+  'idempotency-key',
   'contract-pricings',
   'novation-preview',
   'token-subscription',
