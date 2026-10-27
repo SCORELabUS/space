@@ -297,4 +297,4 @@ const hasPermission = (requiredRoles: (OrganizationApiKeyRole | OrganizationUser
   };
 };
 
-export { authenticateApiKeyMiddleware, memberRole, hasPermission };
+export { authenticateApiKeyMiddleware, memberRole, hasPermission, rejectionOrOutage, InvalidApiKeyError };

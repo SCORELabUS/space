@@ -708,6 +708,11 @@ class ContractService {
         const novated = updatedContracts
           .map(contract => contract.userContact.userId)
           .filter(userId => !rejected.includes(userId));
+        // Those writes are persisted: announce them before reporting the failure.
+        for (const userId of novated) {
+          const written = await this.contractRepository.findByUserId(userId, organizationId);
+          if (written) this._events()?.emitContractEvent('CONTRACT_NOVATED', written);
+        }
         throw new ContractChangedError(changed, novated);
       }
     } else {
@@ -812,6 +817,8 @@ class ContractService {
 
     await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
     await this.cacheService.del(`features.${userId}.*`);
+    // The billing period is part of contractVersion.
+    this._events()?.emitContractEvent('CONTRACT_NOVATED', result);
 
     return result;
   }
@@ -861,6 +868,7 @@ class ContractService {
 
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
+      this._events()?.emitContractEvent('CONTRACT_NOVATED', contract);
     }
 
     return contractsToReturn;
@@ -1081,7 +1089,10 @@ class ContractService {
     for (const org of organizations) {
       const clean = async (assertOwned: () => Promise<void>) => {
         await assertOwned();
+        // What each deleted contract was, for its CONTRACT_DELETED event.
+        const deleted = await this.contractRepository.findEventSummaries(org);
         removed += await this.contractRepository.prune(org);
+        for (const contract of deleted) this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true });
         const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
         for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
       };

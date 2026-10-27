@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { io, Socket } from 'socket.io-client';
 import request from 'supertest';
 import { Server } from 'http';
@@ -154,6 +154,31 @@ describe('Contract events', function () {
       await expect(connect({ apiKey: outsider.apiKey, organizationId: organization.id } as any)).rejects.toThrow(/member/);
       await expect(connect({ apiKey: admin.apiKey, organizationId: organization.id } as any)).resolves.toBeDefined();
     });
+
+    it('reports a credential lookup that fails as unavailable, not as an invalid key', async function () {
+      const userService: any = container.resolve('userService');
+      const outage = vi
+        .spyOn(userService, 'findByApiKey')
+        .mockRejectedValue(new Error('MongooseServerSelectionError: connection timed out'));
+      try {
+        await expect(connect({ apiKey: member.apiKey, organizationId: organization.id } as any)).rejects.toThrow(
+          /unavailable/i
+        );
+      } finally {
+        outage.mockRestore();
+      }
+      const organizationRepository: any = container.resolve('organizationRepository');
+      const orgOutage = vi
+        .spyOn(organizationRepository, 'findByApiKey')
+        .mockRejectedValue(new Error('MongooseServerSelectionError: connection timed out'));
+      try {
+        await expect(connect({ apiKey: allKey })).rejects.toThrow(/unavailable/i);
+      } finally {
+        orgOutage.mockRestore();
+      }
+      // A key that was read and rejected is still invalid.
+      await expect(connect({ apiKey: 'usr_doesnotexist', organizationId: organization.id } as any)).rejects.toThrow(/Invalid/i);
+    });
   });
 
   describe('delivery', function () {
@@ -205,6 +230,103 @@ describe('Contract events', function () {
         .send({ subscriptionPlans: { [serviceName]: 'BASIC' }, subscriptionAddOns: {} });
 
       for (const userId of ids) await waitFor(events, e => e.code === 'CONTRACT_NOVATED' && e.details.userId === userId);
+    });
+
+    it('delivers novated events for the contracts a partly rejected guarded group novation wrote', async function () {
+      const events = collect(await connect({ apiKey: allKey }));
+      const groupId = `group-${uuidv4()}`;
+      const versions: Record<string, string> = {};
+      for (let i = 0; i < 2; i++) {
+        const userId = uuidv4();
+        const created = await request(app)
+          .post(`${baseUrl}/contracts`)
+          .set('x-api-key', allKey)
+          .send({
+            userContact: { userId, username: `p-${i}` }, groupId,
+            contractedServices: { [serviceName]: PETCLINIC_BASE_VERSION },
+            subscriptionPlans: { [serviceName]: 'GOLD' }, subscriptionAddOns: {},
+          });
+        versions[userId] = created.body.contractVersion;
+      }
+      const [written, skipped] = Object.keys(versions);
+      // The second contract changes between the precondition check and its own write.
+      const repository: any = container.resolve('contractRepository');
+      const original = repository.bulkUpdateGuarded.bind(repository);
+      const guarded = vi.spyOn(repository, 'bulkUpdateGuarded').mockImplementation(async (entries: any) => {
+        const kept = (entries as any[]).filter(entry => entry.contract.userContact.userId !== skipped);
+        return [...(await original(kept)), skipped];
+      });
+      try {
+        const response = await request(app)
+          .put(`${baseUrl}/contracts?groupId=${groupId}`)
+          .set('x-api-key', allKey)
+          .send({ subscriptionPlans: { [serviceName]: 'BASIC' }, subscriptionAddOns: {}, expectedContractVersions: versions });
+
+        expect(response.status).toBe(412);
+        expect(response.body.novated).toEqual([written]);
+      } finally {
+        guarded.mockRestore();
+      }
+
+      const novated = await waitFor(events, e => e.code === 'CONTRACT_NOVATED' && e.details.userId === written);
+      expect(novated.details.contractVersion).not.toBe(versions[written]);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(events.filter(e => e.code === 'CONTRACT_NOVATED' && e.details.userId === skipped)).toEqual([]);
+    });
+
+    it('delivers a deleted event per contract when the contracts of the organization are deleted', async function () {
+      const events = collect(await connect({ apiKey: allKey }));
+      const first = await createContract();
+      const second = await createContract();
+
+      const response = await request(app).delete(`${baseUrl}/contracts`).set('x-api-key', allKey);
+      expect(response.status).toBeLessThan(300);
+
+      for (const contract of [first, second]) {
+        const deleted = await waitFor(events, e => e.code === 'CONTRACT_DELETED' && e.details.userId === contract.userContact.userId);
+        expect(deleted.details).toEqual({
+          userId: contract.userContact.userId,
+          organizationId: organization.id,
+          contractVersion: null,
+          services: [serviceName],
+        });
+      }
+    });
+
+    it('delivers a novated event when the billing period changes, also for groups', async function () {
+      const events = collect(await connect({ apiKey: allKey }));
+      const contract = await createContract();
+      const groupId = `group-${uuidv4()}`;
+      await ContractMongoose.updateOne({ 'userContact.userId': contract.userContact.userId }, { $set: { groupId } });
+      await container.resolve('cacheService').del(`contracts.${contract.userContact.userId}`);
+
+      const single = await request(app)
+        .put(`${baseUrl}/contracts/${contract.userContact.userId}/billingPeriod`)
+        .set('x-api-key', allKey)
+        .send({ renewalDays: 45 });
+      const first = await waitFor(events, e => e.code === 'CONTRACT_NOVATED' && e.details.contractVersion === single.body.contractVersion);
+
+      const group = await request(app)
+        .put(`${baseUrl}/contracts/billingPeriod?groupId=${groupId}`)
+        .set('x-api-key', allKey)
+        .send({ renewalDays: 60 });
+      expect(group.status).toBe(200);
+      await waitFor(events, e => e.code === 'CONTRACT_NOVATED' && e.details.contractVersion === group.body[0].contractVersion);
+      expect(first.details.userId).toBe(contract.userContact.userId);
+    });
+
+    it('delivers nothing for a novation preview', async function () {
+      const contract = await createContract();
+      const events = collect(await connect({ apiKey: allKey }));
+
+      const preview = await request(app)
+        .post(`${baseUrl}/contracts/${contract.userContact.userId}/novation/preview`)
+        .set('x-api-key', allKey)
+        .send({ subscriptionPlans: { [serviceName]: 'PLATINUM' }, subscriptionAddOns: {} });
+      expect(preview.status).toBe(200);
+
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(events.filter(e => e.details.userId === contract.userContact.userId)).toEqual([]);
     });
 
     it('delivers a renewed event when an expired auto-renew contract is renewed', async function () {

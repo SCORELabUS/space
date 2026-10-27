@@ -25,6 +25,20 @@ const organizationRoom = (organizationId: string) => `organization:${organizatio
 async function authorizeContractEvents(handshake: any): Promise<string> {
   // Loaded lazily: the container registers this service, so a static import would be circular.
   const container = (await import('../config/container')).default;
+  const { rejectionOrOutage, InvalidApiKeyError } = await import('../middlewares/AuthMiddleware');
+  /**
+   * A lookup that tells a refused credential (`InvalidApiKeyError`, with
+   * `invalid` as the message) apart from a database that cannot answer, which
+   * is reported as unavailable, as the HTTP middleware answers 503.
+   */
+  const lookup = async <T>(run: () => Promise<T>, invalid: string): Promise<T> => {
+    try {
+      return await rejectionOrOutage(run, invalid);
+    } catch (error) {
+      if (error instanceof InvalidApiKeyError) throw new Error(invalid);
+      throw new Error('Authentication is temporarily unavailable; retry shortly');
+    }
+  };
   const header = handshake.headers?.['x-api-key'];
   const apiKey: unknown = handshake.auth?.apiKey ?? (Array.isArray(header) ? header[0] : header);
 
@@ -33,18 +47,19 @@ async function authorizeContractEvents(handshake: any): Promise<string> {
   }
 
   if (apiKey.startsWith('org_')) {
-    const organization: LeanOrganization | null = await container.resolve('organizationRepository').findByApiKey(apiKey);
+    const organization: LeanOrganization = await lookup(
+      () => container.resolve('organizationRepository').findByApiKey(apiKey),
+      'Invalid Organization API Key'
+    );
     if (!organization?.id) throw new Error('Invalid Organization API Key');
     return String(organization.id);
   }
 
   if (apiKey.startsWith('usr_')) {
-    let user: any;
-    try {
-      user = await container.resolve('userService').findByApiKey(apiKey);
-    } catch {
-      throw new Error('Invalid User API Key');
-    }
+    const user: any = await lookup(
+      () => container.resolve('userService').findByApiKey(apiKey),
+      'Invalid User API Key'
+    );
     const organizationId = handshake.auth?.organizationId ?? handshake.query?.organizationId;
     if (typeof organizationId !== 'string' || !organizationId) {
       throw new Error('User API keys must name the organization: auth: { apiKey, organizationId }');

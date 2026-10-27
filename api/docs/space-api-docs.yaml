@@ -141,8 +141,16 @@ tags:
         `{ code: CONTRACT_CREATED | CONTRACT_NOVATED | CONTRACT_DELETED | CONTRACT_RENEWED,
         details: { userId, organizationId, contractVersion, services } }` (`contractVersion` is `null` for
         `CONTRACT_DELETED`; `services` are the contracted services). Events are emitted after the change is stored,
-        including novations by group, by SPHERE synchronization and by archiving a pricing version. A rejected
-        handshake fails with `connect_error`.
+        including novations by group (also the contracts a partly rejected guarded group novation did write),
+        billing period changes (`CONTRACT_NOVATED`, since they change `contractVersion`), SPHERE synchronization,
+        archiving a pricing version, and deleting all contracts of the organization (one `CONTRACT_DELETED` per
+        contract). A novation preview emits nothing. A rejected handshake fails with `connect_error`; when the
+        credential could not be checked (database unavailable) the message says so instead of reporting an
+        invalid key, and the client may retry.
+
+        Authorization is checked once, at the handshake. A connection stays open after its API key is removed or
+        its user leaves the organization, until it disconnects; revoke access by restarting the connection
+        (for example after rotating keys) if that matters.
   - name: Healthcheck
     description: Service health verification (Public)
 
