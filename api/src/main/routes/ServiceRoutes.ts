@@ -5,7 +5,7 @@ import * as ServiceValidator from '../controllers/validation/ServiceValidation';
 import * as PricingValidator from '../controllers/validation/PricingValidation';
 import { handlePricingUpload } from '../middlewares/FileHandlerMiddleware';
 import { handleValidation } from '../middlewares/ValidationHandlingMiddleware';
-import { memberRole, hasPermission } from '../middlewares/AuthMiddleware';
+import { memberRole, hasPermission, authorizeServiceMove } from '../middlewares/AuthMiddleware';
 
 const loadFileRoutes = function (app: express.Application) {
   const serviceController = new ServiceController();
@@ -27,7 +27,7 @@ const loadFileRoutes = function (app: express.Application) {
   app
     .route(baseUrl + '/organizations/:organizationId/services/:serviceName')
     .get(memberRole, hasPermission(['OWNER', 'ADMIN', 'MANAGER', 'EVALUATOR']), serviceController.show)
-    .put(memberRole, hasPermission(['OWNER','ADMIN', 'MANAGER']), ServiceValidator.update, handleValidation, serviceController.update)
+    .put(memberRole, hasPermission(['OWNER','ADMIN', 'MANAGER']), ServiceValidator.update, handleValidation, authorizeServiceMove, serviceController.update)
     .delete(memberRole, hasPermission(['OWNER','ADMIN']), serviceController.disable);
 
   app
@@ -64,7 +64,7 @@ const loadFileRoutes = function (app: express.Application) {
   app
     .route(baseUrl + '/services/:serviceName')
     .get(serviceController.show)
-    .put(ServiceValidator.update, handleValidation, serviceController.update)
+    .put(ServiceValidator.update, handleValidation, authorizeServiceMove, serviceController.update)
     .delete(serviceController.disable);
 
   app
