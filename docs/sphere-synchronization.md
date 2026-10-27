@@ -56,6 +56,16 @@ All migrations first try to preserve the exact plan/add-ons/quantities. If inval
 
 Billing dates remain unchanged during synchronization. Compatible usage counters and reset dates are preserved, including consumption above a new lower limit. New counters start with normal SPACE defaults; removed limits leave active state. Incompatible period, type, tracking or unit changes block migration. Other services in the same contract remain unchanged.
 
+## Opening pricings in SPHERE
+
+The SPACE UI links to SPHERE without ever handing it a SPACE file or credential:
+
+- SPHERE snapshots open SPHERE's permanent link for their pricing (`/p/{pricingId}`, from the pricing's `sphere` field), so SPHERE resolves it and applies its own permissions. SPHERE has no link to a single version: its pricing page opens on the latest version it shows to that user.
+- Pricings defined by an external URL open in SPHERE's editor, which fetches that URL (`/editor?pricingUrl=...`).
+- Pricings uploaded to SPACE are not offered. Their YAML is only readable with the organization's credentials. SPHERE's editor only takes content in its query string (`/editor?pricing=<compressed YAML>`): the request line is written to SPHERE's server logs, and it is refused above about 15.7 KB in SPHERE's production setup and 8 KB in its release image, which the largest pricings exceed.
+
+The links use `SPHERE_PUBLIC_URL`, the address of SPHERE reachable by the browser.
+
 ## Recovery and retention
 
 The worker persists run state and obtains a renewable organization lease. Binding mutations coordinate with the worker; concurrent usage updates use conditional writes and retry. All migration is convergent, not a global database transaction: a technical failure after some contracts are migrated leaves `applying` state and resumes on retry. Contract history makes completed changes idempotent. Configuration changes wait until incomplete application is recovered.
