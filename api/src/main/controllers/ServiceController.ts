@@ -235,8 +235,16 @@ class ServiceController {
 
       if (req.body.source === 'sphere') {
         if (receivedFile || req.body.pricing) return res.status(400).json({ error: 'Invalid mixed pricing sources' });
-        const linked = await container.resolve('sphereSyncService').create(req.body, organizationId);
-        return res.status(201).json(linked);
+        try {
+          const linked = await container.resolve('sphereSyncService').create(req.body, organizationId);
+          return res.status(201).json(linked);
+        } catch (error: any) {
+          // SPHERE key problems are the caller's to fix (missing SPHERE_KEY_ENCRYPTION_KEY, rejected key).
+          if (error?.name === 'SphereCredentialError' || /SPHERE rejected the API key/.test(error?.message ?? '')) {
+            return res.status(400).json({ error: error.message });
+          }
+          throw error;
+        }
       }
       let service;
 

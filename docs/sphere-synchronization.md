@@ -37,6 +37,17 @@ Relative to either service collection route:
 - `PUT /{serviceName}/synchronization`: change policy/selection and queue reconciliation. Changing source identity is not supported.
 - `POST /{serviceName}/synchronization/run`: request reconciliation; returns `202`. Poll the status endpoint for completion.
 
+## Private pricings
+
+By default SPACE reads only the public versions of a SPHERE pricing. To link private versions, give the service a SPHERE API key that may read them. Use a key with **MANAGEMENT** or **ALL** scope on the organisation that owns the pricing: SPHERE treats those as owner/admin access. A **VIEW** key acts as a plain member of the organisation, so it only reveals the private versions that the key's user may read; with a VIEW key, grant that user read access on the pricing first, or SPACE will keep seeing public versions only. SPACE then sends it as `x-api-key` on every SPHERE request of that service, and SPHERE (from the release that lists private versions to authorised callers) includes the private versions in the manifest, each flagged `"private": true`.
+
+1. Set `SPHERE_KEY_ENCRYPTION_KEY` on the SPACE server: 32 random bytes as base64 or hex, for example `openssl rand -base64 32`. Without it SPACE rejects every `sphereApiKey` with `400`.
+2. Pass `sphereApiKey` when creating the service (`"source": "sphere"`) or later with `PUT /{serviceName}/synchronization`. `POST /sphere/preview` also accepts it, for that request only, so private versions can be inspected before linking.
+3. The key is write-only: SPACE stores it encrypted (AES-256-GCM, bound to the service) and never returns it. `GET` of the service and of its synchronization state shows `sphere.hasApiKey` (`configuration.hasApiKey`) instead.
+4. On `PUT`, omit `sphereApiKey` to keep the stored key, send a new one to replace it, or `null` to remove it. SPACE checks the key against SPHERE before storing it; a key SPHERE refuses is rejected with `400`.
+
+If `SPHERE_KEY_ENCRYPTION_KEY` changes, stored keys can no longer be decrypted: synchronization of those services reports `degraded` with an explicit error until the key is entered again. Removing the key does not delete private versions already imported; new versions are then chosen from the public ones only.
+
 Organization keys need ALL or MANAGEMENT to mutate synchronization. EVALUATION may read status. User keys use organization routes with membership checks; OWNER, ADMIN and MANAGER may manage settings, and EVALUATOR may read them. The global permission table and route membership middleware both apply.
 
 The frontend's **Add New Service** form offers file, YAML URL and SPHERE sources. Linked service details display state, applied target, last successful synchronization, retained versions and migration counts. Manual pricing upload/archive/delete and local renaming/moving of linked services are rejected; use synchronization settings. Converting existing manual services or switching pricing identity is outside v1.

@@ -34,7 +34,14 @@ export default class SphereClient {
     }
     return { pricingId: match[1].toLowerCase(), permanentUrl: `${base.origin}${prefix}/p/${match[1].toLowerCase()}` };
   }
-  private async request(path: string) {
+  /**
+   * @param apiKey SPHERE API key of the linked service (SPHERE H11): sent as
+   *        `x-api-key`, so that SPHERE also returns the versions the key may
+   *        read (flagged `private: true`). Without it only public versions are
+   *        visible. Redirects are refused, so the key never leaves the pinned
+   *        SPHERE host.
+   */
+  private async request(path: string, apiKey?: string) {
     const base = this.base();
     const apiBase = process.env.SPHERE_API_URL || `${base.origin}${base.pathname.replace(/\/$/, '')}/api/v1`;
     const api = new URL(apiBase);
@@ -49,22 +56,27 @@ export default class SphereClient {
     try {
       const response = await fetch(`${apiBase.replace(/\/$/, '')}${path}`, {
         signal: controller.signal, redirect: 'error', size: 5 * 1024 * 1024,
+        headers: apiKey ? { 'x-api-key': apiKey, 'cache-control': 'no-store' } : undefined,
       });
+      if (apiKey && (response.status === 401 || response.status === 403)) {
+        throw new Error(`SPHERE rejected the API key of this service (${response.status}); check sphereApiKey`);
+      }
       if (!response.ok) throw new Error(`SPHERE unavailable (${response.status}); keeping local copies`);
       return await response.text();
     } finally { clearTimeout(timeout); }
   }
-  async manifest(id: string): Promise<SphereManifest> {
+  async manifest(id: string, apiKey?: string): Promise<SphereManifest> {
     if (!/^[a-f\d]{24}$/i.test(id)) throw new Error('Invalid pricing identity');
-    const result = JSON.parse(await this.request(`/public/pricings/${id}`));
+    const result = JSON.parse(await this.request(`/public/pricings/${id}`, apiKey));
     if (result.pricingId !== id || typeof result.name !== 'string' || !Array.isArray(result.versions) || !result.versions.length ||
       result.versions.some((v: any) => !/^[a-f\d]{24}$/i.test(v.versionId) || typeof v.version !== 'string' || !v.version || /[$\x00]/.test(v.version) ||
-        !Number.isFinite(Date.parse(v.createdAt)) || !/^[a-f\d]{64}$/i.test(v.contentHash)) ||
+        !Number.isFinite(Date.parse(v.createdAt)) || !/^[a-f\d]{64}$/i.test(v.contentHash) ||
+        (v.private !== undefined && typeof v.private !== 'boolean')) ||
       new Set(result.versions.map((v: any) => escapeVersion(v.version))).size !== result.versions.length) throw new Error('Invalid SPHERE manifest');
     return result;
   }
-  async yaml(pricingId: string, versionId: string) {
+  async yaml(pricingId: string, versionId: string, apiKey?: string) {
     if (![pricingId, versionId].every(id => /^[a-f\d]{24}$/i.test(id))) throw new Error('Invalid version identity');
-    return this.request(`/public/pricings/${pricingId}/versions/${versionId}/yaml`);
+    return this.request(`/public/pricings/${pricingId}/versions/${versionId}/yaml`, apiKey);
   }
 }
