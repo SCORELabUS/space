@@ -2044,6 +2044,11 @@ paths:
       description: |
         The pricing version SPACE assigns to new contracts of the service, which signed-out visitors of a pricing
         page should see. `POST /contracts` uses it for services it subscribes without a `contractedServices` entry.
+        The service name is matched exactly (case-insensitive).
+
+        This route takes precedence over `GET .../pricings/{pricingVersion}`: a pricing version literally named
+        `new-contracts` cannot be read through that route (neither as JSON nor with `format=yaml`). Avoid that
+        version name.
 
         **Authentication**: User API Key
 
@@ -2596,6 +2601,11 @@ paths:
       description: |
         The pricing version SPACE assigns to new contracts of the service, which signed-out visitors of a pricing
         page should see. `POST /contracts` uses it for services it subscribes without a `contractedServices` entry.
+        The service name is matched exactly (case-insensitive).
+
+        This route takes precedence over `GET .../pricings/{pricingVersion}`: a pricing version literally named
+        `new-contracts` cannot be read through that route (neither as JSON nor with `format=yaml`). Avoid that
+        version name.
 
         **Authentication**: Organization API Key
 
@@ -4504,7 +4514,9 @@ components:
           enum: [sphere-policy, default, latest-active]
           description: |
             `sphere-policy`: target of the SPHERE synchronization policy (linked services). `default`: the service's
-            `defaultVersion`. `latest-active`: fallback, the most recently created (`createdAt`) active version.
+            `defaultVersion`. `latest-active`: fallback, the most recently created (`createdAt`) active version;
+            versions without a known creation date (remote URL pricings) come last, and versions created at the
+            same time are ordered by version, descending (numeric-aware), so the answer is deterministic.
 
     Pricing:
       type: object

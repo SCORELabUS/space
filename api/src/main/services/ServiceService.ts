@@ -61,6 +61,24 @@ function readSyntaxVersion(body: Buffer): string | undefined {
   }
 }
 
+/**
+ * Order pricing versions newest first: by `createdAt` (descending; versions
+ * without a valid date last), then by version, descending and numeric-aware
+ * (`10.0` before `2.0`), so that equal dates give the same answer every time.
+ */
+function compareNewestFirst(
+  a: { version: string; createdAt?: Date | string | null },
+  b: { version: string; createdAt?: Date | string | null }
+): number {
+  const timeA = a.createdAt ? new Date(a.createdAt).getTime() : NaN;
+  const timeB = b.createdAt ? new Date(b.createdAt).getTime() : NaN;
+  const datedA = Number.isFinite(timeA);
+  const datedB = Number.isFinite(timeB);
+  if (datedA && datedB && timeA !== timeB) return timeB - timeA;
+  if (datedA !== datedB) return datedA ? -1 : 1;
+  return resetEscapeVersion(String(b.version)).localeCompare(resetEscapeVersion(String(a.version)), undefined, { numeric: true });
+}
+
 class ServiceService {
   private readonly serviceRepository: ServiceRepository;
   private readonly pricingRepository: PricingRepository;
@@ -284,13 +302,36 @@ class ServiceService {
       return { version: resetEscapeVersion(escapeVersion(service.defaultVersion)), source: 'default', serviceName: service.name };
     }
 
-    const latest = await this._getLatestActivePricing(service.name, organizationId);
+    const latest = await this._latestActiveVersion(service);
 
     if (!latest) {
       throw new Error(`NOT FOUND: No active pricing version for service ${serviceName}`);
     }
 
-    return { version: resetEscapeVersion(latest.version), source: 'latest-active', serviceName: service.name };
+    return { version: latest, source: 'latest-active', serviceName: service.name };
+  }
+
+  /**
+   * The most recently created active version of a service (unescaped), without
+   * loading the pricings: only `createdAt` of the locally stored ones is read.
+   * Versions without a known creation date (remote URL pricings, legacy
+   * documents) come after dated ones; ties are broken by version, descending
+   * (see `compareNewestFirst`), so the answer is deterministic.
+   */
+  async _latestActiveVersion(service: LeanService): Promise<string | null> {
+    const entries: [string, any][] = service.activePricings instanceof Map
+      ? Array.from(service.activePricings.entries())
+      : Object.entries(service.activePricings ?? {});
+    if (entries.length === 0) return null;
+
+    const ids = entries.map(([, entry]) => entry?.id).filter(Boolean).map(String);
+    const createdAt = await this.pricingRepository.findCreatedAtByIds(ids);
+    const candidates = entries.map(([version, entry]) => ({
+      version: resetEscapeVersion(version),
+      createdAt: entry?.id ? createdAt.get(String(entry.id)) : undefined,
+    }));
+
+    return candidates.sort(compareNewestFirst)[0].version;
   }
 
   /**
@@ -1333,14 +1374,8 @@ class ServiceService {
   ): Promise<LeanPricing | null> {
     const pricings = await this.indexPricings(serviceName, 'active', organizationId);
 
-    const sortedPricings = pricings.sort((a, b) => {
-      // Sort by createdAt date (descending - newest first)
-      if (a.createdAt && b.createdAt) {
-        return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-      }
-
-      return 0;
-    });
+    // Newest first, with a deterministic tie-breaker (see compareNewestFirst).
+    const sortedPricings = pricings.sort(compareNewestFirst);
 
     return sortedPricings.length > 0 ? sortedPricings[0] : null;
   }

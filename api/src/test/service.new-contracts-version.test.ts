@@ -105,6 +105,38 @@ describe('Pricing version for new contracts', function () {
       });
     });
 
+    it('breaks ties between versions created at the same time by version, deterministically', async function () {
+      await addPetclinicVersion(app, allKey, storedName, '10.0', '2025-06-01');
+
+      const response = await newContracts();
+
+      expect(response.status).toBe(200);
+      expect(response.body.version).toBe('10.0');
+    });
+
+    it('puts versions without a creation date after dated ones', async function () {
+      await PricingMongoose.updateOne(
+        { _organizationId: organization.id, version: '2_0' },
+        { $unset: { createdAt: '' } },
+        { strict: false }
+      );
+
+      const response = await newContracts();
+
+      expect(response.status).toBe(200);
+      expect(response.body.version).toBe(PETCLINIC_BASE_VERSION);
+    });
+
+    it('matches the service name exactly, not as a pattern or a prefix', async function () {
+      const prefix = await newContracts(evaluationKey, storedName.slice(0, 4));
+      const pattern = await newContracts(evaluationKey, `${storedName.slice(0, 3)}.*`);
+      const otherCase = await newContracts(evaluationKey, storedName.toUpperCase());
+
+      expect(prefix.status).toBe(404);
+      expect(pattern.status).toBe(404);
+      expect(otherCase.status).toBe(200);
+    });
+
     it('returns a yamlUrl that serves the version', async function () {
       const { yamlUrl } = (await newContracts()).body;
 

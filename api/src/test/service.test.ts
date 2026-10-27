@@ -750,7 +750,7 @@ describe('Services API Test Suite', function () {
       .reply(200, newPricingVersion);
 
       const response = await request(app)
-        .post(`${baseUrl}/services/${testService}/pricings`)
+        .post(`${baseUrl}/services/${testService.name}/pricings`)
         .set('x-api-key', testApiKey)
         .send({
           pricing:
@@ -765,7 +765,7 @@ describe('Services API Test Suite', function () {
   describe('GET /services/{serviceName}/pricings/{pricingVersion}', function () {
     it('Should return 200: Given existent service name and pricing version', async function () {  
       const response = await request(app)
-        .get(`${baseUrl}/services/${testService}/pricings/${testService.activePricings.keys().next().value}`)
+        .get(`${baseUrl}/services/${testService.name}/pricings/${testService.activePricings.keys().next().value}`)
         .set('x-api-key', testApiKey);
       expect(response.status).toEqual(200);
       expect(response.body.features).toBeDefined();
@@ -780,7 +780,7 @@ describe('Services API Test Suite', function () {
 
     it('Should return 200: Given existent service name in upper case and pricing version', async function () {
       const response = await request(app)
-        .get(`${baseUrl}/services/${testService}/pricings/${testService.activePricings.keys().next().value}`)
+        .get(`${baseUrl}/services/${testService.name.toUpperCase()}/pricings/${testService.activePricings.keys().next().value}`)
         .set('x-api-key', testApiKey);
       expect(response.status).toEqual(200);
       expect(response.body.features).toBeDefined();
@@ -820,7 +820,7 @@ describe('Services API Test Suite', function () {
       const fallbackPlan = getFirstPlanFromPricing(pricingToArchiveContent);
       
       const responseUpdate = await request(app)
-        .put(`${baseUrl}/services/${testService}/pricings/${versionToArchive}`)
+        .put(`${baseUrl}/services/${testService.name}/pricings/${versionToArchive}`)
         .set('x-api-key', testApiKey)
         .send({
           subscriptionPlan: fallbackPlan,
@@ -842,7 +842,7 @@ describe('Services API Test Suite', function () {
       
       const responseUpdate = await request(app)
         .put(
-          `${baseUrl}/services/${testService}/pricings/${versionToArchive}?availability=archived`
+          `${baseUrl}/services/${testService.name}/pricings/${versionToArchive}?availability=archived`
         )
         .set('x-api-key', testApiKey)
         .send({
@@ -862,7 +862,7 @@ describe('Services API Test Suite', function () {
       const archivedVersion = await addArchivedPricingToService(testOrganization.id!, testService.name);
 
       const responseUpdate = await request(app)
-        .put(`${baseUrl}/services/${testService}/pricings/${archivedVersion}?availability=active`)
+        .put(`${baseUrl}/services/${testService.name}/pricings/${archivedVersion}?availability=active`)
         .set('x-api-key', testApiKey);
       expect(responseUpdate.status).toEqual(200);
       expect(responseUpdate.body.activePricings).toBeDefined();
@@ -889,7 +889,7 @@ describe('Services API Test Suite', function () {
 
         const responseUpdate = await request(app)
           .put(
-            `${baseUrl}/services/${testService}/pricings/${versionToArchive}?availability=archived`
+            `${baseUrl}/services/${testService.name}/pricings/${versionToArchive}?availability=archived`
           )
           .set('x-api-key', testApiKey)
           .send({
@@ -945,7 +945,7 @@ describe('Services API Test Suite', function () {
       
       const responseUpdate = await request(app)
         .put(
-          `${baseUrl}/services/${testService}/pricings/${versionToArchive}?availability=invalidValue`
+          `${baseUrl}/services/${testService.name}/pricings/${versionToArchive}?availability=invalidValue`
         )
         .set('x-api-key', testApiKey)
         .send({
@@ -1020,7 +1020,7 @@ describe('Services API Test Suite', function () {
       // Necesary to delete
       await archivePricingFromService(testOrganization.id!, testService.name, versionToDelete, app);
       await request(app)
-        .delete(`${baseUrl}/services/${testService}/pricings/${versionToDelete}`)
+        .delete(`${baseUrl}/services/${testService.name}/pricings/${versionToDelete}`)
         .set('x-api-key', testApiKey)
         .expect(204);
     });

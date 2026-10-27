@@ -12,6 +12,17 @@ class PricingRepository extends RepositoryBase {
     return pricing.toJSON();
   }
 
+  /** `createdAt` of the given pricings, by id (pricings without one are left out). */
+  async findCreatedAtByIds(ids: string[]): Promise<Map<string, Date>> {
+    if (ids.length === 0) return new Map();
+    const pricings = await PricingMongoose.find({ _id: { $in: ids } }, { createdAt: 1 }).lean();
+    return new Map(
+      pricings
+        .filter((pricing: any) => pricing.createdAt)
+        .map((pricing: any) => [String(pricing._id), new Date(pricing.createdAt)])
+    );
+  }
+
   async create(data: any): Promise<LeanPricing | null> {
     const pricing = await PricingMongoose.create(data);
     if (!pricing) {
