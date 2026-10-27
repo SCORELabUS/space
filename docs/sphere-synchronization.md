@@ -6,6 +6,7 @@ SPACE can create a service from a public SPHERE pricing permanent link. Existing
 
 1. Deploy SPHERE's permanent-identity migration and public pricing API first. Pause pricing writes while running its migration. Existing versions must receive a `pricingId`; never regenerate those IDs after sharing links.
 2. Configure SPACE's `SPHERE_PUBLIC_URL` (for example `https://sphere.score.us.es`). Optional `SPHERE_API_URL` must use the same protocol and host and include the API prefix, normally `/api/v1`. In local development its port may differ, such as UI `http://localhost:5173` and API `http://localhost:8080/api/v1`.
+   `SPHERE_EDITOR_FRAGMENT=true` additionally offers **View in SPHERE** for uploaded pricings, once that SPHERE's editor reads `#pricing=` (see [Opening pricings in SPHERE](#opening-pricings-in-sphere)).
 3. Initially use `SPHERE_SYNC_ENABLED=false`. Create a linked service and use **Synchronize now** to verify connectivity and permissions.
 4. Set `SPHERE_SYNC_ENABLED=true` and restart SPACE to enable periodic processing. The worker checks each service on a staggered five-minute schedule, with bounded sequential processing. Slow remote calls or a backlog can delay completion.
 5. Disable periodic processing using the same flag without deleting services, contracts or snapshots. Manual synchronization remains available. Graceful SIGTERM/SIGINT shutdown waits for the current worker and closes events, Redis and MongoDB without deleting the database.
@@ -62,9 +63,11 @@ The SPACE UI links to SPHERE without ever handing it a SPACE file or credential:
 
 - SPHERE snapshots open SPHERE's permanent link for their pricing (`/p/{pricingId}`, from the pricing's `sphere` field), so SPHERE resolves it and applies its own permissions. SPHERE has no link to a single version: its pricing page opens on the latest version it shows to that user.
 - Pricings defined by an external URL open in SPHERE's editor, which fetches that URL (`/editor?pricingUrl=...`).
-- Pricings uploaded to SPACE are not offered. Their YAML is only readable with the organization's credentials. SPHERE's editor only takes content in its query string (`/editor?pricing=<compressed YAML>`): the request line is written to SPHERE's server logs, and it is refused above about 15.7 KB in SPHERE's production setup and 8 KB in its release image, which the largest pricings exceed.
+- Pricings uploaded to SPACE are offered only when `SPHERE_EDITOR_FRAGMENT=true`. Their YAML is only readable with the organization's credentials, so SPACE reads it with the signed-in user's API key and opens SPHERE's editor with the content in the URL fragment: `/editor#pricing=<YAML compressed with lz-string compressToEncodedURIComponent>`, the encoding of SPHERE's own share links. Browsers never send the fragment to a server, so the content reaches no SPHERE server or log; no YAML or credential goes in the query string. A pricing whose encoded content exceeds 512 KiB (524,288 characters) is not opened: SPACE says it is too large and suggests downloading the YAML and using **Import** in SPHERE's editor. It is never truncated. The largest real pricings measured encode to about 20,000 characters.
 
 The links use `SPHERE_PUBLIC_URL`, the address of SPHERE reachable by the browser.
+
+`SPHERE_EDITOR_FRAGMENT` (default `false`) tells the frontend that the SPHERE at `SPHERE_PUBLIC_URL` reads `#pricing=` in its editor. Set it to `true` only for a SPHERE release with that support: an editor without it ignores the fragment and shows its default template instead of the pricing. Like `SPHERE_PUBLIC_URL`, it is read when the frontend is built (from `frontend/.env`, the root `.env` or the Docker build argument), so rebuild the frontend after changing it.
 
 ## Recovery and retention
 
