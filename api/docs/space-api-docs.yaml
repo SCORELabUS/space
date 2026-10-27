@@ -148,6 +148,13 @@ info:
       consumers did not know them); `contractVersion` does not change unless the service is also renamed. Contracts
       with other services stay and lose this one, as when it is deleted (history recorded, `CONTRACT_NOVATED`).
     - The pricings of the service follow it (`GET .../services/{newName}/pricings` in its organization).
+
+    **Who may move a service.** A move takes the service and its contracts out of one organization and into another,
+    so the caller must be allowed to manage services in both: a user with the OWNER or ADMIN role in the organization
+    the service is in and in the target organization (`PUT /organizations/{organizationId}/services/{serviceName}`),
+    or a platform ADMIN. Organization API keys cannot move services (`403`): a key belongs to one organization. A
+    target organization that does not exist gets the same `403` as one the caller has no rights in. This is checked
+    before anything is read or written for the move. Renaming and `defaultVersion` keep their permissions.
     Everything that can refuse the request is checked first, and a `409` changes nothing: the name is taken by
     another service (enabled or disabled) of the organization the service would be in, a contract already has a
     service with the new name, or a contract that would move has a `userId` the target organization already uses.
@@ -2018,8 +2025,12 @@ paths:
         **Authentication**: User API Key
 
         **Permission**: 
-        - USER user: OWNER/ADMIN/MANAGER role required
-        - ADMIN user: can update services in any organization
+        - USER user: OWNER/ADMIN/MANAGER role required to rename it or set `defaultVersion`. Moving it to another
+          organization (`organizationId`) requires the OWNER or ADMIN role in this organization **and** in the target
+          organization; otherwise `403`, also when the target organization does not exist (see "Renaming and moving
+          services").
+        - ADMIN user: can update services in any organization, and move them to any organization (`400` when it does
+          not exist)
 
         **Cascading Operations** (every contract of the organization; see "Renaming and moving services"):
         - Renaming a service renames it in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
@@ -2074,9 +2085,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/Service'
         '400':
-          description: Invalid update data (e.g., organization not found)
+          description: Invalid update data (for a platform ADMIN, also a target organization that does not exist)
         '403':
-          description: Forbidden
+          description: |
+            Forbidden. For a move (`organizationId`): the caller is an organization API key, or does not have the
+            OWNER or ADMIN role in both organizations, or the target organization does not exist (the same answer, so
+            that it does not reveal which organization ids exist). Nothing was changed.
         '404':
           description: Service not found
         '409':
@@ -2646,8 +2660,12 @@ paths:
         **Authentication**: Organization API Key
 
         **Permission**: 
-          - ALL scope: can update service name and organization.
-          - MANAGEMENT scope: can update service name and organization
+          - ALL scope: can update the service name and `defaultVersion`.
+          - MANAGEMENT scope: can update the service name and `defaultVersion`.
+          - Moving the service to another organization (`organizationId` other than the key's organization) is
+            refused with `403` for every scope: an organization API key belongs to one organization. Use
+            `PUT /organizations/{organizationId}/services/{serviceName}` with a user API key that has the OWNER or
+            ADMIN role in both organizations (see "Renaming and moving services").
 
         **Cascading Operations** (every contract of the organization; see "Renaming and moving services"):
         - Renaming a service renames it in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
@@ -2697,9 +2715,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/Service'
         '400':
-          description: Invalid update data (e.g., organization not found)
+          description: Invalid update data (for a platform ADMIN, also a target organization that does not exist)
         '403':
-          description: Forbidden
+          description: |
+            Forbidden. For a move (`organizationId`): the caller is an organization API key, or does not have the
+            OWNER or ADMIN role in both organizations, or the target organization does not exist (the same answer, so
+            that it does not reveal which organization ids exist). Nothing was changed.
         '404':
           description: Service not found
         '409':
