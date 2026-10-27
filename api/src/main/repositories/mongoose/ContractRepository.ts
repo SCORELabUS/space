@@ -294,14 +294,24 @@ class ContractRepository extends RepositoryBase {
     return result.modifiedCount;
   }
 
-  async bulkUpdate(contracts: LeanContract[], disable = false): Promise<number> {
+  /**
+   * Write several contracts, each addressed by `userId` within an organization:
+   * `options.organizationId` (the organization the contracts belong to before
+   * this write, for moves between organizations) or else each contract's own
+   * `organizationId`. A contract of another organization never matches.
+   */
+  async bulkUpdate(
+    contracts: LeanContract[],
+    disable = false,
+    options: { organizationId?: string } = {}
+  ): Promise<number> {
     if (contracts.length === 0) {
       return 0;
     }
 
     const bulkOps = contracts.map(contract => ({
       updateOne: {
-        filter: { 'userContact.userId': contract.userContact.userId },
+        filter: byUserId(contract.userContact.userId, options.organizationId ?? contract.organizationId),
         update: {
           $set: {
             ...contract,

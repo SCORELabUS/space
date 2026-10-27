@@ -15,6 +15,7 @@ import { LeanUser } from '../main/types/models/User';
 import { LeanOrganization } from '../main/types/models/Organization';
 import ContractMongoose from '../main/repositories/mongoose/models/ContractMongoose';
 import ServiceMongoose from '../main/repositories/mongoose/models/ServiceMongoose';
+import container from '../main/config/container';
 
 /**
  * Contracts are addressed by `userId`, which is chosen by the host application
@@ -246,6 +247,29 @@ describe('Contract organization scoping', function () {
         .set('x-api-key', ownerA.apiKey);
 
       expect(response.status).toBe(200);
+    });
+  });
+
+  describe('bulk contract writes', function () {
+    it('never write over a contract of another organization that shares the userId', async function () {
+      const stored = await storedContract();
+      const forged = {
+        ...stored,
+        organizationId: orgB.id,
+        subscriptionPlans: { [serviceName]: 'PLATINUM' },
+      };
+      delete forged._id;
+
+      // The filter includes the organization: nothing of org A matches, and the
+      // upsert then collides with the globally unique userId instead of writing.
+      await container
+        .resolve('contractRepository')
+        .bulkUpdate([forged])
+        .catch(() => undefined);
+
+      const after = await storedContract();
+      expect(after.organizationId).toBe(orgA.id);
+      expect(after.subscriptionPlans[serviceName]).toBe('GOLD');
     });
   });
 

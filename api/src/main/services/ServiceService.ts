@@ -794,7 +794,8 @@ class ServiceService {
       for (const contract of contractsToUpdateOrgId) {
         contract.organizationId = dataToUpdate.organizationId;
       }
-      await this.contractRepository.bulkUpdate(contractsToUpdateOrgId);
+      // Matched in the organization they are moving from.
+      await this.contractRepository.bulkUpdate(contractsToUpdateOrgId, false, { organizationId });
 
       await this.cacheService.delMany(
         contractsToRemoveService.map(c => `contracts.${c.userContact.userId}`)

@@ -71,6 +71,10 @@ info:
     users). A contract of another organization is reported as `404`, exactly like a `userId` that does not
     exist. Only a platform ADMIN user calling the direct `/contracts/{userId}` routes is not confined.
 
+    Known limitation: `userId` is still unique across the whole server, not per organization. Creating a
+    contract (`POST /contracts`) with a `userId` that a contract of another organization already uses
+    answers `409`, so two organizations cannot use the same `userId` yet.
+
     ## Capabilities
 
     Every response (errors and CORS preflights included) carries `X-Space-Capabilities`, a comma-separated
