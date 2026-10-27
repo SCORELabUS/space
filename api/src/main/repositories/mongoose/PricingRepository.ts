@@ -44,6 +44,19 @@ class PricingRepository extends RepositoryBase {
     return true;
   }
 
+  /**
+   * Point stored pricings to the service they belong to after it was renamed
+   * or moved (`_serviceName`, `_organizationId`), so that they are found under
+   * its name and organization.
+   */
+  async reassignToService(ids: string[], serviceName: string, organizationId: string): Promise<void> {
+    if (ids.length === 0) return;
+    await PricingMongoose.updateMany(
+      { _id: { $in: ids } },
+      { $set: { _serviceName: serviceName, _organizationId: organizationId } }
+    );
+  }
+
   async destroy(id: string): Promise<LeanPricing | null> {
     const pricing = await PricingMongoose.findByIdAndDelete(id);
     if (!pricing) {

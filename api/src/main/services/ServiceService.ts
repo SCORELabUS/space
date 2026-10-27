@@ -14,7 +14,7 @@ import { validatePricingData } from './validation/PricingServiceValidation';
 import { LeanService } from '../types/models/Service';
 import { ExpectedPricingType, LeanPricing } from '../types/models/Pricing';
 import { FallBackSubscription, LeanContract } from '../types/models/Contract';
-import ContractRepository from '../repositories/mongoose/ContractRepository';
+import ContractRepository, { SERVICE_MAPS } from '../repositories/mongoose/ContractRepository';
 import { isSubscriptionValidInPricing } from '../controllers/validation/ContractValidation';
 import { generateUsageLevels } from '../utils/contracts/helpers';
 import { escapeVersion, resetEscapeVersion } from '../utils/helpers';
@@ -128,6 +128,28 @@ function compareNewestFirst(
   if (datedA && datedB && timeA !== timeB) return timeB - timeA;
   if (datedA !== datedB) return datedA ? -1 : 1;
   return resetEscapeVersion(String(b.version)).localeCompare(resetEscapeVersion(String(a.version)), undefined, { numeric: true });
+}
+
+/** A Map or plain object of a lean document, as a plain object. */
+const plainMap = (value: any): Record<string, any> =>
+  value instanceof Map ? Object.fromEntries(value) : value ?? {};
+
+/** Ids of the stored pricings of a service (active and archived). */
+function pricingIdsOf(service: LeanService): string[] {
+  return [service.activePricings, service.archivedPricings]
+    .flatMap(locators => Object.values(plainMap(locators)))
+    .map((locator: any) => locator?.id)
+    .filter(Boolean)
+    .map(String);
+}
+
+/**
+ * Whether a contract moves with a service that goes to another organization:
+ * it has that service and no other one. Contracts with other services keep
+ * them and lose this one.
+ */
+function movesWithService(contractedServices: string[], serviceKey: string): boolean {
+  return contractedServices.length > 0 && contractedServices.every(key => key.toLowerCase() === serviceKey);
 }
 
 class ServiceService {
@@ -893,29 +915,39 @@ class ServiceService {
     }
   }
 
+  /**
+   * Update a service: `defaultVersion`, its name and/or its organization.
+   *
+   * Renaming renames it in every contract of the organization (the keys of
+   * `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
+   * `usageLevels`, compared case-insensitively). Moving it to another
+   * organization moves the contracts that only have this service, and removes
+   * it from the contracts that have other services too (they stay; the
+   * previous subscription goes to their history). Its pricings follow it.
+   *
+   * Everything that can refuse the request is checked before anything is
+   * written (`409`): the name is free in the organization the service ends up
+   * in (disabled services included), no contract would end up with two
+   * subscriptions under the same name, and no contract would move into an
+   * organization that already has its userId. Contracts are written one by
+   * one, each conditional on the version that was read (retried when it
+   * changed meanwhile), with contract events and cache invalidation; the
+   * service itself is written last, so a failure can be repeated. Contracts
+   * created with the old name while the request runs are handled after the
+   * service is written.
+   */
   async update(serviceName: string, newServiceData: any, organizationId: string) {
     const cacheKey = `service.${organizationId}.${serviceName}`;
-    let service = await this.cacheService.get(cacheKey);
     const dataToUpdate: any = {};
-    const contractsToRemoveService: LeanContract[] = [];
-    const contractsToUpdateOrgId: LeanContract[] = [];
 
-    if (!service) {
-      service = await this.serviceRepository.findByName(serviceName, organizationId);
-    }
+    // From the database: the name and organization are about to change.
+    const service: LeanService | null = await this.serviceRepository.findByName(serviceName, organizationId);
 
     if (!service) {
       throw new Error(`NOT FOUND: Service with name ${serviceName}`);
     }
 
     if (newServiceData.name && newServiceData.name !== service.name) {
-      const existingService = await this.serviceRepository.findByName(
-        newServiceData.name,
-        organizationId
-      );
-      if (existingService) {
-        throw new Error(`CONFLICT: Service name ${newServiceData.name} already exists`);
-      }
       dataToUpdate.name = newServiceData.name;
     }
 
@@ -943,40 +975,29 @@ class ServiceService {
           `INVALID DATA: Organization with id ${newServiceData.organizationId} not found`
         );
       }
-
-      const contracts = await this.contractRepository.findByFilters({
-        filters: { services: [service.name] },
-        organizationId,
-      });
-
-      for (const contract of contracts) {
-        if (Object.keys(contract.contractedServices).length > 1) {
-          contractsToRemoveService.push(contract);
-        } else {
-          if (dataToUpdate.name) {
-            contract.contractedServices[dataToUpdate.name] =
-              contract.contractedServices[service.name];
-            delete contract.contractedServices[service.name];
-          }
-          contractsToUpdateOrgId.push(contract);
-        }
-      }
-
-      // userIds are unique per organization: a contract cannot move into an
-      // organization that already has a contract for the same userId. Checked
-      // before anything is written.
-      const taken = await this.contractRepository.findExistingUserIds(
-        newServiceData.organizationId,
-        contractsToUpdateOrgId.map(contract => contract.userContact.userId)
-      );
-      if (taken.length > 0) {
-        throw new Error(
-          `CONFLICT: Organization ${newServiceData.organizationId} already has contracts for userIds ${taken.join(', ')}; ` +
-            `moving service ${service.name} would move contracts with the same userIds into it`
-        );
-      }
-
       dataToUpdate.organizationId = newServiceData.organizationId;
+    }
+
+    const finalName: string = dataToUpdate.name ?? service.name;
+    const finalOrganizationId: string = dataToUpdate.organizationId ?? organizationId;
+    // Contract keys are lowercased: a change of case only is not a rename for them.
+    const change = {
+      ...(finalName.toLowerCase() !== service.name.toLowerCase() ? { name: finalName } : {}),
+      ...(dataToUpdate.organizationId ? { organizationId: dataToUpdate.organizationId as string } : {}),
+    };
+    const relocated = Boolean(dataToUpdate.name || dataToUpdate.organizationId);
+
+    if (relocated) {
+      await this._assertServiceNameFree(finalName, finalOrganizationId, service);
+    }
+
+    if (change.name || change.organizationId) {
+      // Checks every contract (409) before anything is written.
+      const plan = await this._planServiceInContracts(service.name, organizationId, change);
+      await this.pricingRepository.reassignToService(pricingIdsOf(service), finalName, finalOrganizationId);
+      await this._renameOrMoveServiceInContracts(plan);
+    } else if (relocated) {
+      await this.pricingRepository.reassignToService(pricingIdsOf(service), finalName, finalOrganizationId);
     }
 
     const updatedService = await this.serviceRepository.update(
@@ -985,55 +1006,159 @@ class ServiceService {
       organizationId
     );
 
-    if (dataToUpdate.name) {
-      // If the service name has changed, we need to update the cache key
-      await this.cacheService.del(cacheKey);
-      serviceName = dataToUpdate.name;
+    if (!updatedService) {
+      throw new Error(`NOT FOUND: Service with name ${serviceName}`);
+    }
 
-      await this.contractRepository.changeServiceName(
-        service.name,
-        dataToUpdate.name,
-        organizationId
+    if (relocated) {
+      await this.cacheService.delMany([cacheKey, `service.${organizationId}.${service.name}`]);
+    }
+
+    if (change.name || change.organizationId) {
+      // Contracts created with the old name while the contracts were written.
+      await this._renameOrMoveServiceInContracts(
+        await this._planServiceInContracts(service.name, organizationId, change)
       );
-      const updatedContracts = await this.contractRepository.findByFilters({
-        filters: { services: [dataToUpdate.name] },
-        organizationId: dataToUpdate.organizationId || organizationId,
-      });
-
-      // Evaluations and pricing tokens name the service too.
-      await this.cacheService.delMany(updatedContracts.flatMap(c => contractCacheKeys(c)));
     }
 
-    if (dataToUpdate.organizationId) {
-      for (const contract of contractsToRemoveService) {
-        delete contract.contractedServices[service.name];
-      }
-      await this.contractRepository.bulkUpdate(contractsToRemoveService);
-
-      // Cached under the organization they move from (and nothing of theirs under the new one).
-      const movedCacheKeys = contractsToUpdateOrgId.flatMap(c => [
-        ...contractCacheKeys(c),
-        ...contractCacheKeys({ ...c, organizationId: dataToUpdate.organizationId }),
-      ]);
-      for (const contract of contractsToUpdateOrgId) {
-        contract.organizationId = dataToUpdate.organizationId;
-      }
-      // Matched in the organization they are moving from.
-      await this.contractRepository.bulkUpdate(contractsToUpdateOrgId, false, { organizationId });
-
-      await this.cacheService.delMany(contractsToRemoveService.flatMap(c => contractCacheKeys(c)));
-      await this.cacheService.delMany(movedCacheKeys);
-    }
-
-    let newCacheKey = `service.${organizationId}.${serviceName}`;
-
-    if (newServiceData.organizationId && newServiceData.organizationId !== organizationId) {
-      newCacheKey = `service.${newServiceData.organizationId}.${serviceName}`;
-    }
-
-    await this.cacheService.set(newCacheKey, updatedService, 3600, true);
+    await this.cacheService.set(`service.${finalOrganizationId}.${finalName}`, updatedService, 3600, true);
 
     return updatedService;
+  }
+
+  /**
+   * @throws `CONFLICT:` when the organization has another service (enabled or
+   *         disabled) with this name, compared case-insensitively.
+   */
+  async _assertServiceNameFree(name: string, organizationId: string, service: LeanService) {
+    for (const disabled of [false, true]) {
+      const existing = await this.serviceRepository.findByName(name, organizationId, disabled);
+      if (existing && existing.id !== service.id) {
+        throw new Error(
+          disabled
+            ? `CONFLICT: Service name ${existing.name} is taken by a disabled service of organization ${organizationId}; delete that service first`
+            : `CONFLICT: Service name ${existing.name} already exists in organization ${organizationId}`
+        );
+      }
+    }
+  }
+
+  /**
+   * What renaming a service and/or moving it to another organization does to
+   * the contracts of `organizationId` that name it (all of them), checked
+   * before anything is written.
+   *
+   * @throws `CONFLICT:` when a contract would end up with two subscriptions
+   *         under the new name, or when a contract that would move has a userId
+   *         the target organization already uses.
+   */
+  async _planServiceInContracts(
+    serviceName: string,
+    organizationId: string,
+    change: { name?: string; organizationId?: string }
+  ): Promise<{ serviceName: string; organizationId: string; change: typeof change; userIds: string[] }> {
+    const rows = await this.contractRepository.findServiceKeysOfContracts(organizationId, serviceName);
+    const from = serviceName.toLowerCase();
+    const isService = (key: string) => key.toLowerCase() === from;
+
+    if (change.name) {
+      const to = change.name.toLowerCase();
+      const clashes = rows
+        .filter(row =>
+          SERVICE_MAPS.some(
+            field => row.keys[field].filter(isService).length > 1 || row.keys[field].some(key => key.toLowerCase() === to)
+          )
+        )
+        .map(row => row.userId);
+      if (clashes.length > 0) {
+        throw new Error(
+          `CONFLICT: Contracts of userIds ${clashes.join(', ')} already have a service named ${change.name} ` +
+            `(or name service ${serviceName} more than once); renaming would merge two subscriptions`
+        );
+      }
+    }
+
+    if (change.organizationId) {
+      // userIds are unique per organization (see ContractRepository).
+      const moving = rows.filter(row => movesWithService(row.keys.contractedServices, from)).map(row => row.userId);
+      const taken = await this.contractRepository.findExistingUserIds(change.organizationId, moving);
+      if (taken.length > 0) {
+        throw new Error(
+          `CONFLICT: Organization ${change.organizationId} already has contracts for userIds ${taken.join(', ')}; ` +
+            `moving service ${serviceName} would move contracts with the same userIds into it`
+        );
+      }
+    }
+
+    return { serviceName, organizationId, change, userIds: rows.map(row => row.userId) };
+  }
+
+  /**
+   * Apply a plan of `_planServiceInContracts`, contract by contract:
+   * - renamed in place (no move): CONTRACT_NOVATED (`contractVersion` changes
+   *   with the name);
+   * - moved (the contract only has this service): CONTRACT_DELETED in the
+   *   organization it leaves and CONTRACT_CREATED in the one it joins, whose
+   *   consumers did not know it;
+   * - service removed (the contract has other services, and stays):
+   *   CONTRACT_NOVATED.
+   * Each write is conditional on the version that was read; a contract that
+   * changed meanwhile is read again and retried. The cached contract,
+   * evaluations and pricing token are dropped in every organization concerned.
+   *
+   * @returns how many contracts were changed.
+   */
+  async _renameOrMoveServiceInContracts(plan: {
+    serviceName: string;
+    organizationId: string;
+    change: { name?: string; organizationId?: string };
+    userIds: string[];
+  }): Promise<number> {
+    const { serviceName, organizationId, change } = plan;
+    const from = serviceName.toLowerCase();
+    const attempts = 5;
+    let changed = 0;
+
+    for (const userId of plan.userIds) {
+      let done = false;
+      for (let attempt = 0; attempt < attempts && !done; attempt++) {
+        const contract = await this.contractRepository.findByUserId(userId, organizationId);
+        if (!contract) {
+          done = true; // Deleted meanwhile.
+          break;
+        }
+        const names = SERVICE_MAPS.flatMap(field => Object.keys(plainMap(contract[field])));
+        if (!names.some(name => name.toLowerCase() === from)) {
+          done = true; // Nothing of the service left in it.
+          break;
+        }
+
+        const moves = Boolean(change.organizationId) && movesWithService(Object.keys(plainMap(contract.contractedServices)), from);
+        const written =
+          change.organizationId && !moves
+            ? await this.contractRepository.removeServicesFromContract(contract, [serviceName])
+            : await this.contractRepository.renameOrMoveServiceInContract(contract, serviceName, change);
+        if (!written) continue; // Changed after it was read: read it again.
+        done = true;
+        changed++;
+
+        await this.cacheService.delMany(contractCacheKeys(contract));
+        if (moves) {
+          await this.cacheService.delMany(contractCacheKeys(written));
+          this.eventService.emitContractEvent?.('CONTRACT_DELETED', contract, { deleted: true });
+          this.eventService.emitContractEvent?.('CONTRACT_CREATED', written);
+        } else {
+          this.eventService.emitContractEvent?.('CONTRACT_NOVATED', written);
+        }
+      }
+      if (!done) {
+        throw new Error(
+          `CONFLICT: The contract of user ${userId} kept changing while service ${serviceName} was renamed or moved in it; retry`
+        );
+      }
+    }
+
+    return changed;
   }
 
   async updatePricingAvailability(
