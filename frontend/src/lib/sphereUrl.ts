@@ -34,7 +34,7 @@ export interface SphereViewSource {
   /** Set when the pricing is defined by a remote URL instead of a file stored by SPACE. */
   url?: string;
   /** Set on snapshots imported from SPHERE. */
-  sphere?: { pricingId?: string; permanentUrl?: string };
+  sphere?: { pricingId?: string; versionId?: string; permanentUrl?: string };
   /** Set when SPACE stores the pricing file (uploaded by hand, or a SPHERE snapshot). */
   yamlPath?: string;
 }
@@ -68,8 +68,9 @@ function httpUrl(value: string | undefined): URL | null {
 /**
  * Where "View in SPHERE" opens a pricing version, or `null` when SPHERE cannot open it.
  *
- * - Snapshot of a SPHERE pricing: SPHERE's permanent link `/p/{pricingId}`. SPHERE has no
- *   link to a single version, so its pricing page opens on its latest version.
+ * - Snapshot of a SPHERE pricing: SPHERE's permanent link `/p/{pricingId}?version={versionId}`,
+ *   on the SPHERE version SPACE copied. Without a valid version ID: `/p/{pricingId}`. A SPHERE
+ *   without version links ignores `version` and opens its latest version.
  * - Pricing defined by an external URL: SPHERE's editor fetches that URL itself.
  * - Pricing file stored by SPACE (uploaded by hand), when SPHERE's editor reads `#pricing=`:
  *   SPHERE's editor, to be given the content in the URL fragment. Its YAML is only readable
@@ -87,11 +88,17 @@ export function sphereViewLink(
 
   if (pricingId && SPHERE_ID.test(pricingId)) {
     const permanent = httpUrl(pricing.sphere?.permanentUrl);
-    const url =
+    const url = new URL(
       permanent && permanent.pathname.replace(/\/+$/, '').toLowerCase().endsWith(`/p/${pricingId}`)
         ? spherePricingUrl(permanent.href, browserUrl)
-        : new URL(`p/${pricingId}`, base).href;
-    return { kind: 'permalink', url };
+        : new URL(`p/${pricingId}`, base).href
+    );
+    // SPHERE's version `_id`, the value its permanent links take in `?version=`.
+    const versionId = pricing.sphere?.versionId?.trim().toLowerCase();
+    if (versionId && SPHERE_ID.test(versionId)) {
+      url.searchParams.set('version', versionId);
+    }
+    return { kind: 'permalink', url: url.href };
   }
 
   const remote = httpUrl(pricing.url);
