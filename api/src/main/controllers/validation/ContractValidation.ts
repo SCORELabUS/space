@@ -108,10 +108,11 @@ const create = [
 ];
 
 const novate = [
-  // contractedServices (optional)
+  // contractedServices (optional): services it omits keep the version of the
+  // contract or, if the contract does not have them, get the version for new
+  // contracts; SPHERE policies still apply.
   check('contractedServices')
-    .exists({ checkNull: true })
-    .withMessage('The contractedServices field is required')
+    .optional()
     .isObject()
     .withMessage(
       'contractedServices must be an object where keys are service names and values are pricing versions'

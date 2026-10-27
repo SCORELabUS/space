@@ -107,6 +107,7 @@ class ContractController {
     this.pricings = this.pricings.bind(this);
     this.create = this.create.bind(this);
     this.novate = this.novate.bind(this);
+    this.previewNovation = this.previewNovation.bind(this);
     this.novateByGroupId = this.novateByGroupId.bind(this);
     this.novateUserContact = this.novateUserContact.bind(this);
     this.novateBillingPeriod = this.novateBillingPeriod.bind(this);
@@ -253,6 +254,25 @@ class ContractController {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('invalid subscription:')) {
         res.status(400).send({ error: err.message });
+      } else {
+        res.status(500).send({ error: err.message });
+      }
+    }
+  }
+
+  /** POST /contracts/{userId}/novation/preview: what PUT /contracts/{userId} would do, writing nothing. */
+  async previewNovation(req: any, res: any) {
+    try {
+      const options = novationOptionsOf(req);
+      // Preconditions are for writes; the preview reports the current version instead.
+      if (req.body && 'expectedContractVersion' in req.body) delete req.body.expectedContractVersion;
+      const preview = await this.contractService.previewNovation(req.params.userId, req.body, this._scope(req), options);
+      res.status(200).json(preview);
+    } catch (err: any) {
+      if (err.message.toLowerCase().includes('not found')) {
+        res.status(404).send({ error: err.message });
+      } else if (/applying|busy/i.test(err.message)) {
+        res.status(409).send({ error: err.message });
       } else {
         res.status(500).send({ error: err.message });
       }

@@ -50,6 +50,16 @@ const loadFileRoutes = function (app: express.Application) {
     .delete(memberRole, hasPermission(['OWNER', 'ADMIN']), contractController.destroy);
 
   app
+    .route(baseUrl + '/organizations/:organizationId/contracts/:userId/novation/preview')
+    .post(
+      memberRole,
+      hasPermission(['OWNER', 'ADMIN', 'MANAGER']),
+      ContractValidator.novate,
+      handleValidation,
+      contractController.previewNovation
+    );
+
+  app
     .route(baseUrl + '/organizations/:organizationId/contracts/:userId/pricings')
     .get(
       memberRole,
@@ -79,6 +89,10 @@ const loadFileRoutes = function (app: express.Application) {
     .delete(contractController.destroy);
 
   app.route(baseUrl + '/contracts/:userId/pricings').get(contractController.pricings);
+
+  app
+    .route(baseUrl + '/contracts/:userId/novation/preview')
+    .post(ContractValidator.novate, handleValidation, contractController.previewNovation);
 
   app
     .route(baseUrl + '/contracts/:userId/usageLevels')
