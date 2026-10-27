@@ -304,8 +304,8 @@ describe('Services API Test Suite', function () {
       expect(serviceBeforeUpdate.organizationId).toEqual(testOrganization.id);
 
       const responseUpdate = await request(app)
-        .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', testApiKey)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN of both organizations
         .send({ organizationId: newOrganization.id });
 
       expect(responseUpdate.status).toEqual(200);
@@ -347,8 +347,8 @@ describe('Services API Test Suite', function () {
 
       // Move service to new organization
       const updateResponse = await request(app)
-        .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', testApiKey)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN of both organizations
         .send({ organizationId: newOrganization.id });
 
       expect(updateResponse.status).toEqual(200);
@@ -396,8 +396,8 @@ describe('Services API Test Suite', function () {
       // Move service to new organization
       const newOrganization = await createTestOrganization(ownerUser.username);
       const updateResponse = await request(app)
-        .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', testApiKey)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN of both organizations
         .send({ organizationId: newOrganization.id });
 
       expect(updateResponse.status).toEqual(200);
@@ -437,8 +437,8 @@ describe('Services API Test Suite', function () {
       await addApiKeyToOrganization(newOrganization.id!, { key: newOrgApiKey, scope: 'ALL' });
 
       const responseUpdate = await request(app)
-        .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', testApiKey)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN of both organizations
         .send({ name: newName, organizationId: newOrganization.id });
 
       expect(responseUpdate.status).toEqual(200);
@@ -498,8 +498,8 @@ describe('Services API Test Suite', function () {
       contractsToCleanup.set(multiContractBefore.userContact.userId, multiContractBefore.organizationId);
 
       const updateResponse = await request(app)
-        .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', testApiKey)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN of both organizations
         .send({ name: newName, organizationId: newOrganization.id });
 
       expect(updateResponse.status).toEqual(200);
@@ -561,18 +561,33 @@ describe('Services API Test Suite', function () {
       await deleteTestService(secondService.name, testOrganization.id!);
     });
 
-    it('Should return 4XX when trying to move service to non-existent organization', async function () {
+    it('Should return 403 when trying to move service to non-existent organization', async function () {
       const fakeOrgId = '507f1f77bcf86cd799439012';
+
+      const responseUpdate = await request(app)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey)
+        .send({ organizationId: fakeOrgId });
+
+      // The same answer as for an organization the caller has no rights in.
+      expect(responseUpdate.status).toEqual(403);
+      expect(responseUpdate.body.error).toBeDefined();
+      expect(responseUpdate.body.error.toLowerCase()).not.toContain('not found');
+    });
+
+    it('Should return 403 when an organization API key moves a service to another organization', async function () {
+      const newOrganization = await createTestOrganization(ownerUser.username);
 
       const responseUpdate = await request(app)
         .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
         .set('x-api-key', testApiKey)
-        .send({ organizationId: fakeOrgId });
+        .send({ organizationId: newOrganization.id });
 
-      expect(responseUpdate.status).toBeGreaterThanOrEqual(400);
-      expect(responseUpdate.status).toBeLessThan(500);
-      expect(responseUpdate.body.error).toBeDefined();
-      expect(responseUpdate.body.error.toLowerCase()).toContain('not found');
+      expect(responseUpdate.status).toEqual(403);
+      const service = await getService(testOrganization.id!, testService.name, app);
+      expect(service.organizationId).toEqual(testOrganization.id);
+
+      await deleteTestOrganization(newOrganization.id!);
     });
 
     it('Should return 404 when trying to update non-existent service', async function () {
