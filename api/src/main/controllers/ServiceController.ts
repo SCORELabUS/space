@@ -1,6 +1,6 @@
 import container from '../config/container.js';
 import { createHash } from 'node:crypto';
-import ServiceService, { PricingYamlUnavailableError } from '../services/ServiceService.js';
+import ServiceService, { PricingYamlUnavailableError, PricingYamlUpstreamError } from '../services/ServiceService.js';
 import { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository.js';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import { FallBackSubscription } from '../types/models/Contract.js';
@@ -157,6 +157,8 @@ class ServiceController {
     } catch (err: any) {
       if (err instanceof PricingYamlUnavailableError) {
         res.status(404).send({ error: 'PRICING_YAML_UNAVAILABLE', message: err.message });
+      } else if (err instanceof PricingYamlUpstreamError) {
+        res.status(502).send({ error: 'SPHERE_UNAVAILABLE', message: err.message });
       } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {

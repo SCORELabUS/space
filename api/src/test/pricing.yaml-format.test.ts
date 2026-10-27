@@ -281,9 +281,12 @@ describe('Pricing version as Pricing2Yaml (format=yaml)', function () {
       ],
     });
 
+    let snapshotFile: string;
+
     beforeEach(async function () {
       const serviceId = new mongoose.Types.ObjectId();
       const yamlPath = `/static/pricings/sphere/${serviceId}/${currentVersionId}.yaml`;
+      snapshotFile = path.resolve('public', `.${yamlPath}`);
       fs.mkdirSync(path.dirname(path.resolve('public', `.${yamlPath}`)), { recursive: true });
       // Snapshots are stored as SPACE wrote them; any bytes will do here.
       fs.writeFileSync(path.resolve('public', `.${yamlPath}`), `# stored snapshot\n${currentText}`);
@@ -310,6 +313,23 @@ describe('Pricing version as Pricing2Yaml (format=yaml)', function () {
       expect(response.headers['x-pricing-syntax-version']).toBe('3.1');
     });
 
+    it('reports an unquoted syntaxVersion exactly as written (3.0, not 3)', async function () {
+      fs.writeFileSync(snapshotFile, currentText.replace("syntaxVersion: '3.1'", 'syntaxVersion: 3.0'));
+
+      const response = await yamlOf('2.0', evaluationKey, linkedName);
+
+      expect(response.status).toBe(200);
+      expect(response.headers['x-pricing-syntax-version']).toBe('3.0');
+    });
+
+    it('exposes ETag and X-Pricing-Syntax-Version to browser clients through CORS', async function () {
+      const response = await yamlOf('2.0', evaluationKey, linkedName).set('Origin', 'http://localhost:5403');
+      const exposed = String(response.headers['access-control-expose-headers']).toLowerCase();
+
+      expect(exposed).toContain('etag');
+      expect(exposed).toContain('x-pricing-syntax-version');
+    });
+
     it('fetches a historical version that SPACE no longer keeps from SPHERE', async function () {
       nock(origin).get(`/api/v1/public/pricings/${pricingId}`).reply(200, manifest());
       nock(origin).get(`/api/v1/public/pricings/${pricingId}/versions/${historicalVersionId}/yaml`).reply(200, historicalText);
@@ -322,18 +342,21 @@ describe('Pricing version as Pricing2Yaml (format=yaml)', function () {
       expect(response.headers['x-pricing-syntax-version']).toBe('3.1');
     });
 
-    it('answers 404 PRICING_YAML_UNAVAILABLE when SPHERE cannot provide it', async function () {
+    it('answers 404 PRICING_YAML_UNAVAILABLE when SPHERE does not list the version', async function () {
+      nock(origin).get(`/api/v1/public/pricings/${pricingId}`).reply(200, manifest());
+      const unknown = await yamlOf('0.5', evaluationKey, linkedName);
+
+      expect(unknown.status).toBe(404);
+      expect(unknown.body.error).toBe('PRICING_YAML_UNAVAILABLE');
+    });
+
+    it('answers 502 SPHERE_UNAVAILABLE when SPHERE cannot be reached, not 404', async function () {
       nock(origin).get(`/api/v1/public/pricings/${pricingId}`).reply(503, 'down');
 
       const unavailable = await yamlOf('1.0', evaluationKey, linkedName);
 
-      nock(origin).get(`/api/v1/public/pricings/${pricingId}`).reply(200, manifest());
-      const unknown = await yamlOf('0.5', evaluationKey, linkedName);
-
-      expect(unavailable.status).toBe(404);
-      expect(unavailable.body.error).toBe('PRICING_YAML_UNAVAILABLE');
-      expect(unknown.status).toBe(404);
-      expect(unknown.body.error).toBe('PRICING_YAML_UNAVAILABLE');
+      expect(unavailable.status).toBe(502);
+      expect(unavailable.body.error).toBe('SPHERE_UNAVAILABLE');
     });
 
     it('rejects a historical version whose content does not match the SPHERE manifest', async function () {
@@ -344,8 +367,8 @@ describe('Pricing version as Pricing2Yaml (format=yaml)', function () {
 
       const response = await yamlOf('1.0', evaluationKey, linkedName);
 
-      expect(response.status).toBe(404);
-      expect(response.body.error).toBe('PRICING_YAML_UNAVAILABLE');
+      expect(response.status).toBe(502);
+      expect(response.body.error).toBe('SPHERE_UNAVAILABLE');
     });
   });
 });

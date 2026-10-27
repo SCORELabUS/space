@@ -2075,7 +2075,7 @@ paths:
               schema:
                 type: string
             X-Pricing-Syntax-Version:
-              description: '`format=yaml` only: `syntaxVersion` of the file.'
+              description: '`format=yaml` only: `syntaxVersion` of the file, exactly as written (an unquoted `3.0` is `3.0`). Exposed to browsers through CORS, like `ETag`.'
               schema:
                 type: string
           content:
@@ -2089,8 +2089,8 @@ paths:
         '404':
           description: |
             Pricing not found. With `format=yaml`, `{"error": "PRICING_YAML_UNAVAILABLE"}` when the version exists
-            but its file cannot be provided (no stored copy and, for SPHERE-linked services, SPHERE could not
-            provide a matching one).
+            but its file cannot be provided (no stored copy and, for SPHERE-linked services, SPHERE no longer
+            lists the version).
           content:
             application/json:
               schema:
@@ -2099,6 +2099,21 @@ paths:
                   error:
                     type: string
                     example: PRICING_YAML_UNAVAILABLE
+                  message:
+                    type: string
+        '502':
+          description: |
+            `format=yaml`, SPHERE-linked services only: `{"error": "SPHERE_UNAVAILABLE"}` when a historical
+            version had to be fetched from SPHERE and SPHERE could not be reached, failed, or returned content
+            that does not match its manifest. Temporary; retry later.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: SPHERE_UNAVAILABLE
                   message:
                     type: string
         '304':
@@ -2559,7 +2574,7 @@ paths:
               schema:
                 type: string
             X-Pricing-Syntax-Version:
-              description: '`format=yaml` only: `syntaxVersion` of the file.'
+              description: '`format=yaml` only: `syntaxVersion` of the file, exactly as written (an unquoted `3.0` is `3.0`). Exposed to browsers through CORS, like `ETag`.'
               schema:
                 type: string
           content:
@@ -2573,8 +2588,8 @@ paths:
         '404':
           description: |
             Pricing not found. With `format=yaml`, `{"error": "PRICING_YAML_UNAVAILABLE"}` when the version exists
-            but its file cannot be provided (no stored copy and, for SPHERE-linked services, SPHERE could not
-            provide a matching one).
+            but its file cannot be provided (no stored copy and, for SPHERE-linked services, SPHERE no longer
+            lists the version).
           content:
             application/json:
               schema:
@@ -2583,6 +2598,21 @@ paths:
                   error:
                     type: string
                     example: PRICING_YAML_UNAVAILABLE
+                  message:
+                    type: string
+        '502':
+          description: |
+            `format=yaml`, SPHERE-linked services only: `{"error": "SPHERE_UNAVAILABLE"}` when a historical
+            version had to be fetched from SPHERE and SPHERE could not be reached, failed, or returned content
+            that does not match its manifest. Temporary; retry later.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: SPHERE_UNAVAILABLE
                   message:
                     type: string
         '304':
