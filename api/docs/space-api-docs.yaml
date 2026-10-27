@@ -127,6 +127,27 @@ info:
     are updated before the services are deleted, so a failure (`500`, or `409` when a contract keeps changing) deletes
     nothing and the request can be repeated.
 
+    ## Renaming and moving services
+
+    `PUT /services/{serviceName}` (and the organization-scoped route) with `name` and/or `organizationId` updates
+    every contract of the organization that has the service (all of them, names compared case-insensitively):
+    - **Rename**: the service is renamed in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
+      `usageLevels` (consumption included). `contractVersion` changes (it covers the service names), so each contract
+      gets a `CONTRACT_NOVATED` event, and its cached evaluations and pricing token are dropped (feature ids carry the
+      service name).
+    - **Move** to another organization: contracts that only have this service move with it. The organization they
+      leave gets `CONTRACT_DELETED` (they are no longer found there) and the new one gets `CONTRACT_CREATED` (its
+      consumers did not know them); `contractVersion` does not change unless the service is also renamed. Contracts
+      with other services stay and lose this one, as when it is deleted (history recorded, `CONTRACT_NOVATED`).
+    - The pricings of the service follow it (`GET .../services/{newName}/pricings` in its organization).
+    Everything that can refuse the request is checked first, and a `409` changes nothing: the name is taken by
+    another service (enabled or disabled) of the organization the service would be in, a contract already has a
+    service with the new name, or a contract that would move has a `userId` the target organization already uses.
+    Each contract is written only if it did not change since it was read (a concurrent novation or consumption is
+    never overwritten; the contract is read again and retried). Contracts are written before the service, so after
+    a failure the request can be repeated; contracts created with the old name while the request runs are updated
+    after the service is.
+
     ## Capabilities
 
     Every response (errors and CORS preflights included) carries `X-Space-Capabilities`, a comma-separated
@@ -1972,11 +1993,15 @@ paths:
         - USER user: OWNER/ADMIN/MANAGER role required
         - ADMIN user: can update services in any organization
 
-        **Cascading Operations**:
-        - Renaming a service propagates the change by updating the corresponding `contractedServices` references in all associated contracts.
+        **Cascading Operations** (every contract of the organization; see "Renaming and moving services"):
+        - Renaming a service renames it in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
+          `usageLevels` of every contract that has it (`CONTRACT_NOVATED`).
         - Updating `organizationId` triggers one of the following behaviors:
-            - If contracts include **only the updated service**, each contract’s `organizationId`` is updated to reflect the new organization.
-            - If contracts include **multiple contracted services**, the updated service is removed from them.
+            - If contracts include **only the updated service**, they move to the new organization
+              (`CONTRACT_DELETED` in the organization they leave, `CONTRACT_CREATED` in the new one).
+            - If contracts include **multiple contracted services**, the updated service is removed from them
+              (`CONTRACT_NOVATED`; the previous subscription is recorded in their history).
+        - The pricings of the service follow it.
 
       tags:
         - Services
@@ -2027,7 +2052,11 @@ paths:
         '404':
           description: Service not found
         '409':
-          description: Service name already exists
+          description: |
+            Nothing was changed: the name is taken by another service, enabled or disabled, of the organization the
+            service would be in; a contract would end up with two subscriptions under the new name; or a contract
+            that would move has a `userId` the target organization already uses. Also when a contract kept changing
+            while it was being updated (repeat the request).
 
     delete:
       summary: Disable service
@@ -2579,11 +2608,15 @@ paths:
           - ALL scope: can update service name and organization.
           - MANAGEMENT scope: can update service name and organization
 
-        **Cascading Operations**:
-        - Renaming a service propagates the change by updating the corresponding `contractedServices` references in all associated contracts.
+        **Cascading Operations** (every contract of the organization; see "Renaming and moving services"):
+        - Renaming a service renames it in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
+          `usageLevels` of every contract that has it (`CONTRACT_NOVATED`).
         - Updating `organizationId` triggers one of the following behaviors:
-            - If contracts include **only the updated service**, each contract’s `organizationId` is updated to reflect the new organization.
-            - If contracts include **multiple contracted services**, the updated service is removed from them.
+            - If contracts include **only the updated service**, they move to the new organization
+              (`CONTRACT_DELETED` in the organization they leave, `CONTRACT_CREATED` in the new one).
+            - If contracts include **multiple contracted services**, the updated service is removed from them
+              (`CONTRACT_NOVATED`; the previous subscription is recorded in their history).
+        - The pricings of the service follow it.
 
       tags:
         - Services
@@ -2622,8 +2655,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Service'
+        '400':
+          description: Invalid update data (e.g., organization not found)
         '403':
           description: Forbidden
+        '404':
+          description: Service not found
+        '409':
+          description: |
+            Nothing was changed: the name is taken by another service, enabled or disabled, of the organization the
+            service would be in; a contract would end up with two subscriptions under the new name; or a contract
+            that would move has a `userId` the target organization already uses. Also when a contract kept changing
+            while it was being updated (repeat the request).
 
     delete:
       summary: Disable service
