@@ -75,8 +75,9 @@ class ServiceRepository extends RepositoryBase {
     organizationId: string,
     disabled = false
   ): Promise<LeanService[] | null> {
+    // Exact, case-insensitive: contract service names are not patterns.
     const query: any = {
-      name: { $in: names.map(name => new RegExp(name, 'i')) },
+      name: { $in: names.map(name => new RegExp(`^${escapeRegex(name)}$`, 'i')) },
       disabled: disabled,
       organizationId: organizationId,
     };

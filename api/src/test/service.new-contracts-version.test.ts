@@ -17,11 +17,13 @@ import { LeanOrganization } from '../main/types/models/Organization';
 import ContractMongoose from '../main/repositories/mongoose/models/ContractMongoose';
 import ServiceMongoose from '../main/repositories/mongoose/models/ServiceMongoose';
 import PricingMongoose from '../main/repositories/mongoose/models/PricingMongoose';
+import container from '../main/config/container';
 import {
   PETCLINIC_BASE_VERSION,
   addPetclinicVersion,
   archivePetclinicVersion,
   uploadPetclinicService,
+  writePetclinicVariant,
 } from './utils/services/petclinicVersions';
 
 /**
@@ -282,6 +284,74 @@ describe('Pricing version for new contracts', function () {
 
       expect(response.status).toBe(400);
       expect(response.body.errors[0]).toMatchObject({ code: 'VERSION_NOT_FOUND', service: 'ghost' });
+    });
+  });
+
+  describe('service names when validating contracts', function () {
+    const proName = 'PetclinicPro';
+    const serviceService = () => container.resolve('serviceService');
+
+    beforeEach(async function () {
+      // A service whose name starts with the name of the petclinic service.
+      const file = writePetclinicVariant('1.0', '2025-01-01', pricing => {
+        pricing.saasName = proName;
+      });
+      await uploadPetclinicService(app, allKey, file);
+    });
+
+    it('does not let a name match another service it is a prefix of', async function () {
+      const prefix = await serviceService().indexByNames([storedName.slice(0, 4)], organization.id!);
+      const exact = await serviceService().indexByNames([serviceName], organization.id!);
+
+      expect(prefix).toBeNull();
+      expect(exact.map((s: any) => s.name)).toEqual([storedName]);
+    });
+
+    it('treats regular expression metacharacters as literal characters', async function () {
+      const literalName = 'pet+(clinic).*';
+      await ServiceMongoose.collection.insertOne({
+        name: literalName, organizationId: organization.id, disabled: false, activePricings: {}, archivedPricings: {},
+      });
+
+      const pattern = await serviceService().indexByNames([`${storedName.slice(0, 3)}.*`], organization.id!);
+      const literal = await serviceService().indexByNames([literalName.toUpperCase()], organization.id!);
+      const invalidPattern = await serviceService().indexByNames(['pet('], organization.id!);
+
+      expect(pattern).toBeNull();
+      expect(literal.map((s: any) => s.name)).toEqual([literalName]);
+      expect(invalidPattern).toBeNull();
+    });
+
+    it('still matches exact names written in another casing', async function () {
+      const services = await serviceService().indexByNames(
+        [storedName.toUpperCase(), proName.toLowerCase()],
+        organization.id!
+      );
+
+      expect(services.map((s: any) => s.name).sort()).toEqual([proName, storedName].sort());
+    });
+
+    it('creates a contract for a service whose name is a prefix of another one', async function () {
+      const response = await createContract({
+        contractedServices: { [serviceName]: PETCLINIC_BASE_VERSION },
+        subscriptionPlans: { [serviceName]: 'GOLD' },
+        subscriptionAddOns: {},
+      });
+
+      expect(response.status).toBe(201);
+      expect(Object.keys(response.body.contractedServices)).toEqual([serviceName]);
+    });
+
+    it('creates a contract with several services', async function () {
+      const pro = proName.toLowerCase();
+      const response = await createContract({
+        contractedServices: { [serviceName]: '2.0', [pro]: '1.0' },
+        subscriptionPlans: { [serviceName]: 'GOLD', [pro]: 'BASIC' },
+        subscriptionAddOns: {},
+      });
+
+      expect(response.status).toBe(201);
+      expect(response.body.contractedServices).toEqual({ [serviceName]: '2.0', [pro]: '1.0' });
     });
   });
 
