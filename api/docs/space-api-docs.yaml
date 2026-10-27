@@ -2002,6 +2002,60 @@ paths:
         '404':
           description: Service not found
 
+  /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}/public-url:
+    get:
+      summary: Get the download URL of a pricing file
+      description: |
+        Returns the URL from which the Pricing2Yaml file of a version can be
+        downloaded. Despite the name of this endpoint, that URL is **not
+        public**: it is the authorised `GET /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}?format=yaml`
+        and needs the same credentials as this request (`x-api-key`).
+        Pricing files are not served as static files.
+
+        **Authentication**: User API Key (member of the organization; same roles as the pricing route)
+
+      tags:
+        - Services
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pricingVersion
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Download URL of the pricing file
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+                    description: Relative URL of the authorised download route.
+                    example: /api/v1/services/zoom/pricings/2025?format=yaml
+                  url:
+                    type: string
+                    format: uri
+                    description: Absolute URL of the authorised download route.
+                  requiresAuthentication:
+                    type: boolean
+                    description: Always true. Send `x-api-key` when downloading.
+        '404':
+          description: Service or pricing version not found
+
   /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}:
     get:
       summary: Get pricing version details
@@ -2036,6 +2090,17 @@ paths:
           schema:
             type: string
           example: "1.0.0"
+        - name: format
+          in: query
+          required: false
+          description: |
+            `json` (default): the pricing as JSON. `yaml`: the stored Pricing2Yaml
+            file of the version, byte for byte. This is the only way to read a
+            pricing file: SPACE does not serve them as static files.
+          schema:
+            type: string
+            enum: [json, yaml]
+            default: json
       responses:
         '200':
           description: Pricing version details
@@ -2043,8 +2108,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Pricing'
+            application/yaml:
+              schema:
+                type: string
+              description: "The stored Pricing2Yaml file (with `format=yaml`), sent with `Cache-Control: private, no-cache`."
+        '400':
+          description: Invalid `format`
         '404':
-          description: Pricing version not found
+          description: |
+            Pricing version not found, or (`format=yaml`) SPACE stores no
+            Pricing2Yaml file for it (`PRICING_YAML_UNAVAILABLE`: remote URL
+            pricings, SPHERE versions SPACE keeps no copy of).
 
     put:
       summary: Update pricing availability
@@ -2460,6 +2534,55 @@ paths:
         '403':
           description: Forbidden
 
+  /services/{serviceName}/pricings/{pricingVersion}/public-url:
+    get:
+      summary: Get the download URL of a pricing file
+      description: |
+        Returns the URL from which the Pricing2Yaml file of a version can be
+        downloaded. Despite the name of this endpoint, that URL is **not
+        public**: it is the authorised `GET /services/{serviceName}/pricings/{pricingVersion}?format=yaml`
+        and needs the same credentials as this request (`x-api-key`).
+        Pricing files are not served as static files.
+
+        **Authentication**: Organization API Key (any scope)
+
+      tags:
+        - Services
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pricingVersion
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Download URL of the pricing file
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+                    description: Relative URL of the authorised download route.
+                    example: /api/v1/services/zoom/pricings/2025?format=yaml
+                  url:
+                    type: string
+                    format: uri
+                    description: Absolute URL of the authorised download route.
+                  requiresAuthentication:
+                    type: boolean
+                    description: Always true. Send `x-api-key` when downloading.
+        '404':
+          description: Service or pricing version not found
+
   /services/{serviceName}/pricings/{pricingVersion}:
     get:
       summary: Get pricing
@@ -2486,6 +2609,17 @@ paths:
           required: true
           schema:
             type: string
+        - name: format
+          in: query
+          required: false
+          description: |
+            `json` (default): the pricing as JSON. `yaml`: the stored Pricing2Yaml
+            file of the version, byte for byte. This is the only way to read a
+            pricing file: SPACE does not serve them as static files.
+          schema:
+            type: string
+            enum: [json, yaml]
+            default: json
       responses:
         '200':
           description: Pricing details
@@ -2493,8 +2627,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Pricing'
+            application/yaml:
+              schema:
+                type: string
+              description: "The stored Pricing2Yaml file (with `format=yaml`), sent with `Cache-Control: private, no-cache`."
+        '400':
+          description: Invalid `format`
         '404':
-          description: Pricing not found
+          description: |
+            Pricing not found, or (`format=yaml`) SPACE stores no Pricing2Yaml
+            file for it (`PRICING_YAML_UNAVAILABLE`).
 
     put:
       summary: Update pricing availability
@@ -4168,6 +4310,17 @@ components:
         version:
           type: string
           example: "1.0.0"
+        yamlPath:
+          type: string
+          description: |
+            Storage reference of the stored Pricing2Yaml file
+            (`/private/pricings/...` for uploaded pricings,
+            `/private/sphere/...` for SPHERE snapshots). It is **not a URL**:
+            download the file with `GET .../pricings/{pricingVersion}?format=yaml`
+            and the credentials of the owning organization. Versions before this
+            change returned a `/static/pricings/...` path that was served
+            without authentication; such paths now answer 404.
+          example: /private/pricings/63f74bf8eeed64058364b52e-zoom-2025.yaml
         service:
           type: string
         available:
