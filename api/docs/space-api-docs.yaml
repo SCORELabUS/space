@@ -90,6 +90,7 @@ info:
     - `new-contracts-version`: `GET .../pricings/new-contracts` and the optional service `defaultVersion`.
     - `contract-pricings`: `GET /contracts/{userId}/pricings`.
     - `novation-preview`: `POST /contracts/{userId}/novation/preview`.
+    - `token-subscription`: the pricing token carries the `subscription` claim.
 
   contact:
     email: agarcia29@us.es
@@ -4090,6 +4091,11 @@ paths:
         Generates a JWT token containing the user's pricing and subscription information 
         for use by client-side feature evaluation.
 
+        Payload (`PricingTokenPayload`): `sub` (userId), `features`, `pricingContext`, `subscriptionContext` and,
+        optionally, `subscription` - the subscription the token was computed from, with the `contractVersion` of
+        the contract. Clients must ignore claims they do not know; `subscription` may be absent in tokens issued
+        by older SPACE versions.
+
         **Authentication**: Organization API Key only
 
         **Permission**: Org Key with any scope
@@ -4119,9 +4125,9 @@ paths:
               schema:
                 type: object
                 properties:
-                  token:
+                  pricingToken:
                     type: string
-                    description: JWT token with pricing information
+                    description: JWT (HS256) whose payload is a `PricingTokenPayload`
         '404':
           $ref: '#/components/responses/ContractNotFound'
 
@@ -4750,6 +4756,46 @@ components:
             $ref: '#/components/schemas/SubscriptionSnapshot'
         contractVersion:
           $ref: '#/components/schemas/ContractVersion'
+
+    PricingTokenPayload:
+      type: object
+      description: Payload of the pricing token (JWT claims besides `iat` and `exp`).
+      properties:
+        sub:
+          type: string
+          description: userId of the contract
+        features:
+          type: object
+          description: Detailed evaluation of every feature (`{ eval, used, limit, error }` by `service-feature`)
+        pricingContext:
+          type: object
+        subscriptionContext:
+          type: object
+        subscription:
+          $ref: '#/components/schemas/PricingTokenSubscription'
+
+    PricingTokenSubscription:
+      type: object
+      description: Optional claim. The subscription the token was computed from.
+      required: [contractedServices, subscriptionPlans, subscriptionAddOns, contractVersion]
+      properties:
+        contractedServices:
+          $ref: '#/components/schemas/ContractedService'
+        subscriptionPlans:
+          $ref: '#/components/schemas/SubscriptionPlans'
+        subscriptionAddOns:
+          $ref: '#/components/schemas/SubscriptionAddons'
+        contractVersion:
+          $ref: '#/components/schemas/ContractVersion'
+      example:
+        contractedServices:
+          acme: "2024-06-08"
+        subscriptionPlans:
+          acme: growth
+        subscriptionAddOns:
+          acme:
+            extraStorage: 2
+        contractVersion: 3-9f86d081884c7d65
 
     NovationPreview:
       type: object

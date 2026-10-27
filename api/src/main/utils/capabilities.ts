@@ -16,6 +16,7 @@ export const SPACE_CAPABILITIES: readonly string[] = Object.freeze([
   'new-contracts-version',
   'contract-pricings',
   'novation-preview',
+  'token-subscription',
 ]);
 
 export const CAPABILITIES_HEADER = 'X-Space-Capabilities';

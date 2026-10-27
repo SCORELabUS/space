@@ -28,7 +28,8 @@ import {
 } from '../utils/feature-evaluation/featureEvaluation';
 import ContractService from './ContractService';
 import ServiceService from './ServiceService';
-import { generateTokenFromEvalResult } from '../utils/jwt';
+import { PricingTokenSubscription, generateTokenFromEvalResult } from '../utils/jwt';
+import { computeContractVersion } from '../utils/contracts/version';
 import { escapeVersion } from '../utils/helpers';
 import CacheService from './CacheService';
 
@@ -137,11 +138,22 @@ class FeatureEvaluationService {
       result: DetailedFeatureEvaluation;
     };
 
+    // As the contract is after the evaluation, which may have renewed it.
+    // `show` returns unescaped pricing versions.
+    const evaluated = await this.contractService.show(userId, reqOrg.id);
+    const subscription: PricingTokenSubscription = {
+      contractedServices: { ...evaluated.contractedServices },
+      subscriptionPlans: { ...(evaluated.subscriptionPlans ?? {}) },
+      subscriptionAddOns: { ...(evaluated.subscriptionAddOns ?? {}) },
+      contractVersion: computeContractVersion(evaluated),
+    };
+
     const token = await generateTokenFromEvalResult(
       contract.userContact.userId,
       result.pricingContext,
       result.subscriptionContext,
-      result.result
+      result.result,
+      subscription
     );
 
     await this.cacheService.set(`features.${userId}.pricingToken`, token, 3600, true);

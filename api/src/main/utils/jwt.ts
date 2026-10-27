@@ -9,11 +9,24 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_SALT = process.env.JWT_SALT; // Will be used to generate a secure JWT secret from the one configured
 const JWT_EXPIRATION = process.env.JWT_EXPIRATION ?? '1h'; // Time in duration format (e.g., "1h", "2d", "3m")
 
+/**
+ * The subscription a pricing token was computed from (optional claim
+ * `subscription`): pricing versions (unescaped), plans and add-ons per service,
+ * and the contractVersion of the contract.
+ */
+export interface PricingTokenSubscription {
+  contractedServices: Record<string, string>;
+  subscriptionPlans: Record<string, string>;
+  subscriptionAddOns: Record<string, Record<string, number>>;
+  contractVersion: string;
+}
+
 async function generateTokenFromEvalResult(
   userId: string,
   pricingContext: PricingContext,
   subscriptionContext: SubscriptionContext,
-  evalResult: DetailedFeatureEvaluation
+  evalResult: DetailedFeatureEvaluation,
+  subscription?: PricingTokenSubscription
 ): Promise<string> {
   if (!JWT_SECRET) {
     throw new Error('JWT_SECRET environment variable is not defined!');
@@ -28,7 +41,8 @@ async function generateTokenFromEvalResult(
   const payload = {
     features: evalResult,
     pricingContext: pricingContext,
-    subscriptionContext: subscriptionContext
+    subscriptionContext: subscriptionContext,
+    ...(subscription ? { subscription } : {}),
   };
 
   const token = await new SignJWT(payload)
