@@ -1014,8 +1014,9 @@ class ServiceService {
         organizationId: dataToUpdate.organizationId || organizationId,
       });
 
+      // Evaluations and pricing tokens name the service too.
       await this.cacheService.delMany(
-        updatedContracts.map(c => `contracts.${c.userContact.userId}`)
+        updatedContracts.flatMap(c => [`contracts.${c.userContact.userId}`, `features.${c.userContact.userId}.*`])
       );
     }
 
@@ -1032,10 +1033,10 @@ class ServiceService {
       await this.contractRepository.bulkUpdate(contractsToUpdateOrgId, false, { organizationId });
 
       await this.cacheService.delMany(
-        contractsToRemoveService.map(c => `contracts.${c.userContact.userId}`)
+        contractsToRemoveService.flatMap(c => [`contracts.${c.userContact.userId}`, `features.${c.userContact.userId}.*`])
       );
       await this.cacheService.delMany(
-        contractsToUpdateOrgId.map(c => `contracts.${c.userContact.userId}`)
+        contractsToUpdateOrgId.flatMap(c => [`contracts.${c.userContact.userId}`, `features.${c.userContact.userId}.*`])
       );
     }
 

@@ -4776,7 +4776,14 @@ components:
 
     PricingTokenSubscription:
       type: object
-      description: Optional claim. The subscription the token was computed from.
+      description: |
+        Optional claim. The subscription the token was computed from: the same contract the `features` of the
+        token were evaluated on.
+
+        A token is a snapshot. SPACE drops its cached token when the contract changes, but a token already
+        issued keeps this subscription until it expires (`JWT_EXPIRATION`). Treat `contractVersion` here as
+        advisory: a novation sent with it as `If-Match` may answer `412 CONTRACT_CHANGED`, after which the
+        caller reads the contract (or a new token) again.
       required: [contractedServices, subscriptionPlans, subscriptionAddOns, contractVersion]
       properties:
         contractedServices:
