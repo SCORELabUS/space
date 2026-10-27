@@ -53,6 +53,10 @@ services:
       MONGO_URI: ${MONGO_URI:-mongodb://${DATABASE_USERNAME:-mongoUser}:${DATABASE_PASSWORD:-mongoPassword}@mongodb:27017/${DATABASE_NAME:-space_db}}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       JWT_SECRET: ${JWT_SECRET:-test_secret}
+      # Pricing tokens are signed with ES256. Without PRICING_TOKEN_PRIVATE_KEY, a key is generated on first
+      # start and kept in the space-keys volume (one server instance only). See api/.env.template.
+      PRICING_TOKEN_PRIVATE_KEY_FILE: ${PRICING_TOKEN_PRIVATE_KEY_FILE:-/usr/src/server/keys/pricing-token-key.pem}
+      PRICING_TOKEN_GENERATE_KEY: ${PRICING_TOKEN_GENERATE_KEY:-true}
       JWT_SALT: ${JWT_SALT:-wgv~eb6v=VWwC9GIG1q6rZ]J.tUM(M}
       JWT_EXPIRATION: ${JWT_EXPIRATION:-1h}
       JWT_ISSUER: ${JWT_ISSUER:-space}
@@ -60,6 +64,8 @@ services:
       - 'space-statics:/usr/src/server/public'
       # Files that must not be served without authorisation (private SPHERE snapshots).
       - 'space-private:/usr/src/server/private'
+      # Pricing token signing key (never served).
+      - 'space-keys:/usr/src/server/keys'
     depends_on:
       mongodb:
         condition: service_healthy
@@ -133,6 +139,8 @@ volumes:
   space-statics:
     driver: local
   space-private:
+    driver: local
+  space-keys:
     driver: local
   redis_data:
     driver: local

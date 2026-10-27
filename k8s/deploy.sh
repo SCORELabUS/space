@@ -6,6 +6,11 @@ echo "Creating namespace..."
 kubectl apply -f space-namespace.yml
 echo "Deploying ingress controller..."
 kubectl apply -f controllers/
+echo "Creating the pricing token signing key (only if it does not exist yet)..."
+if ! kubectl -n space get secret space-pricing-token-key >/dev/null 2>&1; then
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+    | kubectl -n space create secret generic space-pricing-token-key --from-file=private.pem=/dev/stdin
+fi
 echo "Deploying config maps..."
 kubectl apply -f config/
 echo "Deploying services..."
