@@ -13,7 +13,7 @@ import {
   computeContractVersion,
   parseIfMatch,
 } from '../utils/contracts/version';
-import { AmbiguousContractScopeError } from '../utils/contracts/scope';
+import { OrganizationRequiredError } from '../utils/contracts/scope';
 
 /** Add `contractVersion` to a contract response (see `computeContractVersion`). */
 function withVersion<T extends object>(contract: T): T & { contractVersion: string } {
@@ -99,13 +99,13 @@ function expectedVersionOf(req: any): string[] | undefined {
 
 /**
  * Answer the errors of resolving the organization of a request (see
- * `ContractController._scope`): 409 for an ambiguous userId or groupId, 403 for
- * an `organizationId` parameter that is not the caller's, 400 for a malformed
- * one. Returns whether it answered.
+ * `ContractController._scope`): 400 `ORGANIZATION_ID_REQUIRED` when a platform
+ * ADMIN does not name one, 403 for an `organizationId` parameter that is not the
+ * caller's, 400 for a malformed one. Returns whether it answered.
  */
 function sendScopeError(res: any, err: any): boolean {
-  if (err instanceof AmbiguousContractScopeError) {
-    res.status(409).send({ error: err.message, code: err.code, organizationIds: err.organizationIds });
+  if (err instanceof OrganizationRequiredError) {
+    res.status(400).send({ error: err.message, code: err.code });
     return true;
   }
   const message = String(err?.message ?? '');
@@ -126,7 +126,6 @@ class ContractController {
   constructor() {
     this.contractService = container.resolve('contractService');
     this._scope = this._scope.bind(this);
-    this._groupScope = this._groupScope.bind(this);
     this.index = this.index.bind(this);
     this.show = this.show.bind(this);
     this.pricings = this.pricings.bind(this);
@@ -164,30 +163,24 @@ class ContractController {
   }
 
   /**
-   * Organization in which a request addresses the contract of `req.params.userId`.
+   * Organization in which a request addresses contracts by `userId` (the
+   * route's `:userId`) or by `groupId`.
    *
    * Organization API keys are confined to their own organization, and the
    * organization-scoped routes to the organization in the path. A platform
-   * ADMIN on the direct routes names it with `?organizationId=`; without it,
-   * the organization that has this userId, if only one has it (a userId is
-   * only unique within an organization), and `AmbiguousContractScopeError`
-   * (409) if several do.
+   * ADMIN on the direct routes has none and must name it with
+   * `?organizationId=` (a `userId` or `groupId` is only unique within an
+   * organization): without it, `OrganizationRequiredError` (400). It runs
+   * before the request reads, locks or writes anything.
    */
-  async _scope(req: any): Promise<string | undefined> {
+  _scope(req: any, groupId?: string): string {
     const requested = this._requestedOrganization(req);
     const fixed = req.org?.id ?? req.params.organizationId;
     if (fixed) return fixed;
     if (requested) return requested;
-    return this.contractService.organizationOfUserId(req.params.userId);
-  }
-
-  /** Like `_scope`, for the contracts of a `groupId`. */
-  async _groupScope(req: any, groupId: string): Promise<string | undefined> {
-    const requested = this._requestedOrganization(req);
-    const fixed = req.org?.id ?? req.params.organizationId;
-    if (fixed) return fixed;
-    if (requested) return requested;
-    return this.contractService.organizationOfGroupId(groupId);
+    throw groupId === undefined
+      ? new OrganizationRequiredError('userId', req.params.userId)
+      : new OrganizationRequiredError('groupId', groupId);
   }
 
   async index(req: any, res: any) {
@@ -218,7 +211,7 @@ class ContractController {
   async show(req: any, res: any) {
     try {
       const userId = req.params.userId;
-      const contract = await this.contractService.show(userId, await this._scope(req));
+      const contract = await this.contractService.show(userId, this._scope(req));
       sendContract(req, res, 200, contract);
     } catch (err: any) {
       if (sendScopeError(res, err)) return;
@@ -235,7 +228,7 @@ class ContractController {
     try {
       const { contract, services } = await this.contractService.pricings(
         req.params.userId,
-        await this._scope(req),
+        this._scope(req),
         req.params.organizationId
       );
       const contractVersion = computeContractVersion(contract);
@@ -299,7 +292,7 @@ class ContractController {
       const expectedContractVersion = expectedVersionOf(req);
       const options = novationOptionsOf(req);
       const newSubscription: Subscription = req.body;
-      const contract = await this.contractService.novate(userId, newSubscription, await this._scope(req), {
+      const contract = await this.contractService.novate(userId, newSubscription, this._scope(req), {
         ...options,
         expectedContractVersion,
       });
@@ -328,7 +321,7 @@ class ContractController {
       const options = novationOptionsOf(req);
       // Preconditions are for writes; the preview reports the current version instead.
       if (req.body && 'expectedContractVersion' in req.body) delete req.body.expectedContractVersion;
-      const preview = await this.contractService.previewNovation(req.params.userId, req.body, await this._scope(req), options);
+      const preview = await this.contractService.previewNovation(req.params.userId, req.body, this._scope(req), options);
       res.status(200).json(preview);
     } catch (err: any) {
       if (sendScopeError(res, err)) return;
@@ -367,11 +360,7 @@ class ContractController {
       if (req.body && 'expectedContractVersions' in req.body) delete req.body.expectedContractVersions;
       const options = novationOptionsOf(req);
       const newSubscription: Subscription = req.body;
-      const organizationId = await this._groupScope(req, groupId);
-      if (!organizationId) {
-        res.status(404).send({ error: `No contracts found with groupId ${groupId}` });
-        return;
-      }
+      const organizationId = this._scope(req, groupId);
       const contracts = await this.contractService.novateByGroupId(groupId, organizationId, newSubscription, {
         ...options,
         expectedContractVersions,
@@ -403,7 +392,7 @@ class ContractController {
       const contract = await this.contractService.novateUserContact(
         userId,
         userContact,
-        await this._scope(req)
+        this._scope(req)
       );
       sendContract(req, res, 200, contract);
     } catch (err: any) {
@@ -424,7 +413,7 @@ class ContractController {
       const contract = await this.contractService.novateBillingPeriod(
         userId,
         billingPeriod,
-        await this._scope(req)
+        this._scope(req)
       );
       sendContract(req, res, 200, contract);
     } catch (err: any) {
@@ -448,11 +437,7 @@ class ContractController {
         res.status(400).send({ error: 'Missing groupId query parameter' });
         return;
       }
-      const organizationId = await this._groupScope(req, groupId);
-      if (!organizationId) {
-        res.status(404).send({ error: `No contracts found with groupId ${groupId}` });
-        return;
-      }
+      const organizationId = this._scope(req, groupId);
 
       const contracts = await this.contractService.novateBillingPeriodByGroupId(groupId, organizationId, billingPeriod);
       res.status(200).json(contracts.map(contract => withVersion(contract)));
@@ -480,7 +465,7 @@ class ContractController {
         userId,
         queryParams,
         usageLevelsIncrements,
-        await this._scope(req)
+        this._scope(req)
       );
       sendContract(req, res, 200, novatedContract);
     } catch (err: any) {
@@ -517,7 +502,7 @@ class ContractController {
   async destroy(req: any, res: any) {
     try {
       const userId = req.params.userId;
-      await this.contractService.destroy(userId, await this._scope(req));
+      await this.contractService.destroy(userId, this._scope(req));
       res.status(204).json({ message: `Deleted contract with userId ${userId} successfully` });
     } catch (err: any) {
       if (sendScopeError(res, err)) return;

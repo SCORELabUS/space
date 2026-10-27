@@ -183,22 +183,6 @@ class ContractRepository extends RepositoryBase {
     return contract ? toPlainObject<LeanContract>(contract.toJSON()) : null;
   }
 
-  /**
-   * Organizations that have a contract with this `userId`. The only lookup by
-   * `userId` without an organization: it lets a platform ADMIN on the direct
-   * routes address a contract when the `userId` is unambiguous.
-   */
-  async findOrganizationIdsByUserId(userId: string): Promise<string[]> {
-    const ids = await ContractMongoose.distinct('organizationId', { 'userContact.userId': userId });
-    return ids.map(id => String(id));
-  }
-
-  /** Organizations that have contracts of this `groupId` (see `findOrganizationIdsByUserId`). */
-  async findOrganizationIdsByGroupId(groupId: string): Promise<string[]> {
-    const ids = await ContractMongoose.distinct('organizationId', { groupId });
-    return ids.map(id => String(id));
-  }
-
   /** Which of these userIds already have a contract in the organization. */
   async findExistingUserIds(organizationId: string, userIds: string[]): Promise<string[]> {
     if (userIds.length === 0) return [];

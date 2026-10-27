@@ -50,7 +50,6 @@ import {
   usageLevelSnapshotKey,
   usageLevelSnapshotPattern,
 } from '../utils/contracts/cacheKeys';
-import { AmbiguousContractScopeError } from '../utils/contracts/scope';
 
 /** Response of POST /contracts/{userId}/novation/preview. */
 export interface NovationPreview {
@@ -149,16 +148,15 @@ class ContractService {
       const original = (this[method] as (...args: any[]) => Promise<any>).bind(this);
       (this as any)[method] = async (...args: any[]) => {
         let contract: any = null;
-        if (method !== 'create' && !method.endsWith('ByGroupId')) {
-          // A userId is only unique within an organization: resolve it first
-          // (ambiguity is an error), then pass the organization on explicitly.
-          const scope = args[scopeArgument[method]] ?? await this.organizationOfUserId(args[0]);
-          if (scope) {
-            args[scopeArgument[method]] = scope;
+        if (method !== 'create') {
+          // A userId or groupId is only unique within an organization: without
+          // one, fail before reading or locking anything (callers always pass it).
+          const scope = method.endsWith('ByGroupId') ? args[1] : args[scopeArgument[method]];
+          if (!scope) throw new Error(`INTERNAL ERROR: ${method} requires the organization of the contract`);
+          if (!method.endsWith('ByGroupId')) {
             contract = await ContractModel.findOne({ 'userContact.userId': args[0], organizationId: scope }).lean();
           }
         }
-        if (method.endsWith('ByGroupId') && !args[1]) args[1] = await this.organizationOfGroupId(args[0]);
         const org = method === 'create' ? args[0]?.organizationId : method.endsWith('ByGroupId') ? args[1] : contract?.organizationId;
         if (!org || !await ServiceModel.exists({ organizationId: org, source: 'sphere' })) return original(...args);
         return withOrganizationLock(org, async assertOwned => {
@@ -185,38 +183,18 @@ class ContractService {
   }
 
   /**
-   * The organization of the contract with this `userId`, for callers that do
-   * not have one (a platform ADMIN on the direct routes). A `userId` is only
-   * unique within an organization: when several organizations use it, this
-   * throws `AmbiguousContractScopeError` rather than pick one. Undefined when
-   * no organization has it.
-   */
-  async organizationOfUserId(userId: string): Promise<string | undefined> {
-    const organizations = await this.contractRepository.findOrganizationIdsByUserId(userId);
-    if (organizations.length > 1) throw new AmbiguousContractScopeError('userId', userId, organizations);
-    return organizations[0];
-  }
-
-  /** Like `organizationOfUserId`, for the contracts of a `groupId`. */
-  async organizationOfGroupId(groupId: string): Promise<string | undefined> {
-    const organizations = await this.contractRepository.findOrganizationIdsByGroupId(groupId);
-    if (organizations.length > 1) throw new AmbiguousContractScopeError('groupId', groupId, organizations);
-    return organizations[0];
-  }
-
-  /**
-   * Look a contract up by `userId` within `organizationId` (resolved with
-   * `organizationOfUserId` when not given).
+   * Look a contract up by `userId` within `organizationId` (required: a
+   * `userId` is only unique within an organization).
    *
    * Contracts are cached per organization and userId (see `contractCacheKey`);
    * a cached entry is still checked against both. Outside the organization the
    * contract does not exist, and the error says exactly what it says for an
    * unknown `userId`, so that a caller cannot tell the two apart.
    */
-  async _findContract(userId: string, organizationId?: string): Promise<LeanContract> {
-    const organization = organizationId ?? (await this.organizationOfUserId(userId));
+  async _findContract(userId: string, organizationId: string): Promise<LeanContract> {
+    const organization = organizationId;
     if (!organization) {
-      throw new Error(`Contract with userId ${userId} not found`);
+      throw new Error('INTERNAL ERROR: a contract is looked up by userId within an organization');
     }
 
     const key = contractCacheKey(organization, userId);
@@ -317,7 +295,7 @@ class ContractService {
   async previewNovation(
     userId: string,
     newSubscription: any,
-    organizationId?: string,
+    organizationId: string,
     options: NovationOptions = {}
   ): Promise<NovationPreview> {
     const found = await this._findContract(userId, organizationId);
@@ -434,7 +412,7 @@ class ContractService {
    */
   async pricings(
     userId: string,
-    organizationId?: string,
+    organizationId: string,
     routeOrganizationId?: string
   ): Promise<{ contract: LeanContract; services: Record<string, ContractPricing> }> {
     const contract = await this.show(userId, organizationId);
@@ -468,7 +446,7 @@ class ContractService {
     return { contract, services };
   }
 
-  async show(userId: string, organizationId?: string): Promise<LeanContract> {
+  async show(userId: string, organizationId: string): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
 
     contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
@@ -612,7 +590,7 @@ class ContractService {
   async novate(
     userId: string,
     newSubscription: any,
-    organizationId?: string,
+    organizationId: string,
     options: NovationOptions & { expectedContractVersion?: string | string[] } = {}
   ): Promise<LeanContract> {
     let contract = await this._findContract(userId, organizationId);
@@ -783,7 +761,7 @@ class ContractService {
     return contractsToReturn;
   }
 
-  async renew(userId: string, organizationId?: string): Promise<LeanContract> {
+  async renew(userId: string, organizationId: string): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
 
     if (!contract.billingPeriod.autoRenew) {
@@ -816,7 +794,7 @@ class ContractService {
   async novateUserContact(
     userId: string,
     userContact: Omit<UserContact, 'userId'>,
-    organizationId?: string
+    organizationId: string
   ): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
 
@@ -842,7 +820,7 @@ class ContractService {
   async novateBillingPeriod(
     userId: string,
     newBillingPeriod: { endDate: Date; autoRenew: boolean; renewalDays: number },
-    organizationId?: string
+    organizationId: string
   ): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
 
@@ -920,8 +898,8 @@ class ContractService {
   async resetUsageLevels(
     userId: string,
     queryParams: UsageLevelsResetQuery,
-    usageLevelsIncrements?: Record<string, Record<string, number>>,
-    organizationId?: string
+    usageLevelsIncrements: Record<string, Record<string, number>> | undefined,
+    organizationId: string
   ): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
 
@@ -1072,7 +1050,7 @@ class ContractService {
     userId: string,
     featureId: string,
     latest: boolean = false,
-    organizationId?: string
+    organizationId: string
   ): Promise<void> {
     const contract = await this._findContract(userId, organizationId);
 
@@ -1155,7 +1133,7 @@ class ContractService {
     return removed;
   }
 
-  async destroy(userId: string, organizationId?: string): Promise<void> {
+  async destroy(userId: string, organizationId: string): Promise<void> {
     const contract = await this._findContract(userId, organizationId);
 
     await this.contractRepository.destroy(userId, contract.organizationId);
