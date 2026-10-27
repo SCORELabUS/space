@@ -46,9 +46,12 @@ async function generateTokenFromEvalResult(
   }
 
   // A userId is only unique within an organization (RFC 7519 §4.1.2: `sub` is
-  // unique within the issuer): `sub` is `<organizationId>:<userId>`, `aud` the
-  // organization (RFC 8725 §3.9), and both parts are also explicit claims.
-  const tokenSub = `${organizationId}:${userId}`;
+  // unique within the issuer), so `sub` names both, as a URN (RFC 7519 §2: a
+  // StringOrURI with ":" is a URI) whose last part is the percent-encoded userId
+  // (any ":", "/", space or non-ASCII character in it stays unambiguous; the
+  // organization id is 24 hex characters). Clients read the explicit `userId`
+  // and `organizationId` claims, not `sub`. `aud` is the organization (RFC 8725 §3.9).
+  const tokenSub = `urn:space:${organizationId}:${encodeURIComponent(userId)}`;
 
   const payload = {
     userId,

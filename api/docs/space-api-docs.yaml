@@ -82,10 +82,11 @@ info:
     already uses, and changes nothing.
 
     Contract events and pricing tokens identify the contract by organization and `userId`: events carry
-    `details.organizationId` and only reach that organization; in pricing tokens `sub` is
-    `<organizationId>:<userId>`, the `userId` and `organizationId` claims carry both parts, `aud` is the
-    organization and `iss` names the SPACE server (see `PricingTokenPayload`). Verifiers should check `iss`
-    and `aud` (the organization they serve) and read the user from `userId`, not from `sub`.
+    `details.organizationId` and only reach that organization; in pricing tokens `sub` is the URN
+    `urn:space:<organizationId>:<percent-encoded userId>`, the `userId` and `organizationId` claims carry both
+    parts, `aud` is the organization and `iss` names the SPACE server (see `PricingTokenPayload`). Verifiers
+    should check `iss` and `aud` (the organization they serve) and read the user from `userId`; clients must
+    not parse `sub`.
 
     Platform ADMIN users on the direct routes that address contracts by `userId` or `groupId`
     (`/contracts/{userId}/**`, `PUT /contracts?groupId=`, `PUT /contracts/billingPeriod?groupId=`) must
@@ -114,7 +115,7 @@ info:
     - `token-subscription`: the pricing token carries the `subscription` claim.
     - `contract-events`: authenticated Socket.IO namespace `/contracts` with contract events.
     - `sphere-private`: SPHERE-linked services accept a write-only `sphereApiKey` to read private versions (`sphere.hasApiKey`); private versions are never served statically.
-    - `contract-userid-per-org`: a `userId` is unique per organization (see above), pricing tokens identify the contract by organization (`sub` = `<organizationId>:<userId>`, `userId`, `organizationId`, `aud`, `iss`; see `PricingTokenPayload`), and platform ADMIN users name the organization (`organizationId`) on the direct routes that address contracts by `userId` or `groupId` (`400 ORGANIZATION_ID_REQUIRED` otherwise).
+    - `contract-userid-per-org`: a `userId` is unique per organization (see above), pricing tokens identify the contract by organization (`sub` = `urn:space:<organizationId>:<percent-encoded userId>`, `userId`, `organizationId`, `aud`, `iss`; see `PricingTokenPayload`), and platform ADMIN users name the organization (`organizationId`) on the direct routes that address contracts by `userId` or `groupId` (`400 ORGANIZATION_ID_REQUIRED` otherwise).
 
   contact:
     email: agarcia29@us.es
@@ -4211,11 +4212,12 @@ paths:
         Generates a JWT token containing the user's pricing and subscription information 
         for use by client-side feature evaluation.
 
-        Payload (`PricingTokenPayload`): `sub` (`<organizationId>:<userId>`), `userId`, `organizationId`, `aud`
+        Payload (`PricingTokenPayload`): `sub` (`urn:space:<organizationId>:<percent-encoded userId>`), `userId`, `organizationId`, `aud`
         (the organization), `iss` (this SPACE server), `iat`, `exp`, `features`, `pricingContext`,
         `subscriptionContext` and, optionally, `subscription` - the subscription the token was computed from, with
         the `contractVersion` of the contract. A `userId` is only unique within an organization, so `sub` names
-        both. Verifiers should check `iss` and `aud` and read the user from `userId`. Clients must ignore claims
+        both. Verifiers should check `iss` and `aud` and read the user from `userId`; clients must not parse
+        `sub`. Clients must ignore claims
         they do not know; `subscription`, `userId`, `organizationId`, `aud` and `iss` are absent, and `sub` is
         the bare `userId`, in tokens issued by older SPACE versions.
 
@@ -4968,9 +4970,11 @@ components:
         sub:
           type: string
           description: |
-            `<organizationId>:<userId>`, unique within the issuer. The organization id never contains `:`, so
-            the first `:` separates the two (a `userId` may contain `:`); prefer the `userId` claim.
-          example: '65f1c0ffee0000000000000a:42'
+            The URN `urn:space:<organizationId>:<encodeURIComponent(userId)>` (RFC 7519 §2: a `StringOrURI`
+            containing `:` is a URI), unique within the issuer: the organization id is 24 hex characters and the
+            percent-encoded `userId` contains no `:`, `/` or space. An opaque identifier: clients must not parse
+            it and read the `userId` and `organizationId` claims instead.
+          example: 'urn:space:65f1c0ffee0000000000000a:42'
         userId:
           type: string
           description: userId of the contract, as stored (unique within its organization)
