@@ -61,13 +61,18 @@ async function getAllContracts(app?: any): Promise<any[]> {
   return response.body;
 }
 
-async function getContractByUserId(userId: string, app?: any): Promise<TestContract> {
+/**
+ * Read a contract as a platform ADMIN. A `userId` is only unique within an
+ * organization, so the direct route needs `?organizationId=`.
+ */
+async function getContractByUserId(userId: string, organizationId: string, app?: any): Promise<TestContract> {
   const copyApp = await useApp(app);
   const adminUser: LeanUser = await createTestUser('ADMIN');
   const apiKey = adminUser.apiKey;
 
   const response = await request(copyApp)
     .get(`${baseUrl}/contracts/${userId}`)
+    .query({ organizationId })
     .set('x-api-key', apiKey)
     .expect(200);
 
@@ -182,6 +187,7 @@ async function createRandomContractsForService(
 
 async function incrementUsageLevel(
   userId: string,
+  organizationId: string,
   serviceName: string,
   usageLimitName: string,
   app?: any
@@ -191,6 +197,7 @@ async function incrementUsageLevel(
 
   const response = await request(copyApp)
     .put(`${baseUrl}/contracts/${userId}/usageLevels`)
+    .query({ organizationId })
     .set('x-api-key', apiKey)
     .send({
       [serviceName]: {
@@ -204,6 +211,7 @@ async function incrementUsageLevel(
 
 async function incrementAllUsageLevel(
   userId: string,
+  organizationId: string,
   usageLevels: Record<string, Record<string, UsageLevel>>,
   app?: any
 ): Promise<TestContract> {
@@ -226,6 +234,7 @@ async function incrementAllUsageLevel(
 
   const response = await request(copyApp)
     .put(`${baseUrl}/contracts/${userId}/usageLevels`)
+    .query({ organizationId })
     .set('x-api-key', apiKey)
     .send(updatedUsageLevels)
     .expect(200);
@@ -233,12 +242,13 @@ async function incrementAllUsageLevel(
   return response.body;
 }
 
-async function deleteTestContract(userId: string, app?: any): Promise<void> {
+async function deleteTestContract(userId: string, organizationId: string, app?: any): Promise<void> {
   const copyApp = await useApp(app);
   const apiKey = await getTestAdminApiKey();
 
   await request(copyApp)
     .delete(`${baseUrl}/contracts/${userId}`)
+    .query({ organizationId })
     .set('x-api-key', apiKey)
     .expect(204);
 }

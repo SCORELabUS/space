@@ -5,7 +5,8 @@ import path from 'path';
 import { decodeJwt } from 'jose';
 import { io, Socket } from 'socket.io-client';
 import { v4 as uuidv4 } from 'uuid';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import container from '../main/config/container';
 import { baseUrl, getApp, shutdownApp } from './utils/testApp';
 import { createTestUser, deleteTestUser } from './utils/users/userTestUtils';
 import {
@@ -458,75 +459,137 @@ describe('Contract userId unique per organization', function () {
   describe('platform ADMIN on the direct routes', function () {
     const asAdmin = (req: request.Test) => req.set('x-api-key', admin.apiKey);
 
-    it('still reaches a userId that exists in one organization only', async function () {
-      const response = await asAdmin(request(app).get(`${baseUrl}/contracts/${userId}`));
+    /** Every direct route that addresses one contract by userId, for an ADMIN, with an optional query string. */
+    const userIdRoutes = (query = '') => {
+      const base = `${baseUrl}/contracts/${userId}`;
+      return {
+        show: () => asAdmin(request(app).get(`${base}${query}`)),
+        pricings: () => asAdmin(request(app).get(`${base}/pricings${query}`)),
+        novate: () => asAdmin(request(app).put(`${base}${query}`)).send(subscription('BASIC')),
+        preview: () => asAdmin(request(app).post(`${base}/novation/preview${query}`)).send(subscription('BASIC')),
+        usageLevels: () => asAdmin(request(app).put(`${base}/usageLevels${query}`)).send({ [serviceName]: { maxPets: 2 } }),
+        userContact: () => asAdmin(request(app).put(`${base}/userContact${query}`)).send({ username: 'renamed' }),
+        billingPeriod: () =>
+          asAdmin(request(app).put(`${base}/billingPeriod${query}`)).send({ autoRenew: false }),
+        destroy: () => asAdmin(request(app).delete(`${base}${query}`)),
+      };
+    };
 
-      expect(response.status).toBe(200);
-      expect(response.body.organizationId).toBe(orgA.id);
-    });
+    /** Spies on every service method the direct routes call, to show that nothing was read, locked or written. */
+    const spyOnContractService = () => {
+      const contractService = container.resolve('contractService');
+      const methods = [
+        'show', 'pricings', 'novate', 'previewNovation', 'resetUsageLevels', 'novateUserContact',
+        'novateBillingPeriod', 'destroy', 'novateByGroupId', 'novateBillingPeriodByGroupId', '_findContract',
+      ];
+      return methods.map(method => vi.spyOn(contractService, method));
+    };
 
-    it('gets 409 AMBIGUOUS_USER_ID, and changes nothing, when the userId exists in several organizations', async function () {
-      await createInB();
+    const expectOrganizationRequired = (response: request.Response, kind: 'userId' | 'groupId') => {
+      expect(response.status, JSON.stringify(response.body)).toBe(400);
+      expect(response.body.code).toBe('ORGANIZATION_ID_REQUIRED');
+      expect(response.body.error).toContain('?organizationId=');
+      expect(response.body.error).toContain(kind === 'userId' ? `/organizations/{organizationId}/contracts/${userId}` : '/organizations/{organizationId}/contracts?groupId=');
+      expect(response.body.organizationIds).toBeUndefined();
+    };
 
-      const show = await asAdmin(request(app).get(`${baseUrl}/contracts/${userId}`));
-      const novate = await asAdmin(request(app).put(`${baseUrl}/contracts/${userId}`)).send(subscription('BASIC'));
-      const contact = await asAdmin(request(app).put(`${baseUrl}/contracts/${userId}/userContact`)).send({ username: 'x' });
-      const remove = await asAdmin(request(app).delete(`${baseUrl}/contracts/${userId}`));
-
-      for (const response of [show, novate, contact, remove]) {
-        expect(response.status, JSON.stringify(response.body)).toBe(409);
-        expect(response.body.code).toBe('AMBIGUOUS_USER_ID');
-        expect(response.body.error).toContain('organizationId');
-        expect([...response.body.organizationIds].sort()).toEqual([orgA.id, orgB.id].sort());
+    it('gets 400 ORGANIZATION_ID_REQUIRED without ?organizationId=, even for a userId of one organization only', async function () {
+      const spies = spyOnContractService();
+      try {
+        for (const [name, send] of Object.entries(userIdRoutes())) {
+          const response = await send();
+          expect(response.status, `${name}: ${JSON.stringify(response.body)}`).toBe(400);
+          expectOrganizationRequired(response, 'userId');
+        }
+        for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+      } finally {
+        for (const spy of spies) spy.mockRestore();
       }
-      expect((await stored(orgA.id!)).subscriptionPlans[serviceName]).toBe('GOLD');
-      expect((await stored(orgB.id!)).userContact.username).toBe('bob-of-b');
-      expect(await stored(orgB.id!)).not.toBeNull();
+      const contract = await stored(orgA.id!);
+      expect(contract.subscriptionPlans[serviceName]).toBe('GOLD');
+      expect(contract.userContact.username).toBe('alice-of-a');
     });
 
-    it('names the organization with ?organizationId= on the direct routes', async function () {
+    it('gets 400 ORGANIZATION_ID_REQUIRED, and changes nothing, when the userId exists in several organizations', async function () {
       await createInB();
 
-      const showB = await asAdmin(request(app).get(`${baseUrl}/contracts/${userId}?organizationId=${orgB.id}`));
-      expect(showB.status).toBe(200);
-      expect(showB.body.userContact.username).toBe('bob-of-b');
+      for (const send of Object.values(userIdRoutes())) expectOrganizationRequired(await send(), 'userId');
 
-      const novateA = await asAdmin(request(app).put(`${baseUrl}/contracts/${userId}?organizationId=${orgA.id}`)).send(
-        subscription('BASIC')
-      );
-      expect(novateA.status, JSON.stringify(novateA.body)).toBe(200);
-      expect(novateA.body.organizationId).toBe(orgA.id);
-      expect((await stored(orgA.id!)).subscriptionPlans[serviceName]).toBe('BASIC');
+      expect((await stored(orgA.id!)).subscriptionPlans[serviceName]).toBe('GOLD');
+      expect((await stored(orgA.id!)).userContact.username).toBe('alice-of-a');
       expect((await stored(orgB.id!)).subscriptionPlans[serviceName]).toBe('PLATINUM');
+      expect((await stored(orgB.id!)).userContact.username).toBe('bob-of-b');
+    });
 
-      const removeB = await asAdmin(request(app).delete(`${baseUrl}/contracts/${userId}?organizationId=${orgB.id}`));
-      expect(removeB.status).toBe(204);
+    it('reaches every direct userId route with ?organizationId=', async function () {
+      await createInB();
+      const routes = userIdRoutes(`?organizationId=${orgB.id}`);
+
+      const show = await routes.show();
+      expect(show.status).toBe(200);
+      expect(show.body.userContact.username).toBe('bob-of-b');
+      expect((await routes.pricings()).status).toBe(200);
+      const preview = await routes.preview();
+      expect(preview.status, JSON.stringify(preview.body)).toBe(200);
+      expect((await routes.usageLevels()).status).toBe(200);
+      expect((await stored(orgB.id!)).usageLevels[serviceName].maxPets.consumed).toBe(2);
+      expect((await stored(orgA.id!)).usageLevels[serviceName].maxPets.consumed).toBe(0);
+      expect((await routes.userContact()).status).toBe(200);
+      expect((await routes.billingPeriod()).status).toBe(200);
+      const novate = await routes.novate();
+      expect(novate.status, JSON.stringify(novate.body)).toBe(200);
+      expect(novate.body.organizationId).toBe(orgB.id);
+
+      expect((await stored(orgB.id!)).subscriptionPlans[serviceName]).toBe('BASIC');
+      expect((await stored(orgB.id!)).userContact.username).toBe('renamed');
+      expect((await stored(orgA.id!)).subscriptionPlans[serviceName]).toBe('GOLD');
+      expect((await stored(orgA.id!)).userContact.username).toBe('alice-of-a');
+
+      expect((await routes.destroy()).status).toBe(204);
       expect(await stored(orgB.id!)).toBeNull();
       expect(await stored(orgA.id!)).not.toBeNull();
 
-      // Unambiguous again.
-      expect((await asAdmin(request(app).get(`${baseUrl}/contracts/${userId}`))).status).toBe(200);
+      // One organization left with that userId: still required.
+      expectOrganizationRequired(await userIdRoutes().show(), 'userId');
+      expect((await userIdRoutes(`?organizationId=${orgA.id}`).show()).status).toBe(200);
     });
 
-    it('answers 404 for an organization without that userId', async function () {
-      const response = await asAdmin(request(app).get(`${baseUrl}/contracts/${userId}?organizationId=${orgB.id}`));
+    it('answers 404 for an organization without that userId, or one that does not exist', async function () {
+      const without = await userIdRoutes(`?organizationId=${orgB.id}`).show();
+      const unknown = await userIdRoutes(`?organizationId=${uuidv4()}`).show();
+      const unknownDelete = await userIdRoutes(`?organizationId=${uuidv4()}`).destroy();
 
-      expect(response.status).toBe(404);
+      expect(without.status).toBe(404);
+      expect(unknown.status).toBe(404);
+      expect(unknownDelete.status).toBe(404);
+      expect(await stored(orgA.id!)).not.toBeNull();
     });
 
-    it('keeps using the organization-scoped routes, which are never ambiguous', async function () {
+    it('answers 400 for a malformed organizationId', async function () {
+      const response = await userIdRoutes(`?organizationId=${orgA.id}&organizationId=${orgB.id}`).show();
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toContain('organizationId');
+    });
+
+    it('keeps using the organization-scoped routes without the parameter', async function () {
       await createInB();
 
       const a = await asAdmin(request(app).get(`${baseUrl}/organizations/${orgA.id}/contracts/${userId}`));
       const b = await asAdmin(request(app).get(`${baseUrl}/organizations/${orgB.id}/contracts/${userId}`));
 
+      expect(a.status).toBe(200);
       expect(a.body.userContact.username).toBe('alice-of-a');
       expect(b.body.userContact.username).toBe('bob-of-b');
     });
 
-    it('lists and prunes one organization with ?organizationId=', async function () {
+    it('lists and prunes every organization without ?organizationId=, or one with it', async function () {
       await createInB();
 
+      const all = await asAdmin(request(app).get(`${baseUrl}/contracts?limit=100`));
+      expect(all.status).toBe(200);
+      const holders = all.body.filter((contract: any) => contract.userContact.userId === userId);
+      expect(holders.map((contract: any) => contract.organizationId).sort()).toEqual([orgA.id, orgB.id].sort());
       const listed = await asAdmin(request(app).get(`${baseUrl}/contracts?organizationId=${orgB.id}`));
       expect(listed.status).toBe(200);
       expect(listed.body.map((contract: any) => contract.organizationId)).toEqual([orgB.id]);
@@ -538,14 +601,32 @@ describe('Contract userId unique per organization', function () {
       expect((await read(keyA)).status).toBe(200);
     });
 
-    it('gets 409 on group novation by groupId when the group spans organizations', async function () {
+    it('requires ?organizationId= on the groupId routes, and changes nothing without it', async function () {
       const groupId = `group-${uuidv4()}`;
       expect((await createContract(keyA, `ga-${uuidv4()}`, 'ga', 'GOLD', { groupId })).status).toBe(201);
       expect((await createContract(keyB, `gb-${uuidv4()}`, 'gb', 'GOLD', { groupId })).status).toBe(201);
+      const billingPeriod = { autoRenew: false };
+      const inOrg = async (organizationId: string) =>
+        (await ContractMongoose.findOne({ groupId, organizationId }).lean()) as any;
 
-      const ambiguous = await asAdmin(request(app).put(`${baseUrl}/contracts?groupId=${groupId}`)).send(subscription('BASIC'));
-      expect(ambiguous.status, JSON.stringify(ambiguous.body)).toBe(409);
-      expect(ambiguous.body.code).toBe('AMBIGUOUS_GROUP_ID');
+      const spies = spyOnContractService();
+      try {
+        expectOrganizationRequired(
+          await asAdmin(request(app).put(`${baseUrl}/contracts?groupId=${groupId}`)).send(subscription('BASIC')),
+          'groupId'
+        );
+        expectOrganizationRequired(
+          await asAdmin(request(app).put(`${baseUrl}/contracts/billingPeriod?groupId=${groupId}`)).send(billingPeriod),
+          'groupId'
+        );
+        for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+      } finally {
+        for (const spy of spies) spy.mockRestore();
+      }
+      for (const organizationId of [orgA.id!, orgB.id!]) {
+        expect((await inOrg(organizationId)).subscriptionPlans[serviceName]).toBe('GOLD');
+        expect((await inOrg(organizationId)).billingPeriod.autoRenew).toBe(true);
+      }
 
       const named = await asAdmin(
         request(app).put(`${baseUrl}/contracts?groupId=${groupId}&organizationId=${orgB.id}`)
@@ -553,8 +634,19 @@ describe('Contract userId unique per organization', function () {
       expect(named.status, JSON.stringify(named.body)).toBe(200);
       expect(named.body).toHaveLength(1);
       expect(named.body[0].organizationId).toBe(orgB.id);
-      const inA = (await ContractMongoose.findOne({ groupId, organizationId: orgA.id }).lean()) as any;
-      expect(inA.subscriptionPlans[serviceName]).toBe('GOLD');
+      const period = await asAdmin(
+        request(app).put(`${baseUrl}/contracts/billingPeriod?groupId=${groupId}&organizationId=${orgB.id}`)
+      ).send(billingPeriod);
+      expect(period.status, JSON.stringify(period.body)).toBe(200);
+      expect(period.body).toHaveLength(1);
+      expect((await inOrg(orgA.id!)).subscriptionPlans[serviceName]).toBe('GOLD');
+      expect((await inOrg(orgA.id!)).billingPeriod.autoRenew).toBe(true);
+      expect((await inOrg(orgB.id!)).billingPeriod.autoRenew).toBe(false);
+
+      const unknown = await asAdmin(
+        request(app).put(`${baseUrl}/contracts?groupId=${groupId}&organizationId=${uuidv4()}`)
+      ).send(subscription('BASIC'));
+      expect(unknown.status).toBe(404);
     });
   });
 

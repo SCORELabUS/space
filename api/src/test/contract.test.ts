@@ -1102,7 +1102,7 @@ describe('Contract API routes', function () {
       expect(response.status).toBe(422);
     });
 
-    it('returns 200 when ADMIN user novates contracts by groupId globally', async function () {
+    it('returns 200 when ADMIN user novates contracts by groupId naming the organization', async function () {
       const adminGroupId = `admin-global-${Date.now()}`;
       const adminContract = await createTestContract(testOrganization.id!, [testService], app, adminGroupId);
       trackContractForCleanup(adminContract);
@@ -1117,7 +1117,7 @@ describe('Contract API routes', function () {
       );
 
       const response = await request(app)
-        .put(`${baseUrl}/contracts?groupId=${adminGroupId}`)
+        .put(`${baseUrl}/contracts?groupId=${adminGroupId}&organizationId=${testOrganization.id}`)
         .set('x-api-key', adminUser.apiKey)
         .send({
           contractedServices: { [adminService.name.toLowerCase()]: pricingVersion },
@@ -1266,7 +1266,7 @@ describe('Contract API routes', function () {
       expect(response.status).toBe(422);
     });
 
-    it('returns 200 when ADMIN user updates billing period by groupId globally', async function () {
+    it('returns 200 when ADMIN user updates billing period by groupId naming the organization', async function () {
       const adminBillingGroupId = `admin-billing-${Date.now()}`;
       const adminBillingContract = await createTestContract(
         testOrganization.id!,
@@ -1282,7 +1282,7 @@ describe('Contract API routes', function () {
       };
 
       const response = await request(app)
-        .put(`${baseUrl}/contracts/billingPeriod?groupId=${adminBillingGroupId}`)
+        .put(`${baseUrl}/contracts/billingPeriod?groupId=${adminBillingGroupId}&organizationId=${testOrganization.id}`)
         .set('x-api-key', adminUser.apiKey)
         .send(billingData);
 
@@ -1304,7 +1304,7 @@ describe('Contract API routes', function () {
       expect(response.body.error).toContain('API Key');
     });
 
-    it('returns 200 when ADMIN user updates billing period by groupId globally', async function () {
+    it('returns 200 when ADMIN user updates billing period by groupId naming the organization', async function () {
       const adminBillingGroupId = `admin-billing-${Date.now()}`;
       const adminBillingContract = await createTestContract(
         testOrganization.id!,
@@ -1320,7 +1320,7 @@ describe('Contract API routes', function () {
       };
 
       const response = await request(app)
-        .put(`${baseUrl}/contracts/billingPeriod?groupId=${adminBillingGroupId}`)
+        .put(`${baseUrl}/contracts/billingPeriod?groupId=${adminBillingGroupId}&organizationId=${testOrganization.id}`)
         .set('x-api-key', adminUser.apiKey)
         .send(billingData);
 

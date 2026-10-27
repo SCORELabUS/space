@@ -156,7 +156,7 @@ describe('Pricing token subscription', function () {
       });
     // A novation that lands after the contexts were read: later reads see another plan.
     const show = vi.spyOn(contractService, 'show').mockImplementation(async (...args: any[]) => {
-      const contract: any = await originalShow(...(args as [string, string?]));
+      const contract: any = await originalShow(...(args as [string, string]));
       return contextsRead ? { ...contract, subscriptionPlans: { [serviceName]: 'PLATINUM' } } : contract;
     });
     try {

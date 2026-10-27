@@ -1970,7 +1970,7 @@ describe('Permissions Test Suite', function () {
     describe('GET /contracts/:userId', function () {
       it('Should return 200 with ADMIN user API key', async function () {
         const response = await request(app)
-          .get(`${baseUrl}/contracts/test-user`)
+          .get(`${baseUrl}/contracts/test-user?organizationId=${contractTestOrganization.id}`)
           .set('x-api-key', adminApiKey);
 
         expect([200, 404]).toContain(response.status);
@@ -2018,7 +2018,7 @@ describe('Permissions Test Suite', function () {
     describe('PUT /contracts/:userId', function () {
       it('Should allow update with ADMIN user API key', async function () {
         const response = await request(app)
-          .put(`${baseUrl}/contracts/test-user`)
+          .put(`${baseUrl}/contracts/test-user?organizationId=${contractTestOrganization.id}`)
           .set('x-api-key', adminApiKey)
           .send({ serviceName: 'test' });
 
@@ -2071,7 +2071,7 @@ describe('Permissions Test Suite', function () {
     describe('DELETE /contracts/:userId - Org Role: ALL', function () {
       it('Should allow deletion with ADMIN user API key', async function () {
         const response = await request(app)
-          .delete(`${baseUrl}/contracts/test-user`)
+          .delete(`${baseUrl}/contracts/test-user?organizationId=${contractTestOrganization.id}`)
           .set('x-api-key', adminApiKey);
 
         expect([200, 204, 404]).toContain(response.status);

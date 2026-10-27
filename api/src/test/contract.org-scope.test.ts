@@ -275,11 +275,20 @@ describe('Contract organization scoping', function () {
   });
 
   describe('platform ADMIN on the direct routes', function () {
-    it('keeps its cross-organization access', async function () {
-      const response = await request(app).get(`${baseUrl}/contracts/${userId}`).set('x-api-key', adminUser.apiKey);
+    it('keeps its cross-organization access, naming the organization with ?organizationId=', async function () {
+      const response = await request(app)
+        .get(`${baseUrl}/contracts/${userId}?organizationId=${orgA.id}`)
+        .set('x-api-key', adminUser.apiKey);
 
       expect(response.status).toBe(200);
       expect(response.body.organizationId).toBe(orgA.id);
+    });
+
+    it('must name the organization', async function () {
+      const response = await request(app).get(`${baseUrl}/contracts/${userId}`).set('x-api-key', adminUser.apiKey);
+
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe('ORGANIZATION_ID_REQUIRED');
     });
   });
 });
