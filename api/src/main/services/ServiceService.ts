@@ -4,6 +4,7 @@ import { retrievePricingFromPath, retrievePricingFromText } from 'pricing4ts/ser
 import container from '../config/container';
 import ServiceRepository, { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository';
 import { parsePricingToSpacePricingObject } from '../utils/pricing-yaml2json';
+import { proxyAgentFor } from '../utils/proxy';
 import { Pricing } from 'pricing4ts';
 import fetch from 'node-fetch';
 import https from 'https';
@@ -1197,7 +1198,7 @@ class ServiceService {
   }
 
   async _fetchRemotePricingYaml(url: string) {
-    const agent = new https.Agent({ rejectUnauthorized: false });
+    const agent = proxyAgentFor(url, { rejectUnauthorized: false }) ?? new https.Agent({ rejectUnauthorized: false });
     const timeoutMs = 5000;
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);
