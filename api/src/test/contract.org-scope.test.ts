@@ -260,8 +260,8 @@ describe('Contract organization scoping', function () {
       };
       delete forged._id;
 
-      // The filter includes the organization: nothing of org A matches, and the
-      // upsert then collides with the globally unique userId instead of writing.
+      // The filter includes the organization: nothing of org A matches, and
+      // bulk writes never upsert, so nothing is created in org B either.
       await container
         .resolve('contractRepository')
         .bulkUpdate([forged])
@@ -270,6 +270,7 @@ describe('Contract organization scoping', function () {
       const after = await storedContract();
       expect(after.organizationId).toBe(orgA.id);
       expect(after.subscriptionPlans[serviceName]).toBe('GOLD');
+      expect(await ContractMongoose.countDocuments({ 'userContact.userId': userId })).toBe(1);
     });
   });
 

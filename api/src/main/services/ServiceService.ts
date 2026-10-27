@@ -25,6 +25,7 @@ import OrganizationRepository from '../repositories/mongoose/OrganizationReposit
 import yaml from 'js-yaml';
 import { SphereVersionNotListedError } from './sphere/errors';
 import { isPrivateSnapshotPath, storedYamlFile } from './sphere/snapshots';
+import { contractCacheKeys } from '../utils/contracts/cacheKeys';
 
 /** A pricing version exists, but its Pricing2Yaml file cannot be provided. */
 export class PricingYamlUnavailableError extends Error {
@@ -1000,6 +1001,20 @@ class ServiceService {
         }
       }
 
+      // userIds are unique per organization: a contract cannot move into an
+      // organization that already has a contract for the same userId. Checked
+      // before anything is written.
+      const taken = await this.contractRepository.findExistingUserIds(
+        newServiceData.organizationId,
+        contractsToUpdateOrgId.map(contract => contract.userContact.userId)
+      );
+      if (taken.length > 0) {
+        throw new Error(
+          `CONFLICT: Organization ${newServiceData.organizationId} already has contracts for userIds ${taken.join(', ')}; ` +
+            `moving service ${service.name} would move contracts with the same userIds into it`
+        );
+      }
+
       dataToUpdate.organizationId = newServiceData.organizationId;
     }
 
@@ -1025,9 +1040,7 @@ class ServiceService {
       });
 
       // Evaluations and pricing tokens name the service too.
-      await this.cacheService.delMany(
-        updatedContracts.flatMap(c => [`contracts.${c.userContact.userId}`, `features.${c.userContact.userId}.*`])
-      );
+      await this.cacheService.delMany(updatedContracts.flatMap(c => contractCacheKeys(c)));
     }
 
     if (dataToUpdate.organizationId) {
@@ -1036,18 +1049,19 @@ class ServiceService {
       }
       await this.contractRepository.bulkUpdate(contractsToRemoveService);
 
+      // Cached under the organization they move from (and nothing of theirs under the new one).
+      const movedCacheKeys = contractsToUpdateOrgId.flatMap(c => [
+        ...contractCacheKeys(c),
+        ...contractCacheKeys({ ...c, organizationId: dataToUpdate.organizationId }),
+      ]);
       for (const contract of contractsToUpdateOrgId) {
         contract.organizationId = dataToUpdate.organizationId;
       }
       // Matched in the organization they are moving from.
       await this.contractRepository.bulkUpdate(contractsToUpdateOrgId, false, { organizationId });
 
-      await this.cacheService.delMany(
-        contractsToRemoveService.flatMap(c => [`contracts.${c.userContact.userId}`, `features.${c.userContact.userId}.*`])
-      );
-      await this.cacheService.delMany(
-        contractsToUpdateOrgId.flatMap(c => [`contracts.${c.userContact.userId}`, `features.${c.userContact.userId}.*`])
-      );
+      await this.cacheService.delMany(contractsToRemoveService.flatMap(c => contractCacheKeys(c)));
+      await this.cacheService.delMany(movedCacheKeys);
     }
 
     let newCacheKey = `service.${organizationId}.${serviceName}`;
@@ -1370,12 +1384,7 @@ class ServiceService {
       }
 
       // The cached copies still have the archived version.
-      await this.cacheService.delMany(
-        pricingVersionContracts.flatMap(contract => [
-          `contracts.${contract.userContact.userId}`,
-          `features.${contract.userContact.userId}.*`,
-        ])
-      );
+      await this.cacheService.delMany(pricingVersionContracts.flatMap(contract => contractCacheKeys(contract)));
       for (const contract of pricingVersionContracts) {
         this.eventService.emitContractEvent?.('CONTRACT_NOVATED', contract);
       }

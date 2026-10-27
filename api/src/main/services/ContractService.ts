@@ -42,6 +42,15 @@ import {
 } from '../utils/contracts/version';
 import { LeanUser } from '../types/models/User';
 import { pricingYamlUrl } from '../utils/services/helpers';
+import {
+  contractCacheKey,
+  contractCacheKeys,
+  featuresCachePattern,
+  organizationContractCachePatterns,
+  usageLevelSnapshotKey,
+  usageLevelSnapshotPattern,
+} from '../utils/contracts/cacheKeys';
+import { AmbiguousContractScopeError } from '../utils/contracts/scope';
 
 /** Response of POST /contracts/{userId}/novation/preview. */
 export interface NovationPreview {
@@ -139,14 +148,22 @@ class ContractService {
     for (const method of ['create', 'novate', 'novateByGroupId', 'renew', 'destroy', 'novateUserContact', 'novateBillingPeriod', 'novateBillingPeriodByGroupId', 'resetUsageLevels', '_revertExpectedConsumption'] as const) {
       const original = (this[method] as (...args: any[]) => Promise<any>).bind(this);
       (this as any)[method] = async (...args: any[]) => {
-        const scope = args[scopeArgument[method]];
-        const contract: any = method === 'create' || method.endsWith('ByGroupId') ? null :
-          await ContractModel.findOne({ 'userContact.userId': args[0], ...(scope ? { organizationId: scope } : {}) }).lean();
+        let contract: any = null;
+        if (method !== 'create' && !method.endsWith('ByGroupId')) {
+          // A userId is only unique within an organization: resolve it first
+          // (ambiguity is an error), then pass the organization on explicitly.
+          const scope = args[scopeArgument[method]] ?? await this.organizationOfUserId(args[0]);
+          if (scope) {
+            args[scopeArgument[method]] = scope;
+            contract = await ContractModel.findOne({ 'userContact.userId': args[0], organizationId: scope }).lean();
+          }
+        }
+        if (method.endsWith('ByGroupId') && !args[1]) args[1] = await this.organizationOfGroupId(args[0]);
         const org = method === 'create' ? args[0]?.organizationId : method.endsWith('ByGroupId') ? args[1] : contract?.organizationId;
         if (!org || !await ServiceModel.exists({ organizationId: org, source: 'sphere' })) return original(...args);
         return withOrganizationLock(org, async assertOwned => {
           if (await ServiceModel.exists({ organizationId: org, source: 'sphere', 'sphere.status': 'applying' })) throw new Error('Synchronization is applying; retry shortly');
-          if (contract) await this.cacheService.del(`contracts.${contract.userContact.userId}`);
+          if (contract) await this.cacheService.del(contractCacheKey(contract.organizationId, contract.userContact.userId));
           await assertOwned();
           const result = await original(...args);
           const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
@@ -168,25 +185,54 @@ class ContractService {
   }
 
   /**
-   * Look a contract up by `userId`, confined to `organizationId` when given.
+   * The organization of the contract with this `userId`, for callers that do
+   * not have one (a platform ADMIN on the direct routes). A `userId` is only
+   * unique within an organization: when several organizations use it, this
+   * throws `AmbiguousContractScopeError` rather than pick one. Undefined when
+   * no organization has it.
+   */
+  async organizationOfUserId(userId: string): Promise<string | undefined> {
+    const organizations = await this.contractRepository.findOrganizationIdsByUserId(userId);
+    if (organizations.length > 1) throw new AmbiguousContractScopeError('userId', userId, organizations);
+    return organizations[0];
+  }
+
+  /** Like `organizationOfUserId`, for the contracts of a `groupId`. */
+  async organizationOfGroupId(groupId: string): Promise<string | undefined> {
+    const organizations = await this.contractRepository.findOrganizationIdsByGroupId(groupId);
+    if (organizations.length > 1) throw new AmbiguousContractScopeError('groupId', groupId, organizations);
+    return organizations[0];
+  }
+
+  /**
+   * Look a contract up by `userId` within `organizationId` (resolved with
+   * `organizationOfUserId` when not given).
    *
-   * Contracts are cached under `contracts.<userId>` whatever their organization,
-   * so a cached contract is checked against the organization as well: a hit
-   * from another organization is a miss. Outside the organization the contract
-   * does not exist, and the error says exactly what it says for an unknown
-   * `userId`, so that a caller cannot tell the two apart.
+   * Contracts are cached per organization and userId (see `contractCacheKey`);
+   * a cached entry is still checked against both. Outside the organization the
+   * contract does not exist, and the error says exactly what it says for an
+   * unknown `userId`, so that a caller cannot tell the two apart.
    */
   async _findContract(userId: string, organizationId?: string): Promise<LeanContract> {
-    let contract: LeanContract | null = await this.cacheService.get(`contracts.${userId}`);
+    const organization = organizationId ?? (await this.organizationOfUserId(userId));
+    if (!organization) {
+      throw new Error(`Contract with userId ${userId} not found`);
+    }
+
+    const key = contractCacheKey(organization, userId);
+    let contract: LeanContract | null = await this.cacheService.get(key);
+    if (contract && (contract.organizationId !== organization || contract.userContact?.userId !== userId)) {
+      contract = null;
+    }
 
     if (!contract) {
-      contract = await this.contractRepository.findByUserId(userId);
+      contract = await this.contractRepository.findByUserId(userId, organization);
       if (contract) {
-        await this.cacheService.set(`contracts.${userId}`, contract, 3600, true); // Cache for 1 hour
+        await this.cacheService.set(key, contract, 3600, true); // Cache for 1 hour
       }
     }
 
-    if (!contract || (organizationId && contract.organizationId !== organizationId)) {
+    if (!contract) {
       throw new Error(`Contract with userId ${userId} not found`);
     }
 
@@ -447,8 +493,11 @@ class ContractService {
       throw new Error('INVALID DATA: Missing organizationId');
     }
 
+    // userIds are unique per organization; a userId of another organization
+    // neither conflicts nor is revealed.
     const existingContract = await this.contractRepository.findByUserId(
-      contractData.userContact.userId
+      contractData.userContact.userId,
+      contractData.organizationId
     );
 
     if (existingContract) {
@@ -542,7 +591,7 @@ class ContractService {
 
     contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
 
-    await this.cacheService.set(`contracts.${contract.userContact.userId}`, contract, 3600, true); // Cache for 1 hour
+    await this.cacheService.set(contractCacheKey(contract.organizationId, contract.userContact.userId), contract, 3600, true); // Cache for 1 hour
     this._events()?.emitContractEvent('CONTRACT_CREATED', contract);
 
     return contract;
@@ -605,7 +654,7 @@ class ContractService {
 
     if (!result && expected !== undefined) {
       const latest = await this.contractRepository.findByUserId(userId, contract.organizationId);
-      await this.cacheService.del(`contracts.${userId}`);
+      await this.cacheService.del(contractCacheKey(contract.organizationId, userId));
       if (!latest) {
         throw new Error(`Contract with userId ${userId} not found`);
       }
@@ -618,8 +667,8 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(`features.${userId}.*`);
+    await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
+    await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
     this._events()?.emitContractEvent('CONTRACT_NOVATED', result);
 
     return result;
@@ -694,13 +743,12 @@ class ContractService {
       if (rejected.length > 0) {
         const changed: Record<string, string | null> = {};
         for (const userId of rejected) {
-          await this.cacheService.del(`contracts.${userId}`);
+          await this.cacheService.del(contractCacheKey(organizationId, userId));
           const latest = await this.contractRepository.findByUserId(userId, organizationId);
           changed[userId] = latest ? computeContractVersion(latest) : null;
         }
         for (const contract of updatedContracts) {
-          await this.cacheService.del(`contracts.${contract.userContact.userId}`);
-          await this.cacheService.del(`features.${contract.userContact.userId}.*`);
+          await this.cacheService.delMany(contractCacheKeys(contract));
         }
         // Every precondition held when checked, but a contract changed before
         // its own write. Contracts are written one by one (no multi-document
@@ -727,8 +775,8 @@ class ContractService {
 
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
-      this.cacheService.set(`contracts.${contract.userContact.userId}`, contract, 3600, true); // Cache for 1 hour
-      this.cacheService.del(`features.${contract.userContact.userId}.*`);
+      this.cacheService.set(contractCacheKey(contract.organizationId, contract.userContact.userId), contract, 3600, true); // Cache for 1 hour
+      this.cacheService.del(featuresCachePattern(contract.organizationId, contract.userContact.userId));
       this._events()?.emitContractEvent('CONTRACT_NOVATED', contract);
     }
 
@@ -758,8 +806,8 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(`features.${userId}.*`);
+    await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
+    await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
     this._events()?.emitContractEvent('CONTRACT_RENEWED', result);
 
     return result;
@@ -785,8 +833,8 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(`features.${userId}.*`);
+    await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
+    await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
 
     return result;
   }
@@ -815,8 +863,8 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(`features.${userId}.*`);
+    await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
+    await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
     // The billing period is part of contractVersion.
     this._events()?.emitContractEvent('CONTRACT_NOVATED', result);
 
@@ -859,12 +907,7 @@ class ContractService {
 
     // The billing period is part of contractVersion: drop cached contracts,
     // evaluations and pricing tokens (they carry the version).
-    await this.cacheService.delMany(
-      contractsToReturn.flatMap(contract => [
-        `contracts.${contract.userContact.userId}`,
-        `features.${contract.userContact.userId}.*`,
-      ])
-    );
+    await this.cacheService.delMany(contractsToReturn.flatMap(contract => contractCacheKeys(contract)));
 
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
@@ -913,8 +956,8 @@ class ContractService {
       updatedContract.contractedServices
     );
 
-    await this.cacheService.set(`contracts.${userId}`, updatedContract, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(`features.${userId}.*`);
+    await this.cacheService.set(contractCacheKey(updatedContract.organizationId, userId), updatedContract, 3600, true); // Cache for 1 hour
+    await this.cacheService.del(featuresCachePattern(updatedContract.organizationId, userId));
 
     return updatedContract;
   }
@@ -923,7 +966,7 @@ class ContractService {
     userId: string,
     usageLimitId: string,
     expectedConsumption: number,
-    organizationId?: string
+    organizationId: string
   ): Promise<void> {
     await this._applyExpectedConsumptions(userId, { [usageLimitId]: expectedConsumption }, organizationId);
   }
@@ -946,8 +989,11 @@ class ContractService {
   async _applyExpectedConsumptions(
     userId: string,
     expectedConsumptions: Record<string, number>,
-    organizationId?: string
+    organizationId: string
   ): Promise<void> {
+    if (!organizationId) {
+      throw new Error(`An organization is required to consume the usage levels of userId ${userId}`);
+    }
     const usageLimitIds = Object.keys(expectedConsumptions);
     if (usageLimitIds.length === 0) {
       return;
@@ -986,13 +1032,13 @@ class ContractService {
       // caller's own contribution that gets taken back even if others landed in
       // between.
       await this.cacheService.set(
-        `${appliedAt}.usageLevels.${userId}.${serviceName}.${usageLimit}`,
+        usageLevelSnapshotKey(appliedAt, organizationId, userId, serviceName, usageLimit),
         updatedContract!.usageLevels[serviceName][usageLimit].consumed - amount,
         120
       ); // 120 secs = 2 mins
     }
 
-    await this.cacheService.set(`contracts.${userId}`, updatedContract, 3600, true); // Cache for 1 hour
+    await this.cacheService.set(contractCacheKey(organizationId, userId), updatedContract, 3600, true); // Cache for 1 hour
   }
 
   /**
@@ -1001,7 +1047,7 @@ class ContractService {
   private async _explainMissingUsageLevels(
     userId: string,
     targets: { serviceName: string; usageLimit: string }[],
-    organizationId?: string
+    organizationId: string
   ): Promise<never> {
     const contract = await this.contractRepository.findByUserId(userId, organizationId);
 
@@ -1049,7 +1095,8 @@ class ContractService {
           userId,
           serviceName,
           usageLimitName,
-          latest
+          latest,
+          contract.organizationId
         );
 
         if (previousCachedValue === null || previousCachedValue === undefined) {
@@ -1072,7 +1119,7 @@ class ContractService {
       throw new Error(`Failed to update contract for userId ${userId}`);
     }
 
-    await this.cacheService.set(`contracts.${userId}`, updatedContract, 3600, true); // Cache for 1 hour
+    await this.cacheService.set(contractCacheKey(updatedContract.organizationId, userId), updatedContract, 3600, true); // Cache for 1 hour
   }
 
   async prune(organizationId?: string, reqUser?: LeanUser): Promise<number> {
@@ -1099,8 +1146,12 @@ class ContractService {
       if (await ServiceModel.exists({ organizationId: org, source: 'sphere' })) await withOrganizationLock(org, clean);
       else await clean(async () => {});
     }
-    await this.cacheService.del('contracts.*');
-    await this.cacheService.del('features.*');
+    if (organizationId) {
+      await this.cacheService.delMany(organizationContractCachePatterns(organizationId));
+    } else {
+      await this.cacheService.del('contracts.*');
+      await this.cacheService.del('features.*');
+    }
     return removed;
   }
 
@@ -1109,7 +1160,7 @@ class ContractService {
 
     await this.contractRepository.destroy(userId, contract.organizationId);
 
-    this.cacheService.del(`contracts.${userId}`);
+    await this.cacheService.delMany(contractCacheKeys(contract));
     this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true });
   }
 
@@ -1117,10 +1168,11 @@ class ContractService {
     userId: string,
     serviceName: string,
     usageLimit: string,
-    latest: boolean = false
+    latest: boolean,
+    organizationId: string
   ): Promise<number | null> {
     let cachedValues: string[] = await this.cacheService.match(
-      `*.usagelevels.${userId}.${serviceName}.${usageLimit}`
+      usageLevelSnapshotPattern(organizationId, userId, serviceName, usageLimit)
     );
     cachedValues = cachedValues.sort((a, b) => {
       const aTimestamp = parseInt(a.split('.')[0]);

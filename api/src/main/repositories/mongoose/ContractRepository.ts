@@ -14,15 +14,20 @@ type ContractMatchPipeline = {
 };
 
 /**
- * Filter that addresses one contract by `userId`, optionally confined to an
- * organization. `userId` is chosen by the host application and is not secret,
- * so callers acting for an organization must always pass its id: a contract of
- * another organization then simply does not match.
+ * Filter that addresses one contract: a `userId` is chosen by each host
+ * application and is only unique within an organization (unique index
+ * `{ organizationId, userContact.userId }`), so the organization is always part
+ * of it. Without one the filter could match a contract of any organization.
  */
-const byUserId = (userId: string, organizationId?: string): Record<string, unknown> => ({
-  'userContact.userId': userId,
-  ...(organizationId ? { organizationId } : {}),
-});
+const byUserId = (userId: string, organizationId: string): Record<string, unknown> => {
+  if (!organizationId) {
+    throw new Error(`An organization is required to address the contract with userId ${userId}`);
+  }
+  return { 'userContact.userId': userId, organizationId };
+};
+
+/** Duplicate key error of the unique index { organizationId, userContact.userId }. */
+const isDuplicateKey = (error: any): boolean => error?.code === 11000;
 
 const buildMatchPipeline = (queryFilters: any): ContractMatchPipeline => {
   const {
@@ -173,14 +178,51 @@ class ContractRepository extends RepositoryBase {
     return result[0]?.total ?? 0;
   }
 
-  async findByUserId(userId: string, organizationId?: string): Promise<LeanContract | null> {
+  async findByUserId(userId: string, organizationId: string): Promise<LeanContract | null> {
     const contract = await ContractMongoose.findOne(byUserId(userId, organizationId));
     return contract ? toPlainObject<LeanContract>(contract.toJSON()) : null;
   }
 
+  /**
+   * Organizations that have a contract with this `userId`. The only lookup by
+   * `userId` without an organization: it lets a platform ADMIN on the direct
+   * routes address a contract when the `userId` is unambiguous.
+   */
+  async findOrganizationIdsByUserId(userId: string): Promise<string[]> {
+    const ids = await ContractMongoose.distinct('organizationId', { 'userContact.userId': userId });
+    return ids.map(id => String(id));
+  }
+
+  /** Organizations that have contracts of this `groupId` (see `findOrganizationIdsByUserId`). */
+  async findOrganizationIdsByGroupId(groupId: string): Promise<string[]> {
+    const ids = await ContractMongoose.distinct('organizationId', { groupId });
+    return ids.map(id => String(id));
+  }
+
+  /** Which of these userIds already have a contract in the organization. */
+  async findExistingUserIds(organizationId: string, userIds: string[]): Promise<string[]> {
+    if (userIds.length === 0) return [];
+    const ids = await ContractMongoose.distinct('userContact.userId', {
+      organizationId,
+      'userContact.userId': { $in: userIds },
+    });
+    return ids.map(id => String(id));
+  }
+
+  /**
+   * @throws `CONFLICT:` when the organization already has a contract with this
+   *         userId (unique index; also settles concurrent creations).
+   */
   async create(contractData: ContractToCreate): Promise<LeanContract> {
     const contract = new ContractMongoose(contractData);
-    await contract.save();
+    try {
+      await contract.save();
+    } catch (error) {
+      if (isDuplicateKey(error)) {
+        throw new Error(`CONFLICT: Contract for user ${contractData.userContact.userId} already exists`);
+      }
+      throw error;
+    }
     return toPlainObject<LeanContract>(contract.toJSON());
   }
 
@@ -192,7 +234,7 @@ class ContractRepository extends RepositoryBase {
   async update(
     userId: string,
     contractData: Partial<ContractToCreate>,
-    organizationId?: string,
+    organizationId: string,
     guard: Record<string, unknown> = {}
   ): Promise<LeanContract | null> {
     const contract = await ContractMongoose.findOneAndUpdate(
@@ -225,7 +267,7 @@ class ContractRepository extends RepositoryBase {
   async incrementUsageLevels(
     userId: string,
     increments: Record<string, number>,
-    organizationId?: string
+    organizationId: string
   ): Promise<LeanContract | null> {
     const filter: Record<string, unknown> = byUserId(userId, organizationId);
     const inc: Record<string, number> = {};
@@ -305,6 +347,11 @@ class ContractRepository extends RepositoryBase {
    * `options.organizationId` (the organization the contracts belong to before
    * this write, for moves between organizations) or else each contract's own
    * `organizationId`. A contract of another organization never matches.
+   *
+   * Never upserts: a contract that is not there (deleted meanwhile, or of
+   * another organization) is not created by an update. With userIds unique per
+   * organization an upsert would otherwise create a second contract for the
+   * same userId in another organization.
    */
   async bulkUpdate(
     contracts: LeanContract[],
@@ -324,7 +371,7 @@ class ContractRepository extends RepositoryBase {
             disable: disable,
           },
         },
-        upsert: true,
+        upsert: false,
       },
     }));
 
@@ -373,15 +420,16 @@ class ContractRepository extends RepositoryBase {
     return result.deletedCount;
   }
 
-  async destroy(userId: string, organizationId?: string): Promise<void> {
+  async destroy(userId: string, organizationId: string): Promise<void> {
     const result = await ContractMongoose.deleteOne(byUserId(userId, organizationId));
     if (result.deletedCount === 0) {
       throw new Error(`Contract with userId ${userId} not found`);
     }
   }
 
-  async bulkDestroy(userIds: string[]): Promise<number> {
-    const result = await ContractMongoose.deleteMany({ 'userContact.userId': { $in: userIds } });
+  async bulkDestroy(userIds: string[], organizationId: string): Promise<number> {
+    if (!organizationId) throw new Error('An organization is required to delete contracts by userId');
+    const result = await ContractMongoose.deleteMany({ organizationId, 'userContact.userId': { $in: userIds } });
     return result.deletedCount || 0;
   }
 }

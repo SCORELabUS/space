@@ -26,7 +26,8 @@ async function generateTokenFromEvalResult(
   pricingContext: PricingContext,
   subscriptionContext: SubscriptionContext,
   evalResult: DetailedFeatureEvaluation,
-  subscription?: PricingTokenSubscription
+  subscription?: PricingTokenSubscription,
+  organizationId?: string
 ): Promise<string> {
   if (!JWT_SECRET) {
     throw new Error('JWT_SECRET environment variable is not defined!');
@@ -39,6 +40,8 @@ async function generateTokenFromEvalResult(
   const tokenSub = userId;
 
   const payload = {
+    // `sub` (userId) is only unique within an organization.
+    ...(organizationId ? { organizationId } : {}),
     features: evalResult,
     pricingContext: pricingContext,
     subscriptionContext: subscriptionContext,

@@ -73,6 +73,10 @@ async function evaluateFeature(
       // back, so running them concurrently made every one of them start from
       // the same state and only the last write survive.
       if (options.userId) {
+        // A userId is only unique within an organization.
+        if (!options.organizationId) {
+          throw new Error(`An organization is required to consume the usage levels of userId ${options.userId}`);
+        }
         const contractService: ContractService = container.resolve('contractService');
 
         const consumptions: Record<string, number> = {};
