@@ -85,12 +85,23 @@ export function computeContractVersion(contract: VersionedContract): string {
   return `${historyLength}-${digest}`;
 }
 
-/** Strip the quotes (and weak prefix) of an entity tag. `*` is returned as is. */
-export function parseEntityTag(header?: string): string | undefined {
-  if (!header) return undefined;
-  const value = header.trim();
-  if (value === '*') return value;
-  return value.replace(/^W\//, '').replace(/^"(.*)"$/, '$1');
+/**
+ * The entity tags of an `If-Match` header, for strong comparison (RFC 9110):
+ * quoted tags are unquoted, a bare tag is taken as is, weak tags (`W/"..."`) are
+ * left out because they never match, and `*` is returned as `['*']`. A missing
+ * or empty header gives undefined; a header of weak tags only gives `[]`, which
+ * matches no version.
+ */
+export function parseIfMatch(header?: string): string[] | undefined {
+  const value = header?.trim();
+  if (!value) return undefined;
+  if (value === '*') return ['*'];
+  const tags: string[] = [];
+  for (const match of value.matchAll(/(W\/)?"([^"]*)"|([^\s,"]+)/g)) {
+    if (match[1]) continue;
+    tags.push(match[2] ?? match[3]);
+  }
+  return tags;
 }
 
 /** Pin an array to exactly `length` elements (a missing array counts as empty). */

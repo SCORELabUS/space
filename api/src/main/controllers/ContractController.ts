@@ -10,7 +10,7 @@ import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils';
 import {
   ContractChangedError,
   computeContractVersion,
-  parseEntityTag,
+  parseIfMatch,
 } from '../utils/contracts/version';
 
 /** Add `contractVersion` to a contract response (see `computeContractVersion`). */
@@ -48,18 +48,22 @@ function sendContractChanged(res: any, err: ContractChangedError) {
 }
 
 /**
- * The version a novation is conditional on: `If-Match` or the body field
+ * The versions a novation is conditional on: the strong tags of `If-Match`
+ * (several may be listed; weak tags never match) or the body field
  * `expectedContractVersion` (removed from the body). Both may be given only if
- * they agree.
+ * the header lists the body's version (or is `*`).
  */
-function expectedVersionOf(req: any): string | undefined {
-  const header = parseEntityTag(req.get?.('If-Match'));
+function expectedVersionOf(req: any): string[] | undefined {
+  const header = parseIfMatch(req.get?.('If-Match'));
   const fromBody = req.body?.expectedContractVersion;
   if (req.body && 'expectedContractVersion' in req.body) delete req.body.expectedContractVersion;
-  if (header !== undefined && fromBody !== undefined && header !== fromBody) {
-    throw new Error('Invalid precondition: If-Match and expectedContractVersion differ');
+  if (fromBody !== undefined) {
+    if (header !== undefined && !header.includes(fromBody) && !header.includes('*')) {
+      throw new Error('Invalid precondition: If-Match and expectedContractVersion differ');
+    }
+    return [fromBody];
   }
-  return header ?? fromBody;
+  return header;
 }
 
 class ContractController {
@@ -208,6 +212,13 @@ class ContractController {
         res.status(400).send({
           error:
             'Invalid precondition: If-Match cannot name the versions of several contracts; use expectedContractVersions',
+        });
+        return;
+      }
+      if (req.body && 'expectedContractVersion' in req.body) {
+        res.status(400).send({
+          error:
+            'Invalid precondition: expectedContractVersion names the version of one contract; use expectedContractVersions (userId -> contractVersion)',
         });
         return;
       }

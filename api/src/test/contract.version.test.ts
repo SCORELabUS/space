@@ -174,12 +174,29 @@ describe('Contract version and conditional novation', function () {
       expect(response.headers.etag).toBe(`"${response.body.contractVersion}"`);
     });
 
-    it('accepts weak and unquoted entity tags', async function () {
-      const weak = await novate(subscription('PLATINUM'), `W/"${(await read()).body.contractVersion}"`);
-      const bare = await novate(subscription('GOLD'), (await read()).body.contractVersion);
+    it('compares strongly: a weak tag never matches, so nothing is written', async function () {
+      const current = (await read()).body.contractVersion;
+      const weak = await novate(subscription('PLATINUM'), `W/"${current}"`);
 
-      expect(weak.status).toBe(200);
+      expect(weak.status).toBe(412);
+      expect(weak.body.contractVersion).toBe(current);
+      expect((await stored()).subscriptionPlans[serviceName]).toBe('GOLD');
+    });
+
+    it('accepts a list of tags that includes the current version, and an unquoted tag', async function () {
+      const listed = await novate(subscription('PLATINUM'), `"0-0000000000000000", "${(await read()).body.contractVersion}"`);
+      const bare = await novate(subscription('GOLD'), (await read()).body.contractVersion);
+      const stale = await novate(subscription('PLATINUM'), `"0-0000000000000000", W/"${(await read()).body.contractVersion}"`);
+
+      expect(listed.status).toBe(200);
       expect(bare.status).toBe(200);
+      expect(stale.status).toBe(412);
+    });
+
+    it('exposes ETag to browser clients through CORS', async function () {
+      const response = await read().set('Origin', 'http://localhost:5403');
+
+      expect(String(response.headers['access-control-expose-headers']).toLowerCase()).toContain('etag');
     });
 
     it('refuses with 412 and the current version when the contract changed, writing nothing', async function () {
@@ -329,6 +346,21 @@ describe('Contract version and conditional novation', function () {
       expect(ok.status).toBe(200);
       expect(ok.body.every((contract: any) => contract.subscriptionPlans[serviceName] === 'BASIC')).toBe(true);
       expect(ok.body.every((contract: any) => typeof contract.contractVersion === 'string')).toBe(true);
+    });
+
+    it('rejects the single-contract expectedContractVersion instead of ignoring it', async function () {
+      const groupId = `group-${uuidv4()}`;
+      const member = (await createContract(groupId)).body;
+
+      const response = await request(app)
+        .put(`${baseUrl}/contracts?groupId=${groupId}`)
+        .set('x-api-key', orgKey)
+        .send({ ...subscription('BASIC', {}), expectedContractVersion: member.contractVersion });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toContain('expectedContractVersions');
+      const after = (await ContractMongoose.findOne({ 'userContact.userId': member.userContact.userId }).lean()) as any;
+      expect(after.subscriptionPlans[serviceName]).toBe('GOLD');
     });
 
     it('rejects If-Match, which cannot name the version of several contracts', async function () {

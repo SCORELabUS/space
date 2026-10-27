@@ -2836,7 +2836,7 @@ paths:
         '412':
           $ref: '#/components/responses/ContractChanged'
         '400':
-          description: Missing groupId, or an `If-Match` header (use `expectedContractVersions` for groups)
+          description: Missing groupId, or an `If-Match` header or `expectedContractVersion` field (use `expectedContractVersions` for groups)
 
     delete:
       summary: Delete all contracts in organization
@@ -3230,7 +3230,7 @@ paths:
         '412':
           $ref: '#/components/responses/ContractChanged'
         '400':
-          description: Missing groupId, or an `If-Match` header (use `expectedContractVersions` for groups)
+          description: Missing groupId, or an `If-Match` header or `expectedContractVersion` field (use `expectedContractVersions` for groups)
 
     delete:
       summary: Delete all contracts
@@ -4320,7 +4320,7 @@ components:
         novation or SPHERE migration, also when a novation returns to an earlier subscription. Recording usage
         does not change it. Treat it as an opaque string: compare it for equality and send it back in
         `If-Match` (or `expectedContractVersion`). Single-contract responses also carry it as
-        `ETag: "<contractVersion>"`.
+        `ETag: "<contractVersion>"`, which CORS exposes to browser clients.
       example: 3-9f86d081884c7d65
 
     ContractChanged:
@@ -4598,7 +4598,9 @@ components:
                 type: string
                 description: |
                   `PUT /contracts/{userId}` only. Apply the novation only if the contract still has this
-                  `contractVersion`; otherwise answer `412`. Same as `If-Match`; if both are sent they must agree.
+                  `contractVersion`; otherwise answer `412`. Same as `If-Match`; if both are sent, `If-Match`
+                  must list this version (or be `*`). On `PUT /contracts?groupId=` it answers `400`: use
+                  `expectedContractVersions`.
               expectedContractVersions:
                 type: object
                 description: |
@@ -4728,9 +4730,10 @@ components:
       in: header
       required: false
       description: |
-        `"<contractVersion>"` the novation is conditional on (weak tags and unquoted values are accepted;
-        `*` matches any current version). On mismatch the request fails with `412 CONTRACT_CHANGED` and
-        nothing is written. Without it (and without `expectedContractVersion`) the novation is unconditional,
+        `"<contractVersion>"` the novation is conditional on, or a comma-separated list of them (any one
+        may match). Comparison is strong: weak tags (`W/"..."`) never match. An unquoted value is taken as
+        one tag, and `*` matches any current version. On mismatch the request fails with
+        `412 CONTRACT_CHANGED` and nothing is written. Without it (and without `expectedContractVersion`) the novation is unconditional,
         as before.
       schema:
         type: string

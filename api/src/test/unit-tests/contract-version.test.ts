@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeContractVersion, parseEntityTag } from '../../main/utils/contracts/version';
+import { computeContractVersion, parseIfMatch } from '../../main/utils/contracts/version';
 
 const base = () => ({
   contractedServices: { petclinic: '2025-03-26' },
@@ -79,12 +79,21 @@ describe('computeContractVersion', () => {
   });
 });
 
-describe('parseEntityTag', () => {
-  it('accepts strong, weak, unquoted and wildcard tags', () => {
-    expect(parseEntityTag('"1-abc"')).toBe('1-abc');
-    expect(parseEntityTag('W/"1-abc"')).toBe('1-abc');
-    expect(parseEntityTag('1-abc')).toBe('1-abc');
-    expect(parseEntityTag(' * ')).toBe('*');
-    expect(parseEntityTag(undefined)).toBeUndefined();
+describe('parseIfMatch', () => {
+  it('returns the strong tags of the header, unquoted', () => {
+    expect(parseIfMatch('"1-abc"')).toEqual(['1-abc']);
+    expect(parseIfMatch('1-abc')).toEqual(['1-abc']);
+    expect(parseIfMatch('"1-abc", "2-def"')).toEqual(['1-abc', '2-def']);
+  });
+
+  it('leaves out weak tags, which never match under strong comparison', () => {
+    expect(parseIfMatch('W/"1-abc"')).toEqual([]);
+    expect(parseIfMatch('W/"1-abc", "2-def"')).toEqual(['2-def']);
+  });
+
+  it('keeps the wildcard and ignores a missing header', () => {
+    expect(parseIfMatch(' * ')).toEqual(['*']);
+    expect(parseIfMatch(undefined)).toBeUndefined();
+    expect(parseIfMatch('')).toBeUndefined();
   });
 });

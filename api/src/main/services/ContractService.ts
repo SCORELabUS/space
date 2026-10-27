@@ -250,17 +250,21 @@ class ContractService {
 
   /**
    * @param options.expectedContractVersion when given, the novation only applies
-   *        to this version of the contract (see `computeContractVersion`); `*`
-   *        stands for whatever version is current when the contract is read.
-   *        The write is conditional, so a change that lands between the read
-   *        and the write is not overwritten. A mismatch throws
-   *        `ContractChangedError` and writes nothing.
+   *        to this version of the contract (see `computeContractVersion`), or to
+   *        any of them when several are given; `*` stands for whatever version
+   *        is current when the contract is read. The write is conditional on
+   *        what the version covers (subscription, billing period, histories),
+   *        so a novation that lands between the read and the write is not
+   *        overwritten. A mismatch throws `ContractChangedError` and writes
+   *        nothing. Usage levels are not part of the version: the write still
+   *        sets the whole contract as read, so consumption recorded in that
+   *        window (`$inc`) can be lost, with or without a precondition.
    */
   async novate(
     userId: string,
     newSubscription: any,
     organizationId?: string,
-    options: { expectedContractVersion?: string } = {}
+    options: { expectedContractVersion?: string | string[] } = {}
   ): Promise<LeanContract> {
     let contract = await this._findContract(userId, organizationId);
     let guard: Record<string, unknown> = {};
@@ -273,7 +277,8 @@ class ContractService {
         throw new Error(`Contract with userId ${userId} not found`);
       }
       const current = computeContractVersion(stored);
-      if (expected !== '*' && expected !== current) {
+      const accepted = Array.isArray(expected) ? expected : [expected];
+      if (!accepted.includes('*') && !accepted.includes(current)) {
         throw new ContractChangedError(current);
       }
       contract = stored;
