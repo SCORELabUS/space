@@ -60,6 +60,10 @@ export default class SphereSyncService {
     });
   }
   async historicalPricing(organizationId: string, name: string, version: string) {
+    return parsePricingToSpacePricingObject(retrievePricingFromText(await this.historicalPricingYaml(organizationId, name, version)));
+  }
+  /** The SPHERE source text of a version SPACE does not keep, checked against the manifest's content hash. */
+  async historicalPricingYaml(organizationId: string, name: string, version: string): Promise<string> {
     const service: any = await this.repository.service({ organizationId, name, source: 'sphere' });
     if (!service) throw new Error('Historical pricing not found');
     const manifest = await this.client.manifest(service.sphere.pricingId);
@@ -67,7 +71,7 @@ export default class SphereSyncService {
     if (!remote) throw new Error('Historical version is no longer public in SPHERE');
     const text = await this.client.yaml(service.sphere.pricingId, remote.versionId);
     if (functionalHash(text) !== remote.contentHash) throw new Error('Historical version changed during retrieval');
-    return parsePricingToSpacePricingObject(retrievePricingFromText(text));
+    return text;
   }
   async get(organizationId: string, name: string) {
     const service: any = await this.repository.service({ organizationId, name });

@@ -1,5 +1,6 @@
 import container from '../config/container.js';
-import ServiceService from '../services/ServiceService.js';
+import { createHash } from 'node:crypto';
+import ServiceService, { PricingYamlUnavailableError } from '../services/ServiceService.js';
 import { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository.js';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import { FallBackSubscription } from '../types/models/Contract.js';
@@ -105,6 +106,15 @@ class ServiceController {
         return res.status(400).send({ error: 'Organization ID is required. You can either provide an organization scoped API key or use the /organizations/*/services/** paths' });
       }
 
+      const format = req.query.format ?? 'json';
+      if (format !== 'json' && format !== 'yaml') {
+        return res.status(400).send({ error: 'Invalid format: use "json" (default) or "yaml"' });
+      }
+
+      if (format === 'yaml') {
+        return await this._sendPricingYaml(req, res, serviceName, pricingVersion, organizationId);
+      }
+
       const pricing = await this.serviceService.showPricing(serviceName, pricingVersion, organizationId);
 
       resetEscapePricingVersion(pricing);
@@ -112,6 +122,42 @@ class ServiceController {
       return res.json(pricing);
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
+        res.status(404).send({ error: err.message });
+      } else {
+        res.status(500).send({ error: err.message });
+      }
+    }
+  }
+
+  /**
+   * The Pricing2Yaml file of a version: `application/yaml`, a strong ETag
+   * (sha256 of the body), `X-Pricing-Syntax-Version`, and 304 for a matching
+   * `If-None-Match`.
+   */
+  async _sendPricingYaml(req: any, res: any, serviceName: string, pricingVersion: string, organizationId: string) {
+    try {
+      const { body, syntaxVersion } = await this.serviceService.showPricingYaml(
+        serviceName,
+        pricingVersion,
+        organizationId
+      );
+      const etag = `"${createHash('sha256').update(body).digest('hex')}"`;
+
+      res.set('ETag', etag);
+      res.set('Cache-Control', 'private, no-cache');
+      if (syntaxVersion) res.set('X-Pricing-Syntax-Version', syntaxVersion);
+
+      const ifNoneMatch: string | undefined = req.get('If-None-Match');
+      const tags = (ifNoneMatch ?? '').split(',').map(tag => tag.trim().replace(/^W\//, ''));
+      if (ifNoneMatch && (tags.includes(etag) || tags.includes('*'))) {
+        return res.status(304).end();
+      }
+
+      res.status(200).type('application/yaml; charset=utf-8').send(body);
+    } catch (err: any) {
+      if (err instanceof PricingYamlUnavailableError) {
+        res.status(404).send({ error: 'PRICING_YAML_UNAVAILABLE', message: err.message });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
         res.status(500).send({ error: err.message });

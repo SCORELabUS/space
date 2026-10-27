@@ -22,6 +22,26 @@ import { escapeVersion } from '../utils/helpers';
 import { resetEscapeVersionInService } from '../utils/services/helpers';
 import CacheService from './CacheService';
 import OrganizationRepository from '../repositories/mongoose/OrganizationRepository';
+import yaml from 'js-yaml';
+
+/** A pricing version exists, but its Pricing2Yaml file cannot be provided. */
+export class PricingYamlUnavailableError extends Error {
+  constructor(serviceName: string, pricingVersion: string) {
+    super(`PRICING_YAML_UNAVAILABLE: The Pricing2Yaml file of version ${pricingVersion} of service ${serviceName} is not available`);
+    this.name = 'PricingYamlUnavailableError';
+  }
+}
+
+/** `syntaxVersion` of a Pricing2Yaml document, without trusting the rest of it. */
+function readSyntaxVersion(body: Buffer): string | undefined {
+  try {
+    const document = yaml.load(body.toString('utf8')) as { syntaxVersion?: unknown } | undefined;
+    const value = document?.syntaxVersion;
+    return typeof value === 'string' || typeof value === 'number' ? String(value) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 class ServiceService {
   private readonly serviceRepository: ServiceRepository;
@@ -243,6 +263,76 @@ class ServiceService {
     if (service.activePricings?.get(formattedPricingVersion)) return 'active';
     if (service.archivedPricings?.get(formattedPricingVersion)) return 'archived';
     return 'missing';
+  }
+
+  /**
+   * The stored Pricing2Yaml file of a pricing version, byte for byte.
+   *
+   * Uploaded versions and retained SPHERE snapshots are read from their
+   * `yamlPath`. Historical SPHERE versions, of which SPACE keeps no copy, are
+   * fetched from SPHERE and checked against the content hash of its manifest.
+   * Versions that exist but whose file is not available raise
+   * `PricingYamlUnavailableError`; unknown versions raise a `NOT FOUND` error.
+   */
+  async showPricingYaml(
+    serviceName: string,
+    pricingVersion: string,
+    organizationId: string
+  ): Promise<{ body: Buffer; syntaxVersion?: string }> {
+    const cacheKey = `service.${organizationId}.${serviceName}`;
+    let service = await this.cacheService.get(cacheKey);
+
+    if (!service) {
+      service = await this.serviceRepository.findByName(serviceName, organizationId);
+    }
+
+    if (!service) {
+      throw new Error(`NOT FOUND: Service with name ${serviceName}`);
+    }
+
+    const formattedPricingVersion = escapeVersion(pricingVersion);
+    const pricingLocator =
+      service.activePricings?.get(formattedPricingVersion) ??
+      service.archivedPricings?.get(formattedPricingVersion);
+
+    let body: Buffer | undefined;
+
+    if (pricingLocator?.id) {
+      const pricing = await this.showPricing(serviceName, pricingVersion, organizationId);
+      body = pricing?.yamlPath ? this._readStoredPricingYaml(pricing.yamlPath) : undefined;
+    } else if (pricingLocator?.url) {
+      body = pricingLocator.url.startsWith('public/')
+        ? this._readStoredPricingYaml(pricingLocator.url.slice('public'.length))
+        : undefined;
+    } else if (service.source === 'sphere') {
+      const text = await container
+        .resolve('sphereSyncService')
+        .historicalPricingYaml(organizationId, service.name, pricingVersion)
+        .catch(() => undefined);
+      body = text === undefined ? undefined : Buffer.from(text, 'utf8');
+    } else {
+      throw new Error(`NOT FOUND: Pricing version ${pricingVersion} not found for service ${serviceName}`);
+    }
+
+    if (!body) {
+      throw new PricingYamlUnavailableError(serviceName, pricingVersion);
+    }
+
+    return { body, syntaxVersion: readSyntaxVersion(body) };
+  }
+
+  /** Read a file under `public/static/pricings` by its public path, or undefined. */
+  _readStoredPricingYaml(publicPath: string): Buffer | undefined {
+    const root = path.resolve('public', 'static', 'pricings');
+    const file = path.resolve('public', `.${publicPath.startsWith('/') ? '' : '/'}${publicPath}`);
+    if (!file.startsWith(root + path.sep)) {
+      return undefined;
+    }
+    try {
+      return fs.readFileSync(file);
+    } catch {
+      return undefined;
+    }
   }
 
   async showPublicPricingUrl(serviceName: string, pricingVersion: string, organizationId: string) {
