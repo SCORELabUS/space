@@ -111,6 +111,38 @@ info:
     Renewable usage levels are renewed once per period: `consumed` goes back to 0 and `resetTimeStamp`
     moves forward by whole periods.
 
+    ## Idempotency-Key
+
+    Writes that must not be applied twice when a client retries them accept an `Idempotency-Key` header
+    (1 to 255 characters): single-feature evaluations that consume or revert (`POST
+    /features/{userId}/{featureId}`), usage level changes (`PUT /contracts/{userId}/usageLevels`), contract
+    creation (`POST /contracts`, `POST /organizations/{organizationId}/contracts`) and novations (`PUT
+    /contracts/{userId}`, `PUT /organizations/{organizationId}/contracts/{userId}`, `PUT /contracts?groupId=`,
+    `PUT /organizations/{organizationId}/contracts?groupId=`). Reads never look at it.
+
+    - The key is scoped to the organization of the request (the organization API key's, or the route's for
+      user API keys; a platform ADMIN on a direct route without `organizationId` has keys of their own).
+      Two organizations may use the same key independently.
+    - It is bound to the request it was first used for: method, route, path parameters, query, JSON body
+      and `If-Match`. The same key with the same request replays the stored status, body and `ETag` with
+      `Idempotent-Replayed: true`, and applies nothing. The same key with another request answers
+      `409 IDEMPOTENCY_CONFLICT` and applies nothing.
+    - Concurrent requests with the same key: exactly one runs; the others wait for it briefly and replay
+      its response, or answer `409 IDEMPOTENCY_IN_PROGRESS` with `Retry-After` while it is still running.
+    - Every response below 500 is stored (except `401`, `403`, `408`, `429`), so a retry gets the answer of
+      the first attempt; for example a novation that succeeded with `If-Match` is replayed as `200` even
+      though the version it named is no longer current. A `5xx` is not stored: retrying with the same key
+      runs the request again.
+    - Keys are kept for `IDEMPOTENCY_KEY_TTL_SECONDS` (default 24 hours); after that the same key starts a
+      new request.
+
+    How hosts should use it: generate a new random key (a UUID) for each operation, before the first
+    attempt, and keep it with the operation (for example in the job or outbox row that issues the call).
+    Send the same key on every retry of that operation (timeouts, connection errors, `5xx`, `409
+    IDEMPOTENCY_IN_PROGRESS` after `Retry-After`) and never for a different operation. After a `4xx` that
+    you correct (a different body or `If-Match`), send the corrected request with a new key. Check the
+    `idempotency-key` capability before relying on it: an older SPACE ignores the header.
+
     ## Organization isolation of contracts
 
     Contracts are addressed by `userId`, which is chosen by the host application. Every route that takes a
@@ -242,6 +274,7 @@ info:
     - `reject-private`: the opt-in `rejectPrivate` option (query or body) of contract creation and novations, which rejects private plans and add-ons.
     - `pricing-yaml`: `GET .../pricings/{version}?format=yaml` returns the stored Pricing2Yaml file.
     - `new-contracts-version`: `GET .../pricings/new-contracts` and the optional service `defaultVersion`.
+    - `idempotency-key`: the `Idempotency-Key` header on consumptions, usage level changes, contract creation and novations (see "Idempotency-Key").
     - `contract-pricings`: `GET /contracts/{userId}/pricings`.
     - `novation-preview`: `POST /contracts/{userId}/novation/preview`.
     - `token-subscription`: the pricing token carries the `subscription` claim.
@@ -3273,6 +3306,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - name: organizationId
           in: path
           required: true
@@ -3285,6 +3319,8 @@ paths:
         '201':
           description: Contract created
           headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
             ETag:
               $ref: '#/components/headers/ContractETag'
           content:
@@ -3296,7 +3332,15 @@ paths:
         '400':
           $ref: '#/components/responses/InvalidSubscription'
         '409':
-          description: The caller's organization already has a contract for this `userId` (a `userId` of another organization does not conflict)
+          description: |
+            The caller's organization already has a contract for this `userId` (a `userId` of another
+            organization does not conflict), or `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was used for a different request; `IDEMPOTENCY_IN_PROGRESS` (with `Retry-After`): a request with this key is still running.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/IdempotencyProblem'
+                  - $ref: '#/components/schemas/Error'
 
     put:
       summary: Update contracts by group ID
@@ -3317,6 +3361,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/KeepBillingPeriod'
         - $ref: '#/components/parameters/RejectPrivate'
         - name: userId
@@ -3334,6 +3379,9 @@ paths:
       responses:
         '200':
           description: Contracts updated
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
           content:
             application/json:
               schema:
@@ -3353,6 +3401,8 @@ paths:
                 $ref: '#/components/schemas/InvalidSubscription'
         '404':
           description: Contract (or group) not found, or every subscription problem is a missing plan, add-on or version (`InvalidSubscription`)
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
 
     delete:
       summary: Delete all contracts in organization
@@ -3437,6 +3487,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/KeepBillingPeriod'
         - $ref: '#/components/parameters/RejectPrivate'
         - $ref: '#/components/parameters/IfMatchContractVersion'
@@ -3456,6 +3507,8 @@ paths:
         '200':
           description: Contract updated
           headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
             ETag:
               $ref: '#/components/headers/ContractETag'
           content:
@@ -3476,6 +3529,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InvalidSubscription'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
 
     delete:
       summary: Delete contract
@@ -3796,6 +3851,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/RejectPrivate'
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCreation'
@@ -3803,6 +3859,8 @@ paths:
         '201':
           description: Contract created
           headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
             ETag:
               $ref: '#/components/headers/ContractETag'
           content:
@@ -3812,7 +3870,15 @@ paths:
         '400':
           $ref: '#/components/responses/InvalidSubscription'
         '409':
-          description: The caller's organization already has a contract for this `userId` (a `userId` of another organization does not conflict)
+          description: |
+            The caller's organization already has a contract for this `userId` (a `userId` of another
+            organization does not conflict), or `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was used for a different request; `IDEMPOTENCY_IN_PROGRESS` (with `Retry-After`): a request with this key is still running.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/IdempotencyProblem'
+                  - $ref: '#/components/schemas/Error'
     
     put:
       summary: Update contracts by group ID
@@ -3833,6 +3899,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/AdminContractOrganizationId'
         - $ref: '#/components/parameters/KeepBillingPeriod'
         - $ref: '#/components/parameters/RejectPrivate'
@@ -3846,6 +3913,9 @@ paths:
       responses:
         '200':
           description: Contracts updated
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
           content:
             application/json:
               schema:
@@ -3868,6 +3938,8 @@ paths:
                   - $ref: '#/components/schemas/OrganizationIdRequiredError'
         '404':
           description: Contract (or group) not found, or every subscription problem is a missing plan, add-on or version (`InvalidSubscription`)
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
 
     delete:
       summary: Delete all contracts
@@ -3992,6 +4064,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/AdminContractOrganizationId'
         - $ref: '#/components/parameters/KeepBillingPeriod'
         - $ref: '#/components/parameters/RejectPrivate'
@@ -4007,6 +4080,8 @@ paths:
         '200':
           description: Contract updated
           headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
             ETag:
               $ref: '#/components/headers/ContractETag'
           content:
@@ -4028,6 +4103,8 @@ paths:
                 oneOf:
                   - $ref: '#/components/schemas/InvalidSubscription'
                   - $ref: '#/components/schemas/OrganizationIdRequiredError'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
 
     delete:
       summary: Delete contract
@@ -4170,6 +4247,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/AdminContractOrganizationId'
         - name: userId
           in: path
@@ -4182,6 +4260,8 @@ paths:
         '200':
           description: Usage levels reset
           headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
             ETag:
               $ref: '#/components/headers/ContractETag'
           content:
@@ -4197,19 +4277,41 @@ paths:
             Nothing was changed. `code` is `SERVICE_DISABLED` / `SERVICE_NOT_FOUND` when the body increments a
             usage level of a service that is dormant in the contract (see "Disabling and deleting services"), or
             when `usageLimit` only names usage levels of dormant services. Resets (`reset=true`) leave the usage
-            levels of dormant services as they are.
+            levels of dormant services as they are. `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was already used
+            for a different request; `IDEMPOTENCY_IN_PROGRESS` (with `Retry-After`): a request with this key is
+            still being processed; retry after `Retry-After` seconds with the same key.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying (`IDEMPOTENCY_IN_PROGRESS` only).
+              schema:
+                type: integer
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  error:
-                    type: string
-                  code:
-                    type: string
-                    enum: [SERVICE_DISABLED, SERVICE_NOT_FOUND]
-                  service:
-                    type: string
+                oneOf:
+                  - type: object
+                    required: [error, code, service]
+                    properties:
+                      error:
+                        type: string
+                      code:
+                        type: string
+                        enum: [SERVICE_DISABLED, SERVICE_NOT_FOUND]
+                      service:
+                        type: string
+                  - $ref: '#/components/schemas/IdempotencyProblem'
+              examples:
+                serviceDisabled:
+                  summary: Increment of a usage level of a disabled service
+                  value:
+                    error: 'Service petclinic is disabled in this organization: its features are not available and its usage levels cannot change until it is enabled again (upload a pricing with saasName petclinic)'
+                    code: SERVICE_DISABLED
+                    service: petclinic
+                idempotencyConflict:
+                  summary: The Idempotency-Key was used for a different request
+                  value:
+                    error: Idempotency-Key was already used for a different request
+                    code: IDEMPOTENCY_CONFLICT
 
   /contracts/{userId}/userContact:
     put:
@@ -4519,6 +4621,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - name: userId
           in: path
           required: true
@@ -4580,6 +4683,9 @@ paths:
                 petclinic-maxPets: 1
       responses:
         '200':
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
           content:
             application/json:
               schema:
@@ -4621,14 +4727,17 @@ paths:
         '409':
           description: |
             Nothing was changed, because either:
-            - the contract kept changing while the consumption was being applied; retry (`error` only); or
+            - the contract kept changing while the consumption was being applied; retry (`error` only);
             - `revert=true` (with or without `consumptionId`) on a consumption with a usage level of a service
               that the contract no longer has: it cannot be reverted exactly, nothing is subtracted and it is
-              not marked reverted (`error` only); or
+              not marked reverted (`error` only);
             - `revert=true` on a feature of a service of the contract that is disabled (`SERVICE_DISABLED`; it is
               dormant until a pricing with its saasName is uploaded again) or that the organization no longer
               has (`SERVICE_NOT_FOUND`), with or without `consumptionId`. The consumption is not reverted and
-              stays revertible: once the service is enabled again, the same revert applies.
+              stays revertible: once the service is enabled again, the same revert applies (with an
+              `Idempotency-Key`, this answer is stored for the key like any other below 500, so use a new key); or
+            - `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was used for a different request;
+              `IDEMPOTENCY_IN_PROGRESS` (with `Retry-After`): a request with this key is still running.
           content:
             application/json:
               schema:
@@ -4644,6 +4753,7 @@ paths:
                         enum: [SERVICE_DISABLED, SERVICE_NOT_FOUND]
                       service:
                         type: string
+                  - $ref: '#/components/schemas/IdempotencyProblem'
               examples:
                 contractChanged:
                   summary: The contract kept changing while consuming
@@ -4655,6 +4765,11 @@ paths:
                     error: 'Service petclinic is disabled in this organization: its features are not available and its usage levels cannot change until it is enabled again (upload a pricing with saasName petclinic)'
                     code: SERVICE_DISABLED
                     service: petclinic
+                idempotencyConflict:
+                  summary: The Idempotency-Key was used for a different request
+                  value:
+                    error: Idempotency-Key was already used for a different request
+                    code: IDEMPOTENCY_CONFLICT
 
   /analytics/api-calls:
     get:
@@ -5039,6 +5154,18 @@ components:
           type: string
       required:
         - error
+
+    IdempotencyProblem:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          enum: [IDEMPOTENCY_CONFLICT, IDEMPOTENCY_IN_PROGRESS, IDEMPOTENCY_KEY_INVALID]
+      required:
+        - error
+        - code
 
     FieldValidationError:
       type: object
@@ -6078,6 +6205,13 @@ components:
               maxVisits: 5
 
   headers:
+    IdempotentReplayed:
+      description: |
+        `true` when the response is the stored response of an earlier request with the same
+        `Idempotency-Key` (nothing was applied again). Absent otherwise.
+      schema:
+        type: string
+        enum: ['true']
     ContractETag:
       description: '`"<contractVersion>"` of the returned contract.'
       schema:
@@ -6085,6 +6219,21 @@ components:
       example: '"3-9f86d081884c7d65"'
 
   responses:
+    IdempotencyConflict:
+      description: |
+        `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was already used for a different request (method,
+        route, path parameters, query, body or `If-Match`); nothing was applied. Use a new key for a new
+        request. `IDEMPOTENCY_IN_PROGRESS`: a request with this key is still being processed; retry after
+        `Retry-After` seconds with the same key.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying (`IDEMPOTENCY_IN_PROGRESS` only).
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IdempotencyProblem'
     InvalidSubscription:
       description: |
         The subscription is not valid. `errors` lists every problem with a stable `code`. Contract creation always
@@ -6219,6 +6368,22 @@ components:
       schema:
         type: boolean
         default: false
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Makes the request apply at most once (capability `idempotency-key`; see "Idempotency-Key"). 1 to
+        255 characters, unique per operation within the organization (a UUID). Repeating the same request
+        with the same key replays the first response with `Idempotent-Replayed: true`; another request with
+        the same key answers `409 IDEMPOTENCY_CONFLICT`. Without it the request is handled as before. On a
+        single-feature evaluation it only applies when the request consumes or reverts. `400
+        IDEMPOTENCY_KEY_INVALID` for an empty or longer key.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+      example: 6f1c2b8e-3f4a-4b7e-9d21-0c5a7e8b9f10
     IfMatchContractVersion:
       name: If-Match
       in: header
