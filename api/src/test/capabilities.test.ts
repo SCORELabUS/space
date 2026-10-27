@@ -23,6 +23,7 @@ const EXPECTED = [
   'token-subscription',
   'contract-events',
   'sphere-private',
+  'contract-userid-per-org',
 ];
 
 const tokens = (response: request.Response) =>

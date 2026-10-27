@@ -69,11 +69,29 @@ info:
     `/features/{userId}/**`) only finds contracts of the caller's organization: the organization of the
     organization API key, or the `organizationId` of the route for user API keys (also for platform ADMIN
     users). A contract of another organization is reported as `404`, exactly like a `userId` that does not
-    exist. Only a platform ADMIN user calling the direct `/contracts/{userId}` routes is not confined.
+    exist. Only a platform ADMIN user calling the direct `/contracts/{userId}` routes is not confined (see
+    below).
 
-    Known limitation: `userId` is still unique across the whole server, not per organization. Creating a
-    contract (`POST /contracts`) with a `userId` that a contract of another organization already uses
-    answers `409`, so two organizations cannot use the same `userId` yet.
+    ## userId unique per organization
+
+    A `userId` is unique within an organization, not across the server: two organizations may each have a
+    contract for user `42` (unique index `{ organizationId, userContact.userId }`). `POST /contracts` answers
+    `409` only for a `userId` the caller's own organization already uses; a `userId` of another organization
+    neither conflicts nor is revealed. Moving a service to another organization (`PUT /services/{serviceName}`
+    with `organizationId`) answers `409` when a contract it would move has a `userId` the target organization
+    already uses, and changes nothing.
+
+    Contract events and pricing tokens identify the contract by organization and `userId`: events carry
+    `details.organizationId` and only reach that organization; pricing tokens carry the `organizationId`
+    claim next to `sub` (the `userId`), and verifiers that serve several organizations should check both.
+
+    Platform ADMIN users on the direct routes (`/contracts/{userId}/**`, `PUT /contracts?groupId=`,
+    `PUT /contracts/billingPeriod?groupId=`) name the organization with the `organizationId` query
+    parameter, or use the organization-scoped routes. Without it the request works as before when exactly
+    one organization has that `userId` (or `groupId`), and answers `409` with `code: AMBIGUOUS_USER_ID`
+    (`AMBIGUOUS_GROUP_ID`) and the `organizationIds` that have it when several do, changing nothing. `GET` and
+    `DELETE /contracts` also accept `organizationId` to list or prune one organization. Any other caller
+    already has an organization: `organizationId` may repeat it, and anything else answers `403`.
 
     ## Capabilities
 
@@ -93,6 +111,7 @@ info:
     - `token-subscription`: the pricing token carries the `subscription` claim.
     - `contract-events`: authenticated Socket.IO namespace `/contracts` with contract events.
     - `sphere-private`: SPHERE-linked services accept a write-only `sphereApiKey` to read private versions (`sphere.hasApiKey`); private versions are never served statically.
+    - `contract-userid-per-org`: a `userId` is unique per organization (see above), pricing tokens carry `organizationId`, and the direct routes accept `organizationId` for platform ADMIN users (`409 AMBIGUOUS_USER_ID` otherwise when ambiguous).
 
   contact:
     email: agarcia29@us.es
@@ -3054,6 +3073,8 @@ paths:
           description: Forbidden
         '400':
           $ref: '#/components/responses/InvalidSubscription'
+        '409':
+          description: The caller's organization already has a contract for this `userId` (a `userId` of another organization does not conflict)
 
     put:
       summary: Update contracts by group ID
@@ -3388,6 +3409,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - name: username
           in: query
           required: false
@@ -3567,6 +3589,8 @@ paths:
                 $ref: '#/components/schemas/Contract'
         '400':
           $ref: '#/components/responses/InvalidSubscription'
+        '409':
+          description: The caller's organization already has a contract for this `userId` (a `userId` of another organization does not conflict)
     
     put:
       summary: Update contracts by group ID
@@ -3587,6 +3611,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - $ref: '#/components/parameters/KeepBillingPeriod'
         - $ref: '#/components/parameters/RejectPrivate'
         - name: groupId
@@ -3618,6 +3643,8 @@ paths:
                 $ref: '#/components/schemas/InvalidSubscription'
         '404':
           description: Contract (or group) not found, or every subscription problem is a missing plan, add-on or version (`InvalidSubscription`)
+        '409':
+          $ref: '#/components/responses/AmbiguousContractScope'
 
     delete:
       summary: Delete all contracts
@@ -3636,6 +3663,8 @@ paths:
         - Contracts
       security:
         - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
       responses:
         '204':
           description: All contracts deleted
@@ -3660,6 +3689,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - name: groupId
           in: query
           required: true
@@ -3676,6 +3706,8 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Contract'
+        '409':
+          $ref: '#/components/responses/AmbiguousContractScope'
 
   /contracts/{userId}:
     get:
@@ -3697,6 +3729,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3714,6 +3747,8 @@ paths:
                 $ref: '#/components/schemas/Contract'
         '404':
           $ref: '#/components/responses/ContractNotFound'
+        '409':
+          $ref: '#/components/responses/AmbiguousContractScope'
 
     put:
       summary: Update contract
@@ -3734,6 +3769,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - $ref: '#/components/parameters/KeepBillingPeriod'
         - $ref: '#/components/parameters/RejectPrivate'
         - $ref: '#/components/parameters/IfMatchContractVersion'
@@ -3766,6 +3802,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InvalidSubscription'
+        '409':
+          $ref: '#/components/responses/AmbiguousContractScope'
 
     delete:
       summary: Delete contract
@@ -3785,6 +3823,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3795,6 +3834,8 @@ paths:
           description: Contract deleted
         '404':
           $ref: '#/components/responses/ContractNotFound'
+        '409':
+          $ref: '#/components/responses/AmbiguousContractScope'
 
   /contracts/{userId}/novation/preview:
     post:
@@ -3818,6 +3859,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - $ref: '#/components/parameters/KeepBillingPeriod'
         - $ref: '#/components/parameters/RejectPrivate'
         - name: userId
@@ -3837,7 +3879,10 @@ paths:
         '404':
           $ref: '#/components/responses/ContractNotFound'
         '409':
-          description: A SPHERE synchronization is being applied; retry shortly
+          description: |
+            A SPHERE synchronization is being applied (retry shortly), or, for a platform ADMIN without
+            `organizationId`, the `userId` exists in several organizations (`code: AMBIGUOUS_USER_ID`, see
+            `AmbiguousContractScope`).
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
 
@@ -3859,6 +3904,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3876,6 +3922,8 @@ paths:
                 $ref: '#/components/schemas/ContractPricings'
         '404':
           $ref: '#/components/responses/ContractNotFound'
+        '409':
+          $ref: '#/components/responses/AmbiguousContractScope'
 
   /contracts/{userId}/usageLevels:
     put:
@@ -3897,6 +3945,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3916,6 +3965,8 @@ paths:
                 type: object
         '404':
           $ref: '#/components/responses/ContractNotFound'
+        '409':
+          $ref: '#/components/responses/AmbiguousContractScope'
 
   /contracts/{userId}/userContact:
     put:
@@ -3937,6 +3988,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3956,6 +4008,8 @@ paths:
                 type: object
         '404':
           $ref: '#/components/responses/ContractNotFound'
+        '409':
+          $ref: '#/components/responses/AmbiguousContractScope'
 
   /contracts/{userId}/billingPeriod:
     put:
@@ -3977,6 +4031,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3996,6 +4051,8 @@ paths:
                 type: object
         '404':
           $ref: '#/components/responses/ContractNotFound'
+        '409':
+          $ref: '#/components/responses/AmbiguousContractScope'
 
   /features:
     get:
@@ -4150,10 +4207,11 @@ paths:
         Generates a JWT token containing the user's pricing and subscription information 
         for use by client-side feature evaluation.
 
-        Payload (`PricingTokenPayload`): `sub` (userId), `features`, `pricingContext`, `subscriptionContext` and,
-        optionally, `subscription` - the subscription the token was computed from, with the `contractVersion` of
-        the contract. Clients must ignore claims they do not know; `subscription` may be absent in tokens issued
-        by older SPACE versions.
+        Payload (`PricingTokenPayload`): `sub` (userId), `organizationId`, `features`, `pricingContext`,
+        `subscriptionContext` and, optionally, `subscription` - the subscription the token was computed from, with
+        the `contractVersion` of the contract. A `userId` is only unique within an organization, so `sub` and
+        `organizationId` together identify the contract. Clients must ignore claims they do not know;
+        `subscription` and `organizationId` may be absent in tokens issued by older SPACE versions.
 
         **Authentication**: Organization API Key only
 
@@ -4898,7 +4956,10 @@ components:
       properties:
         sub:
           type: string
-          description: userId of the contract
+          description: userId of the contract (unique within its organization)
+        organizationId:
+          type: string
+          description: Organization of the contract (absent in tokens of SPACE versions without `contract-userid-per-org`)
         features:
           type: object
           description: Detailed evaluation of every feature (`{ eval, used, limit, error }` by `service-feature`)
@@ -5598,6 +5659,26 @@ components:
               error:
                 type: string
                 example: Contract with userId 01c4a3cb-0bd5-4d4f-bc1a-0d5bb3d1f6a3 not found
+    AmbiguousContractScope:
+      description: |
+        Platform ADMIN on a direct route without `organizationId`, and the `userId` (or `groupId`) exists in
+        several organizations. Nothing was changed. Repeat the request with `?organizationId=<id>` (one of
+        `organizationIds`) or through `/organizations/{organizationId}/contracts/...`.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: 'AMBIGUOUS USER ID: contracts with userId 42 exist in 2 organizations. Name one with the organizationId query parameter (?organizationId=<id>) or use /organizations/{organizationId}/contracts/42'
+              code:
+                type: string
+                enum: [AMBIGUOUS_USER_ID, AMBIGUOUS_GROUP_ID]
+              organizationIds:
+                type: array
+                items:
+                  type: string
     UnprocessableEntity:
       description: Request sent could not be processed properly
       content:
@@ -5611,6 +5692,19 @@ components:
                   $ref: '#/components/schemas/FieldValidationError'
 
   parameters:
+    ContractOrganizationId:
+      name: organizationId
+      in: query
+      required: false
+      description: |
+        Organization of the contract(s), for platform ADMIN users on the direct `/contracts` routes: a
+        `userId` (or `groupId`) is only unique within an organization. Without it, an ADMIN request works when
+        exactly one organization has the `userId`/`groupId` and answers `409 AMBIGUOUS_USER_ID` /
+        `AMBIGUOUS_GROUP_ID` when several do; `GET`/`DELETE /contracts` without it cover every organization.
+        Organization API keys and organization-scoped routes already have an organization: the parameter may
+        repeat it, any other value answers `403`.
+      schema:
+        type: string
     RejectPrivate:
       name: rejectPrivate
       in: query
