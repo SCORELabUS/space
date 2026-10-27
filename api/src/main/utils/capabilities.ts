@@ -10,6 +10,7 @@ import type { NextFunction, Request, Response } from 'express';
 export const SPACE_CAPABILITIES: readonly string[] = Object.freeze([
   'contract-org-scope',
   'contract-version',
+  'atomic-usage-limits',
   'keep-billing-period',
   'reject-private',
   'pricing-yaml',

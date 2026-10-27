@@ -47,9 +47,43 @@ import {
   contractCacheKeys,
   featuresCachePattern,
   organizationContractCachePatterns,
-  usageLevelSnapshotKey,
-  usageLevelSnapshotPattern,
 } from '../utils/contracts/cacheKeys';
+import { randomUUID } from 'node:crypto';
+import UsageConsumptionRepository, { UsageConsumption } from '../repositories/mongoose/UsageConsumptionRepository';
+import { ConsumptionRevertResult } from '../types/models/FeatureEvaluation';
+import {
+  ConsumptionTarget,
+  consumptionTargets,
+  normalizeFeatureId,
+} from '../utils/feature-evaluation/consumption';
+
+/**
+ * How long an applied consumption can be reverted by its `consumptionId`
+ * (`CONSUMPTION_RETENTION_SECONDS`, default 24 hours, at least 60 seconds).
+ */
+export function consumptionRetentionSeconds(): number {
+  const configured = Number(process.env.CONSUMPTION_RETENTION_SECONDS);
+  return Number.isFinite(configured) && configured >= 60 ? Math.floor(configured) : 24 * 3600;
+}
+
+/** The legacy revert (`?revert=true` without `consumptionId`) only considers consumptions this recent. */
+export const LEGACY_REVERT_WINDOW_MS = 120_000;
+
+/**
+ * What applying an expected consumption came to.
+ * - `applied`: every level was incremented; `contract` is the stored contract
+ *   after the increment, `consumptionId` identifies the consumption when it
+ *   was recorded (single-feature evaluations).
+ * - `limit`: nothing was written because a level would have exceeded its
+ *   limit; `contract` is the stored contract that showed it.
+ * - `changed`: nothing was written because the subscription the limits were
+ *   computed from is no longer the stored one (or the room seen at the write
+ *   was freed right after): the evaluation has to be made again.
+ */
+export type ConsumptionOutcome =
+  | { status: 'applied'; contract: LeanContract; consumptionId?: string }
+  | { status: 'limit'; contract: LeanContract }
+  | { status: 'changed' };
 
 /** Response of POST /contracts/{userId}/novation/preview. */
 export interface NovationPreview {
@@ -144,11 +178,13 @@ class ContractService {
   private readonly contractRepository: ContractRepository;
   private readonly serviceService: ServiceService;
   private readonly cacheService: CacheService;
+  private readonly usageConsumptionRepository: UsageConsumptionRepository;
 
   constructor() {
     this.contractRepository = container.resolve('contractRepository');
     this.serviceService = container.resolve('serviceService');
     this.cacheService = container.resolve('cacheService');
+    this.usageConsumptionRepository = container.resolve('usageConsumptionRepository');
     // Position of the caller's organization among the arguments of the methods
     // that address a contract by userId (see `_findContract`).
     const scopeArgument: Record<string, number> = {
@@ -935,6 +971,9 @@ class ContractService {
       contract.organizationId
     );
 
+    // Only the usage levels this request changes are written (`$set` of those
+    // levels, `$inc` for increments). Writing the whole contract as read
+    // would undo consumptions recorded meanwhile on any level.
     if (queryParams.usageLimit) {
       await this._resetUsageLimitUsageLevels(
         contract,
@@ -945,26 +984,54 @@ class ContractService {
     } else if (queryParams.reset) {
       await this._resetUsageLevels(contract, queryParams.renewableOnly, contract.organizationId, dormant);
     } else if (usageLevelsIncrements) {
+      const increments: Record<string, number> = {};
       for (const serviceName in usageLevelsIncrements) {
         const reason = dormant[serviceName.toLowerCase()];
         if (reason) throw new DormantServiceError(serviceName.toLowerCase(), reason);
       }
       for (const serviceName in usageLevelsIncrements) {
         for (const usageLimit in usageLevelsIncrements[serviceName]) {
-          if (contract.usageLevels[serviceName][usageLimit]) {
-            contract.usageLevels[serviceName][usageLimit].consumed +=
-              usageLevelsIncrements[serviceName][usageLimit];
+          if (contract.usageLevels?.[serviceName]?.[usageLimit]) {
+            increments[`${serviceName}.${usageLimit}`] = usageLevelsIncrements[serviceName][usageLimit];
           }
         }
+      }
+      if (
+        Object.keys(increments).length > 0 &&
+        !(await this.contractRepository.incrementUsageLevels(userId, increments, contract.organizationId))
+      ) {
+        throw new Error(`Failed to update contract for userId ${userId}`);
       }
     } else {
       throw new Error(`Invalid query params: ${JSON.stringify(queryParams)}`);
     }
 
-    const updatedContract = await this.contractRepository.update(userId, contract, contract.organizationId);
+    if (queryParams.usageLimit || queryParams.reset) {
+      // Every level the reset targets, whatever the copy read says it holds;
+      // those of dormant services are not written at all.
+      const reset: Record<string, { consumed: number; resetTimeStamp?: Date }> = {};
+      for (const [serviceName, levels] of Object.entries(contract.usageLevels ?? {})) {
+        if (dormant[serviceName.toLowerCase()]) continue;
+        for (const [usageLimit, level] of Object.entries(levels)) {
+          const targeted = queryParams.usageLimit
+            ? usageLimit === queryParams.usageLimit
+            : !(queryParams.renewableOnly && !level.resetTimeStamp);
+          if (!targeted) continue;
+          reset[`${serviceName}.${usageLimit}`] = {
+            consumed: level.consumed,
+            ...(level.resetTimeStamp ? { resetTimeStamp: new Date(level.resetTimeStamp) } : {}),
+          };
+        }
+      }
+      if (!(await this.contractRepository.setUsageLevels(userId, contract.organizationId, reset))) {
+        throw new Error(`Failed to update contract for userId ${userId}`);
+      }
+    }
+
+    const updatedContract = await this.contractRepository.findByUserId(userId, contract.organizationId);
 
     if (!updatedContract) {
-      throw new Error(`Failed to update contract for userId ${userId}`);
+      throw new Error(`Contract with userId ${userId} not found`);
     }
 
     updatedContract.contractedServices = resetEscapeContractedServiceVersions(
@@ -982,88 +1049,108 @@ class ContractService {
     usageLimitId: string,
     expectedConsumption: number,
     organizationId: string
-  ): Promise<void> {
-    await this._applyExpectedConsumptions(userId, { [usageLimitId]: expectedConsumption }, organizationId);
+  ): Promise<ConsumptionOutcome> {
+    return this._applyExpectedConsumptions(userId, { [usageLimitId]: expectedConsumption }, organizationId);
   }
 
   /**
    * Apply several expected consumptions to a contract in one atomic update.
    *
-   * Read-modify-write loses consumptions, and it does so in two ways. Applying
-   * the limits of one evaluation in turn made each application read the whole
-   * contract, change a single usage level in its own copy and write the whole
-   * contract back, so an evaluation touching two limits recorded one of them.
-   * Batching the limits into a single read and write fixes that, but not the
-   * case of two requests arriving together: both read the same consumed value,
-   * both write the same total, and one consumption is gone.
+   * Read-modify-write loses consumptions: two requests that read the same
+   * consumed value both write the same total. The increment is handed to the
+   * database as `$inc` instead, evaluated against the stored document.
    *
-   * The database is the only place that can settle this, so the increment is
-   * handed to it as `$inc` and evaluated against the stored document. Whatever
-   * order concurrent calls arrive in, every one of them is added.
+   * The limits are part of the same update. Checking them on the contract that
+   * was read and incrementing afterwards let two requests both see room for one
+   * more and both consume it; now a level is only incremented while
+   * `consumed + amount` stays within its limit (`options.limits`, the limits
+   * of the contract's current subscription as the evaluation computed them),
+   * for every level of the consumption at once. With `options.contract`, the
+   * update is also conditional on that contract's subscription still being the
+   * stored one (`contractVersionGuard`), so the limits used are never those of
+   * a subscription replaced in between.
+   *
+   * With `options.featureId` the consumption is recorded (collection
+   * `usageConsumptions`) and its id returned, so that it can be reverted by id
+   * (`revertConsumption`).
    */
   async _applyExpectedConsumptions(
     userId: string,
     expectedConsumptions: Record<string, number>,
-    organizationId: string
-  ): Promise<void> {
+    organizationId: string,
+    options: { limits?: Record<string, unknown>; contract?: LeanContract; featureId?: string } = {}
+  ): Promise<ConsumptionOutcome> {
     if (!organizationId) {
       throw new Error(`An organization is required to consume the usage levels of userId ${userId}`);
     }
-    const usageLimitIds = Object.keys(expectedConsumptions);
-    if (usageLimitIds.length === 0) {
-      return;
+    const targets = consumptionTargets(expectedConsumptions, options.limits);
+    if (targets.length === 0) {
+      return { status: 'applied', contract: options.contract as LeanContract };
     }
-
-    const targets = usageLimitIds.map(usageLimitId => {
-      const serviceName: string = usageLimitId.split('-')[0];
-      const usageLimit: string = usageLimitId.split('-')[1];
-
-      return { serviceName, usageLimit, amount: expectedConsumptions[usageLimitId] };
-    });
 
     const increments: Record<string, number> = {};
-    for (const { serviceName, usageLimit, amount } of targets) {
+    const ceilings: Record<string, number> = {};
+    for (const { serviceName, usageLimit, amount, ceiling } of targets) {
       increments[`${serviceName}.${usageLimit}`] = amount;
+      if (ceiling !== null) ceilings[`${serviceName}.${usageLimit}`] = ceiling;
     }
 
-    const updatedContract = await this.contractRepository.incrementUsageLevels(
-      userId,
-      increments,
-      organizationId
-    );
+    const updatedContract = await this.contractRepository.incrementUsageLevels(userId, increments, organizationId, {
+      ceilings,
+      guard: options.contract ? contractVersionGuard(options.contract) : undefined,
+    });
 
     if (!updatedContract) {
-      // The update requires the contract and every named usage level to exist,
-      // so it matched nothing. Which of the two is missing only matters for the
-      // message, and is worth a read to get right.
-      await this._explainMissingUsageLevels(userId, targets, organizationId);
+      return this._explainRejectedConsumption(userId, targets, organizationId, options.contract);
     }
 
-    const appliedAt = new Date().getTime();
-
-    for (const { serviceName, usageLimit, amount } of targets) {
-      // What the level held before this call, for `_revertExpectedConsumption`.
-      // Derived from the result rather than from a prior read, so it is this
-      // caller's own contribution that gets taken back even if others landed in
-      // between.
-      await this.cacheService.set(
-        usageLevelSnapshotKey(appliedAt, organizationId, userId, serviceName, usageLimit),
-        updatedContract!.usageLevels[serviceName][usageLimit].consumed - amount,
-        120
-      ); // 120 secs = 2 mins
+    let consumptionId: string | undefined;
+    if (options.featureId) {
+      consumptionId = randomUUID();
+      const createdAt = new Date();
+      try {
+        await this.usageConsumptionRepository.create({
+          id: consumptionId,
+          organizationId,
+          userId,
+          featureId: normalizeFeatureId(options.featureId),
+          levels: targets.map(({ serviceName, usageLimit, amount }) => {
+            const resetTimeStamp = updatedContract.usageLevels[serviceName][usageLimit].resetTimeStamp;
+            return { serviceName, usageLimit, amount, resetTimeStamp: resetTimeStamp ? new Date(resetTimeStamp) : null };
+          }),
+          createdAt,
+          expiresAt: new Date(createdAt.getTime() + consumptionRetentionSeconds() * 1000),
+        });
+      } catch (error) {
+        // Without its record the consumption could not be reverted: take it
+        // back and report the failure, rather than answer with an id that
+        // does not exist.
+        const negated = Object.fromEntries(Object.entries(increments).map(([path, amount]) => [path, -amount]));
+        await this.contractRepository.incrementUsageLevels(userId, negated, organizationId);
+        await this.cacheService.del(contractCacheKey(organizationId, userId));
+        throw error;
+      }
     }
 
     await this.cacheService.set(contractCacheKey(organizationId, userId), updatedContract, 3600, true); // Cache for 1 hour
+
+    return { status: 'applied', contract: updatedContract, consumptionId };
   }
 
   /**
-   * Say which part of the contract was missing, having established that one was.
+   * Why a conditional consumption matched nothing, read from the stored
+   * contract: no contract or a missing usage level (errors, as before), a
+   * different subscription (`changed`), or a level that the consumption would
+   * take over its limit (`limit`). If none of these holds any more, the room
+   * was freed right after the write (a revert, a reset): `changed`, so that the
+   * caller evaluates again.
    */
-  private async _explainMissingUsageLevels(
+  private async _explainRejectedConsumption(
     userId: string,
-    targets: { serviceName: string; usageLimit: string }[],
-    organizationId: string
-  ): Promise<never> {
+    targets: ConsumptionTarget[],
+    organizationId: string,
+    evaluated?: LeanContract
+  ): Promise<ConsumptionOutcome> {
     const contract = await this.contractRepository.findByUserId(userId, organizationId);
 
     if (!contract) {
@@ -1071,7 +1158,7 @@ class ContractService {
     }
 
     const missing = targets.find(
-      ({ serviceName, usageLimit }) => !contract.usageLevels[serviceName]?.[usageLimit]
+      ({ serviceName, usageLimit }) => !contract.usageLevels?.[serviceName]?.[usageLimit]
     );
 
     if (missing) {
@@ -1080,66 +1167,220 @@ class ContractService {
       );
     }
 
-    throw new Error(`Failed to update contract for userId ${userId}`);
+    await this.cacheService.set(contractCacheKey(organizationId, userId), contract, 3600, true);
+
+    if (evaluated && computeContractVersion(contract) !== computeContractVersion(evaluated)) {
+      return { status: 'changed' };
+    }
+
+    const overLimit = targets.some(
+      ({ serviceName, usageLimit, amount, ceiling }) =>
+        ceiling !== null && contract.usageLevels[serviceName][usageLimit].consumed + amount > ceiling
+    );
+
+    return overLimit ? { status: 'limit', contract } : { status: 'changed' };
   }
 
+  /**
+   * Revert one consumption by its id (`consumptionId` of the evaluation that
+   * applied it): its amounts are subtracted from the usage levels it
+   * incremented, once, never below zero, and nothing else is touched. Usage
+   * recorded since (other consumptions, increments) is kept.
+   *
+   * Reverting a consumption that was already reverted does nothing. One that
+   * does not exist in the caller's organization for this userId and feature,
+   * or whose record expired, is not found.
+   *
+   * Each usage level of the consumption is looked up by its service:
+   * - a service that the contract no longer has (a rename or move that raced
+   *   with the consumption, or the service was removed from the contract):
+   *   the consumption cannot be reverted exactly, so it is refused
+   *   (`CONFLICT:`, 409), nothing is subtracted and the record is not claimed;
+   * - a usage level that its service, still in the contract, no longer has (for
+   *   example, the pricing version was archived with a fallback that has no such
+   *   limit, which regenerates the service's levels): there is nothing to
+   *   give back for it, so it is skipped and the other levels are reverted.
+   * Renaming, moving and deleting services keep the records in step with the
+   * contracts (see `ServiceService`).
+   *
+   * @returns what was reverted and skipped when a level was skipped, so that
+   *          the caller can say so; null otherwise (every level reverted, or
+   *          the consumption had already been reverted).
+   */
+  async revertConsumption(
+    userId: string,
+    featureId: string,
+    consumptionId: string,
+    organizationId: string
+  ): Promise<ConsumptionRevertResult | null> {
+    if (!organizationId) {
+      throw new Error('INTERNAL ERROR: a consumption is reverted within the organization of its contract');
+    }
+    const scope = { organizationId, userId, featureId: normalizeFeatureId(featureId) };
+
+    const contract = await this._findContract(userId, organizationId);
+    await this._refuseDormantRevert(contract, featureId);
+
+    // Refused before it is claimed, so that it is never seen as reverted.
+    const existing = await this.usageConsumptionRepository.find(consumptionId, scope);
+    if (existing && !existing.revertedAt) {
+      const stored = await this.contractRepository.findByUserId(userId, organizationId);
+      if (stored) this._resolveConsumption(existing, stored);
+    }
+
+    const claimed = await this.usageConsumptionRepository.claim(consumptionId, scope);
+    if (!claimed) {
+      const existing = await this.usageConsumptionRepository.find(consumptionId, scope);
+      if (existing?.revertedAt) return null;
+      throw new Error(`Consumption ${consumptionId} not found for userId ${userId} and feature ${featureId}`);
+    }
+
+    return this._takeBackConsumption(claimed);
+  }
+
+  /**
+   * Legacy revert (`?revert=true[&latest=true]` without `consumptionId`),
+   * deprecated in favour of `revertConsumption`: it picks one consumption of
+   * this userId and feature made in the last two minutes, the oldest one or,
+   * with `latest`, the most recent one, and reverts it like
+   * `revertConsumption`. It used to set the usage levels back to a cached
+   * snapshot and write the whole contract, which also undid everything
+   * recorded after that snapshot.
+   *
+   * @returns as `revertConsumption`; null also when there was nothing to revert.
+   */
   async _revertExpectedConsumption(
     userId: string,
     featureId: string,
     latest: boolean = false,
     organizationId: string
-  ): Promise<void> {
+  ): Promise<ConsumptionRevertResult | null> {
     const contract = await this._findContract(userId, organizationId);
+    const scope = {
+      organizationId: contract.organizationId,
+      userId,
+      featureId: normalizeFeatureId(featureId),
+    };
 
+    await this._refuseDormantRevert(contract, featureId);
+
+    const claimed = await this.usageConsumptionRepository.claimRecent(
+      scope,
+      new Date(Date.now() - LEGACY_REVERT_WINDOW_MS),
+      latest
+    );
+
+    if (!claimed) {
+      console.log(
+        `WARNING: No recent consumption of feature ${featureId} found for userId ${userId}. Unable to perform revert operation.`
+      );
+      return null;
+    }
+
+    return this._takeBackConsumption(claimed);
+  }
+
+  /**
+   * A consumption of a feature of a dormant (disabled or gone) service of the
+   * contract is not reverted: the usage levels of a dormant service are kept as
+   * they are until it is enabled again, so a revert is refused like a
+   * consumption (`DormantServiceError`, 409). Checked before the consumption
+   * is claimed, so that it can still be reverted once the service is enabled.
+   */
+  private async _refuseDormantRevert(contract: LeanContract, featureId: string): Promise<void> {
     const serviceName: string = featureId.split('-')[0].toLowerCase();
-    const featureName: string = featureId.split('-')[1];
-
     const dormant = (await this.serviceService.dormantServices([serviceName], contract.organizationId))[serviceName];
     if (dormant && contract.contractedServices[serviceName] !== undefined) {
       throw new DormantServiceError(serviceName, dormant);
     }
+  }
 
-    const pricing: LeanPricing = await this.serviceService.showPricing(
-      serviceName,
-      contract.contractedServices[serviceName],
-      contract.organizationId
-    );
+  /**
+   * Which levels of a consumption the contract can take back: those of a
+   * service of the contract that still has the level (`present`), and those
+   * that the service no longer has (`skipped`: nothing to give back).
+   * `services` are the keys of those services in `contractedServices`.
+   *
+   * @throws `CONFLICT:` (409) when a level belongs to a service that the
+   *         contract no longer has: the consumption cannot be reverted
+   *         exactly. The message must not say "not found", which would be
+   *         answered as an unknown consumption (404) and keep the claim.
+   */
+  private _resolveConsumption(
+    consumption: UsageConsumption,
+    contract: LeanContract
+  ): { present: UsageConsumption['levels']; skipped: UsageConsumption['levels']; services: string[] } {
+    const contracted = contract.contractedServices instanceof Map
+      ? Object.fromEntries(contract.contractedServices as Map<string, string>)
+      : contract.contractedServices ?? {};
+    const serviceKeys = new Map(Object.keys(contracted).map(key => [key.toLowerCase(), key]));
 
-    const affectedUsageLimits = Object.values(pricing.usageLimits || {})
-      .filter((usageLimit: LeanUsageLimit) => usageLimit.linkedFeatures?.includes(featureName))
-      .map(ul => ul.name!);
+    const gone = consumption.levels.filter(({ serviceName }) => !serviceKeys.has(serviceName.toLowerCase()));
+    if (gone.length > 0) {
+      const names = [...new Set(gone.map(({ serviceName }) => serviceName))];
+      throw new Error(
+        `CONFLICT: Consumption ${consumption.id} cannot be reverted: the contract of userId ${consumption.userId} ` +
+          `no longer has service ${names.join(', ')} (usage level ` +
+          `${gone.map(({ serviceName, usageLimit }) => `${serviceName}.${usageLimit}`).join(', ')}); nothing was subtracted`
+      );
+    }
 
-    for (const usageLimitName of affectedUsageLimits) {
-      if (contract.usageLevels[serviceName][usageLimitName]) {
-        const previousCachedValue = await this._getCachedUsageLevel(
-          userId,
-          serviceName,
-          usageLimitName,
-          latest,
-          contract.organizationId
-        );
+    const has = ({ serviceName, usageLimit }: UsageConsumption['levels'][number]) =>
+      !!contract.usageLevels?.[serviceName]?.[usageLimit];
+    return {
+      present: consumption.levels.filter(has),
+      skipped: consumption.levels.filter(level => !has(level)),
+      services: [...new Set(consumption.levels.map(({ serviceName }) => serviceKeys.get(serviceName.toLowerCase())!))],
+    };
+  }
 
-        if (previousCachedValue === null || previousCachedValue === undefined) {
-          console.log(
-            `WARNING: No previous cached value found for limit: ${serviceName}-${usageLimitName}. Unable to perform revert operation.`
-          );
-        }else{
-          contract.usageLevels[serviceName][usageLimitName].consumed = previousCachedValue;
+  /**
+   * Subtract a claimed consumption; the claim is given back if that fails, so that the revert can be retried.
+   *
+   * @returns what was reverted and skipped when a level was skipped (see
+   *          `revertConsumption`), null when every level was reverted.
+   */
+  private async _takeBackConsumption(consumption: UsageConsumption): Promise<ConsumptionRevertResult | null> {
+    const { userId, organizationId } = consumption;
+    try {
+      // The levels of the contract's services, in one update; a level whose
+      // service is gone refuses the revert (and gives the claim back), one
+      // that its service no longer has is skipped. The update requires what
+      // was decided to still hold (the services, the levels present and the
+      // skipped ones absent); if that changes in between, look again.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const contract = await this.contractRepository.findByUserId(userId, organizationId);
+        if (!contract) {
+          throw new Error(`Contract with userId ${userId} not found`);
         }
-      } else {
-        throw new Error(
-          `Usage level ${serviceName}-${usageLimitName} not found in contract for user ${contract.userContact.username}`
-        );
+        const { present, skipped, services } = this._resolveConsumption(consumption, contract);
+        const levels = present.map(({ serviceName, usageLimit, amount, resetTimeStamp }) => ({
+          path: `${serviceName}.${usageLimit}`,
+          amount,
+          resetTimeStamp: resetTimeStamp ? new Date(resetTimeStamp) : null,
+        }));
+
+        const applied = await this.contractRepository.decrementUsageLevels(userId, organizationId, levels, {
+          services,
+          absent: skipped.map(({ serviceName, usageLimit }) => `${serviceName}.${usageLimit}`),
+        });
+        if (applied) {
+          await this.cacheService.del(contractCacheKey(organizationId, userId));
+          if (skipped.length === 0) return null;
+          return {
+            consumptionId: consumption.id,
+            reverted: Object.fromEntries(present.map(({ serviceName, usageLimit, amount }) => [`${serviceName}-${usageLimit}`, amount])),
+            skipped: skipped.map(({ serviceName, usageLimit }) => `${serviceName}-${usageLimit}`),
+          };
+        }
       }
+      throw new Error(`Failed to revert consumption ${consumption.id} for userId ${userId}`);
+    } catch (error) {
+      if (!String((error as Error)?.message).includes('not found')) {
+        await this.usageConsumptionRepository.release(consumption.id);
+      }
+      throw error;
     }
-
-    const updatedContract = await this.contractRepository.update(userId, contract, contract.organizationId);
-
-    if (!updatedContract) {
-      throw new Error(`Failed to update contract for userId ${userId}`);
-    }
-
-    await this.cacheService.set(contractCacheKey(updatedContract.organizationId, userId), updatedContract, 3600, true); // Cache for 1 hour
   }
 
   async prune(organizationId?: string, reqUser?: LeanUser): Promise<number> {
@@ -1162,6 +1403,7 @@ class ContractService {
         for (const contract of deleted) this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true });
         const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
         for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
+        await this.usageConsumptionRepository.deleteAll(org);
       };
       if (await ServiceModel.exists({ organizationId: org, source: 'sphere' })) await withOrganizationLock(org, clean);
       else await clean(async () => {});
@@ -1180,33 +1422,10 @@ class ContractService {
 
     await this.contractRepository.destroy(userId, contract.organizationId);
 
+    // A contract created later with this userId starts without revertible consumptions.
+    await this.usageConsumptionRepository.deleteAll(contract.organizationId, userId);
     await this.cacheService.delMany(contractCacheKeys(contract));
     this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true });
-  }
-
-  async _getCachedUsageLevel(
-    userId: string,
-    serviceName: string,
-    usageLimit: string,
-    latest: boolean,
-    organizationId: string
-  ): Promise<number | null> {
-    let cachedValues: string[] = await this.cacheService.match(
-      usageLevelSnapshotPattern(organizationId, userId, serviceName, usageLimit)
-    );
-    cachedValues = cachedValues.sort((a, b) => {
-      const aTimestamp = parseInt(a.split('.')[0]);
-      const bTimestamp = parseInt(b.split('.')[0]);
-      return aTimestamp - bTimestamp;
-    });
-
-    if (cachedValues.length === 0) {
-      return null;
-    }
-
-    return await this.cacheService.get(
-      latest ? cachedValues[cachedValues.length - 1] : cachedValues[0]
-    );
   }
 
   async _createUsageLevels(
@@ -1312,6 +1531,20 @@ class ContractService {
     }
   }
 
+  /**
+   * Renew the renewable usage levels whose period ended: `consumed` back to 0
+   * and `resetTimeStamp` moved forward by whole periods until it is in the
+   * future. Each level is written on its own and only while its stored
+   * `resetTimeStamp` is still the one that ended, so it is renewed once per
+   * period even when several evaluations notice the end at the same time
+   * (consumptions applied right after the first renewal are not reset by the
+   * others), and nothing else of the contract is written.
+   *
+   * Before, the new `resetTimeStamp` was computed but never stored: once a
+   * period had ended, every evaluation reset the level again.
+   *
+   * @returns the stored contract after the renewals.
+   */
   async _resetRenewableUsageLevels(
     contract: LeanContract,
     usageLimitsToRenew: string[],
@@ -1321,36 +1554,46 @@ class ContractService {
       return contract;
     }
 
-    const contractToUpdate = { ...contract };
+    const userId = contract.userContact.userId;
+    const now = new Date();
 
     for (const usageLimitId of usageLimitsToRenew) {
       const serviceName: string = usageLimitId.split('-')[0];
       const usageLimitName: string = usageLimitId.split('-')[1];
-      let currentResetTimeStamp =
-        contractToUpdate.usageLevels[serviceName][usageLimitName].resetTimeStamp;
+      const stored = contract.usageLevels?.[serviceName]?.[usageLimitName]?.resetTimeStamp;
 
-      if (currentResetTimeStamp && isAfter(new Date(), currentResetTimeStamp)) {
-        const pricing: LeanPricing = await this.serviceService.showPricing(
-          serviceName,
-          contractToUpdate.contractedServices[serviceName],
-          organizationId
-        );
-        currentResetTimeStamp = addPeriodToDate(
-          currentResetTimeStamp,
-          pricing.usageLimits![usageLimitName].period!
-        );
-        contractToUpdate.usageLevels[serviceName][usageLimitName].consumed = 0;
+      if (!stored || !isAfter(now, new Date(stored))) continue;
+
+      const pricing: LeanPricing = await this.serviceService.showPricing(
+        serviceName,
+        contract.contractedServices[serviceName],
+        organizationId
+      );
+      const period = pricing.usageLimits?.[usageLimitName]?.period;
+      if (!period) continue;
+
+      const ended = new Date(stored);
+      let next = addPeriodToDate(ended, period);
+      for (let periods = 1; !isAfter(next, now) && periods < 100_000; periods++) {
+        next = addPeriodToDate(next, period);
       }
+      if (!isAfter(next, now)) next = addPeriodToDate(now, period);
+
+      const path = `${serviceName}.${usageLimitName}`;
+      // No match: another evaluation renewed it first (or it is gone).
+      await this.contractRepository.setUsageLevels(
+        userId,
+        contract.organizationId,
+        { [path]: { consumed: 0, resetTimeStamp: next } },
+        { [path]: ended }
+      );
     }
 
-    const updatedContract = await this.contractRepository.update(
-      contract.userContact.userId,
-      contractToUpdate,
-      contract.organizationId
-    );
+    await this.cacheService.del(contractCacheKey(contract.organizationId, userId));
+    const updatedContract = await this.contractRepository.findByUserId(userId, contract.organizationId);
 
     if (!updatedContract) {
-      throw new Error(`Failed to update contract for userId ${contract.userContact.userId}`);
+      throw new Error(`Failed to update contract for userId ${userId}`);
     }
 
     return updatedContract;
