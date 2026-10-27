@@ -8,6 +8,7 @@ import useAuth from '@/hooks/useAuth';
 import { useOrganization } from '@/hooks/useOrganization';
 import { useCustomAlert } from '@/hooks/useCustomAlert';
 import { sphereEditorContentUrl, sphereEditorFragmentEnabled, sphereViewLink } from '@/lib/sphereUrl';
+import { sphereOpeningPage } from '@/lib/sphereOpeningPage';
 
 interface DragDropPricingsProps {
   activePricings: Pricing[];
@@ -169,7 +170,8 @@ export default function DragDropPricings({
    * Uploaded pricings: the YAML is read with the user's API key, which takes a request, and a
    * window opened after it would no longer count as opened by the click, so popup blockers could
    * stop it. The tab is therefore opened blank during the click, detached from SPACE
-   * (`opener = null`), and sent to SPHERE once the content is ready, or closed with a message.
+   * (`opener = null`), given a loading page, and sent to SPHERE once the content is ready, or
+   * closed with a message.
    */
   async function handleOpenInSphere(pricing: Pricing) {
     const link = sphereLink(pricing);
@@ -194,8 +196,9 @@ export default function DragDropPricings({
     }
     tab.opener = null;
     try {
-      tab.document.title = 'Opening in SPHERE…';
-      tab.document.body.textContent = `Opening pricing ${pricing.version} in SPHERE…`;
+      // Shown while the YAML is read: inline CSS only, no script, and the version as text.
+      tab.document.documentElement.lang = 'en';
+      tab.document.documentElement.innerHTML = sphereOpeningPage(pricing.version);
     } catch {
       // Only a courtesy message.
     }
