@@ -218,6 +218,33 @@ class ServiceService {
     }
   }
 
+  /**
+   * Where a pricing version of a service stands, without loading the pricing:
+   * `active`, `archived`, `missing` (not a version of the service) or
+   * `no-service` (no enabled service with that name in the organization).
+   */
+  async pricingVersionStatus(
+    serviceName: string,
+    pricingVersion: string,
+    organizationId: string
+  ): Promise<'active' | 'archived' | 'missing' | 'no-service'> {
+    const cacheKey = `service.${organizationId}.${serviceName}`;
+    let service = await this.cacheService.get(cacheKey);
+
+    if (!service) {
+      service = await this.serviceRepository.findByName(serviceName, organizationId);
+    }
+
+    if (!service) {
+      return 'no-service';
+    }
+
+    const formattedPricingVersion = escapeVersion(pricingVersion);
+    if (service.activePricings?.get(formattedPricingVersion)) return 'active';
+    if (service.archivedPricings?.get(formattedPricingVersion)) return 'archived';
+    return 'missing';
+  }
+
   async showPublicPricingUrl(serviceName: string, pricingVersion: string, organizationId: string) {
     const pricing = await this.showPricing(serviceName, pricingVersion, organizationId);
 
@@ -1119,6 +1146,14 @@ class ServiceService {
       if (!resultNovations) {
         throw new Error(`Failed to novate contracts for service ${serviceName}`);
       }
+
+      // The cached copies still have the archived version.
+      await this.cacheService.delMany(
+        pricingVersionContracts.flatMap(contract => [
+          `contracts.${contract.userContact.userId}`,
+          `features.${contract.userContact.userId}.*`,
+        ])
+      );
     }
   }
 

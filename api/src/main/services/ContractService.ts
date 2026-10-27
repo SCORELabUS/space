@@ -15,7 +15,10 @@ import { validateContractQueryFilters } from './validation/ContractServiceValida
 import ServiceService from './ServiceService';
 import { LeanPricing, LeanUsageLimit } from '../types/models/Pricing';
 import { addDays, isAfter } from 'date-fns';
-import { isSubscriptionValid } from '../controllers/validation/ContractValidation';
+import {
+  SubscriptionValidationError,
+  validateSubscription,
+} from '../controllers/validation/ContractValidation';
 import { performNovation } from '../utils/contracts/novation';
 import CacheService from './CacheService';
 import {
@@ -35,6 +38,14 @@ import {
   contractVersionGuard,
 } from '../utils/contracts/version';
 import { LeanUser } from '../types/models/User';
+
+/** Options shared by the novation routes (see S8 in the API docs). */
+export interface NovationOptions {
+  /** Keep the billing period instead of restarting it. */
+  keepBillingPeriod?: boolean;
+  /** Accept private plans and add-ons the contract does not have yet. */
+  allowPrivate?: boolean;
+}
 
 class ContractService {
   private readonly contractRepository: ContractRepository;
@@ -144,7 +155,14 @@ class ContractService {
     return contract;
   }
 
-  async create(contractData: ContractToCreate): Promise<LeanContract> {
+  /**
+   * @param options.allowPrivate accept private plans and add-ons (see
+   *        `validateSubscription`).
+   */
+  async create(
+    contractData: ContractToCreate,
+    options: { allowPrivate?: boolean } = {}
+  ): Promise<LeanContract> {
     // Prevent creating more than one contract per userId
     if (!contractData || !contractData.userContact || !contractData.userContact.userId) {
       throw new Error('Invalid request: Missing userContact.userId');
@@ -185,6 +203,28 @@ class ContractService {
       throw new Error(`Invalid contract: Services not found: ${missingServices.join(', ')}`);
     }
 
+    // Convert keys to lowercase for contractedServices, subscriptionPlans and subscriptionAddOns
+    contractData.contractedServices = convertKeysToLowercase(contractData.contractedServices);
+    contractData.subscriptionPlans = convertKeysToLowercase(contractData.subscriptionPlans);
+    contractData.subscriptionAddOns = convertKeysToLowercase(contractData.subscriptionAddOns);
+
+    // Before anything reads the pricings: unknown or archived versions, invalid
+    // or private selections are reported together, with stable codes.
+    try {
+      await validateSubscription(
+        {
+          contractedServices: contractData.contractedServices,
+          subscriptionPlans: contractData.subscriptionPlans,
+          subscriptionAddOns: contractData.subscriptionAddOns,
+        },
+        contractData.organizationId,
+        { allowPrivate: options.allowPrivate }
+      );
+    } catch (error) {
+      if (error instanceof SubscriptionValidationError) throw error;
+      throw new Error(`Invalid subscription: ${error}`);
+    }
+
     for (const serviceName in contractData.contractedServices) {
       const pricingVersion = escapeVersion(contractData.contractedServices[serviceName]);
       const service = services.find(s => s.name.toLowerCase() === serviceName.toLowerCase());
@@ -206,11 +246,6 @@ class ContractService {
     const renewalDays = contractData.billingPeriod?.renewalDays ?? 30; // Default to 30 days if not provided
     const endDate = addDays(new Date(startDate), renewalDays);
 
-    // Convert keys to lowercase for contractedServices, subscriptionPlans and subscriptionAddOns
-    contractData.contractedServices = convertKeysToLowercase(contractData.contractedServices);
-    contractData.subscriptionPlans = convertKeysToLowercase(contractData.subscriptionPlans);
-    contractData.subscriptionAddOns = convertKeysToLowercase(contractData.subscriptionAddOns);
-
     const contractDataToCreate: LeanContract = {
       ...contractData,
       billingPeriod: {
@@ -226,18 +261,6 @@ class ContractService {
         )) || {},
       history: [],
     };
-    try {
-      await isSubscriptionValid(
-        {
-          contractedServices: contractData.contractedServices,
-          subscriptionPlans: contractData.subscriptionPlans,
-          subscriptionAddOns: contractData.subscriptionAddOns,
-        },
-        contractData.organizationId
-      );
-    } catch (error) {
-      throw new Error(`Invalid subscription: ${error}`);
-    }
 
     const contract = await this.contractRepository.create(contractDataToCreate);
 
@@ -264,7 +287,7 @@ class ContractService {
     userId: string,
     newSubscription: any,
     organizationId?: string,
-    options: { expectedContractVersion?: string | string[] } = {}
+    options: NovationOptions & { expectedContractVersion?: string | string[] } = {}
   ): Promise<LeanContract> {
     let contract = await this._findContract(userId, organizationId);
     let guard: Record<string, unknown> = {};
@@ -287,9 +310,14 @@ class ContractService {
     }
 
     await enforceSpherePolicy(contract.organizationId, newSubscription, contract);
-    await isSubscriptionValid(newSubscription, contract.organizationId);
+    await validateSubscription(newSubscription, contract.organizationId, {
+      previous: contract,
+      allowPrivate: options.allowPrivate,
+    });
 
-    const newContract = performNovation(contract, newSubscription);
+    const newContract = performNovation(contract, newSubscription, {
+      keepBillingPeriod: options.keepBillingPeriod,
+    });
 
     const result = await this.contractRepository.update(
       userId,
@@ -332,7 +360,7 @@ class ContractService {
     groupId: string,
     organizationId: string,
     newSubscription: any,
-    options: { expectedContractVersions?: Record<string, string> } = {}
+    options: NovationOptions & { expectedContractVersions?: Record<string, string> } = {}
   ): Promise<LeanContract[]> {
     const contracts = await this.index({ groupId }, organizationId);
 
@@ -366,9 +394,17 @@ class ContractService {
     const updatedContracts: LeanContract[] = [];
 
     for (const contract of contracts) {
-      await enforceSpherePolicy(contract.organizationId, newSubscription, contract);
-    await isSubscriptionValid(newSubscription, contract.organizationId);
-      const newContract = performNovation(contract, newSubscription);
+      // Each contract gets its own copy: the SPHERE policy may pin a different
+      // version per contract.
+      const subscription = structuredClone(newSubscription);
+      await enforceSpherePolicy(contract.organizationId, subscription, contract);
+      await validateSubscription(subscription, contract.organizationId, {
+        previous: contract,
+        allowPrivate: options.allowPrivate,
+      });
+      const newContract = performNovation(contract, subscription, {
+        keepBillingPeriod: options.keepBillingPeriod,
+      });
       updatedContracts.push(newContract);
     }
 

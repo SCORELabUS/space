@@ -1,5 +1,5 @@
 import container from '../config/container';
-import ContractService from '../services/ContractService';
+import ContractService, { NovationOptions } from '../services/ContractService';
 import {
   ContractQueryFilters,
   ContractToCreate,
@@ -7,6 +7,7 @@ import {
   UsageLevelsResetQuery,
 } from '../types/models/Contract';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils';
+import { SubscriptionValidationError } from './validation/ContractValidation';
 import {
   ContractChangedError,
   computeContractVersion,
@@ -45,6 +46,36 @@ function sendContractChanged(res: any, err: ContractChangedError) {
       ...(err.novated ? { novated: err.novated } : {}),
     });
   }
+}
+
+/**
+ * Every validation problem, each with a stable `code`.
+ *
+ * Status: 400. Novations keep answering 404 when everything wrong is a missing
+ * plan, add-on or pricing version, as they did before the codes existed.
+ */
+function sendInvalidSubscription(res: any, err: SubscriptionValidationError, novation = false) {
+  const onlyMissing = err.errors.every(error => error.code.endsWith('_NOT_FOUND'));
+  res.status(novation && onlyMissing ? 404 : 400).send({ error: err.message, errors: err.errors });
+}
+
+/**
+ * Novation options from the query (`keepBillingPeriod=true`) or the body
+ * (`keepBillingPeriod: true`, `allowPrivate: true`); the body fields are
+ * removed so that only the subscription remains.
+ */
+function novationOptionsOf(req: any): NovationOptions {
+  const fromBody = (name: string) => {
+    const value = req.body?.[name];
+    if (req.body && name in req.body) delete req.body[name];
+    return value === true;
+  };
+  const keepFromBody = fromBody('keepBillingPeriod');
+  const allowPrivate = fromBody('allowPrivate');
+  return {
+    keepBillingPeriod: req.query?.keepBillingPeriod === 'true' || keepFromBody,
+    allowPrivate,
+  };
 }
 
 /**
@@ -161,10 +192,14 @@ class ContractController {
         }
       }
 
-      const contract = await this.contractService.create(contractData);
+      const allowPrivate = (contractData as any).allowPrivate === true;
+      delete (contractData as any).allowPrivate;
+      const contract = await this.contractService.create(contractData, { allowPrivate });
       sendContract(req, res, 201, contract);
     } catch (err: any) {
-      if (err.message.toLowerCase().includes('invalid')) {
+      if (err instanceof SubscriptionValidationError) {
+        sendInvalidSubscription(res, err);
+      } else if (err.message.toLowerCase().includes('invalid')) {
         res.status(400).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('permission error')) {
         res.status(403).send({ error: err.message });
@@ -180,13 +215,17 @@ class ContractController {
     try {
       const userId = req.params.userId;
       const expectedContractVersion = expectedVersionOf(req);
+      const options = novationOptionsOf(req);
       const newSubscription: Subscription = req.body;
       const contract = await this.contractService.novate(userId, newSubscription, this._scope(req), {
+        ...options,
         expectedContractVersion,
       });
       sendContract(req, res, 200, contract);
     } catch (err: any) {
-      if (err instanceof ContractChangedError) {
+      if (err instanceof SubscriptionValidationError) {
+        sendInvalidSubscription(res, err, true);
+      } else if (err instanceof ContractChangedError) {
         sendContractChanged(res, err);
       } else if (err.message.toLowerCase().includes('invalid precondition')) {
         res.status(400).send({ error: err.message });
@@ -224,13 +263,17 @@ class ContractController {
       }
       const expectedContractVersions = req.body?.expectedContractVersions;
       if (req.body && 'expectedContractVersions' in req.body) delete req.body.expectedContractVersions;
+      const options = novationOptionsOf(req);
       const newSubscription: Subscription = req.body;
       const contracts = await this.contractService.novateByGroupId(groupId, organizationId, newSubscription, {
+        ...options,
         expectedContractVersions,
       });
       res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
-      if (err instanceof ContractChangedError) {
+      if (err instanceof SubscriptionValidationError) {
+        sendInvalidSubscription(res, err, true);
+      } else if (err instanceof ContractChangedError) {
         sendContractChanged(res, err);
       } else if (
         err.message.toLowerCase().includes('not found') ||

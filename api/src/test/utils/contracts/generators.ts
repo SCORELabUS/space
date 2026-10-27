@@ -145,7 +145,11 @@ async function _generateSubscriptionPlans(
     );
 
     if (pricing.plans) {
-      subscriptionPlans[serviceName] = faker.helpers.arrayElement(Object.keys(pricing.plans));
+      // Private plans need `allowPrivate`; generated subscriptions use public ones.
+      const publicPlans = Object.keys(pricing.plans).filter(plan => !pricing.plans![plan].private);
+      subscriptionPlans[serviceName] = faker.helpers.arrayElement(
+        publicPlans.length > 0 ? publicPlans : Object.keys(pricing.plans)
+      );
     }
   }
 
@@ -189,6 +193,10 @@ async function _generateSubscriptionAddOns(
 
     for (const addOnName in pricing.addOns) {
       const addOn = pricing.addOns[addOnName];
+
+      if (addOn.private) {
+        continue;
+      }
 
       if (!addOn.availableFor || _addOnAvailableForPlan(addOn.availableFor, planName)) {
         const minQuantity = pricing.addOns[addOnName].subscriptionConstraints?.minQuantity;
@@ -262,7 +270,10 @@ function _processDependencies(
     
     for (const dependency of pricingAddon.dependsOn) {
       if (!subscriptionAddOns[dependency]) {
-        if (pricingAddons[dependency]?.availableFor?.includes(subscriptionPlan)) {
+        if (
+          !pricingAddons[dependency]?.private &&
+          pricingAddons[dependency]?.availableFor?.includes(subscriptionPlan)
+        ) {
           subscriptionAddOns[dependency] = 1;
           changesMade = true;
         } else {
