@@ -101,7 +101,8 @@ info:
 
     **Disabling** a service (`DELETE /services/{serviceName}`, `DELETE /organizations/{organizationId}/services/{serviceName}`)
     is reversible: its pricings are archived, `SERVICE_DISABLED` is announced on `/pricings`, and uploading a pricing with
-    the same `saasName` enables it again (the versions it had stay archived). Contracts are not changed: the service is
+    the same `saasName` enables it again (the versions it had stay archived; uploading one of them activates it again,
+    see "Uploading a version the service has archived"). Contracts are not changed: the service is
     *dormant* in the contracts that have it, and every reader of a contract treats it so:
     - Evaluation of all features (`POST /features/{userId}`) and the pricing token leave its features out, as for any
       feature the subscription does not have; the other services of the contract evaluate normally. The token lists it
@@ -147,6 +148,19 @@ info:
     never overwritten; the contract is read again and retried). Contracts are written before the service, so after
     a failure the request can be repeated; contracts created with the old name while the request runs are updated
     after the service is.
+
+    ## Uploading a version the service has archived
+
+    A pricing version is not replaced once contracts may use it. Uploading a version that the service has archived
+    (`POST .../services/{serviceName}/pricings`, or `POST .../services` for a disabled service, which enables it
+    again) compares the upload with the stored version, by content (what SPACE stores of a pricing: version, currency,
+    `createdAt`, features, usage limits, plans and add-ons; layout, comments and key order do not matter):
+    - **Same content**: the archived version is active again, the same stored pricing as before, so contracts on it
+      work as they did (for a disabled service: with their subscription and usage levels). A disabled service is
+      enabled with it as its only active version; its other versions stay archived. `PRICING_ACTIVED` is announced.
+    - **Other content**, or stored content that cannot be read: `409`, and nothing is changed (the stored Pricing2Yaml
+      file neither). Upload it as another version.
+    Uploading a version that is active is refused with `400`, as before.
 
     ## Capabilities
 
@@ -1850,6 +1864,9 @@ paths:
       description: |
         Creates a new service in the organization.
 
+        Uploading a pricing whose `saasName` is a disabled service of the organization enables it again; with a
+        version it has archived, see "Uploading a version the service has archived".
+
         **Authentication**: User API Key
 
         **Permission**: 
@@ -1906,6 +1923,10 @@ paths:
           description: Forbidden - insufficient permissions
         '404':
           description: Organization not found
+        '409':
+          description: |
+            The service has this version archived with other content (or its stored content cannot be read); nothing
+            was changed. See "Uploading a version the service has archived".
 
     delete:
       summary: Delete all services in organization
@@ -2142,6 +2163,8 @@ paths:
       description: |
         Uploads and adds a new pricing version to the service.
 
+        With a version the service has archived, see "Uploading a version the service has archived".
+
         **Authentication**: User API Key
 
         **Permission**: 
@@ -2192,6 +2215,10 @@ paths:
           description: Forbidden
         '404':
           description: Service not found
+        '409':
+          description: |
+            The service has this version archived with other content (or its stored content cannot be read); nothing
+            was changed. See "Uploading a version the service has archived".
 
   /organizations/{organizationId}/services/{serviceName}/pricings/new-contracts:
     get:
@@ -2496,6 +2523,9 @@ paths:
       description: |
         Creates a new service in the organization.
 
+        Uploading a pricing whose `saasName` is a disabled service of the organization enables it again; with a
+        version it has archived, see "Uploading a version the service has archived".
+
         **Authentication**: Organization API Key
 
         **Permission**: 
@@ -2538,6 +2568,10 @@ paths:
                 $ref: '#/components/schemas/Service'
         '403':
           description: Forbidden
+        '409':
+          description: |
+            The service has this version archived with other content (or its stored content cannot be read); nothing
+            was changed. See "Uploading a version the service has archived".
 
     delete:
       summary: Delete all services
@@ -2735,6 +2769,8 @@ paths:
       description: |
         Uploads and adds a new pricing version to the service.
 
+        With a version the service has archived, see "Uploading a version the service has archived".
+
         **Constraints**:
         - Pricing `saasName` and `serviceName` must be the same
 
@@ -2773,6 +2809,10 @@ paths:
                 $ref: '#/components/schemas/Pricing'
         '403':
           description: Forbidden
+        '409':
+          description: |
+            The service has this version archived with other content (or its stored content cannot be read); nothing
+            was changed. See "Uploading a version the service has archived".
 
   /services/{serviceName}/pricings/new-contracts:
     get:
