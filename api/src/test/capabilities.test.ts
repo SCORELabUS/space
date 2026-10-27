@@ -21,6 +21,7 @@ const EXPECTED = [
   'contract-pricings',
   'novation-preview',
   'token-subscription',
+  'pricing-token-jwks',
   'contract-events',
   'sphere-private',
   'contract-userid-per-org',

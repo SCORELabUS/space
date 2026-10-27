@@ -1,7 +1,6 @@
 import request from 'supertest';
 import { Server } from 'http';
 import { v4 as uuidv4 } from 'uuid';
-import { jwtVerify } from 'jose';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import container from '../main/config/container';
 import { contractCacheKey } from '../main/utils/contracts/cacheKeys';
@@ -13,7 +12,7 @@ import {
   deleteTestOrganization,
 } from './utils/organization/organizationTestUtils';
 import { generateOrganizationApiKey } from '../main/utils/users/helpers';
-import { encryptJWTSecret } from '../main/utils/jwt';
+import { verifyPricingToken } from './utils/pricingTokens';
 import { LeanUser } from '../main/types/models/User';
 import { LeanOrganization } from '../main/types/models/Organization';
 import ContractMongoose from '../main/repositories/mongoose/models/ContractMongoose';
@@ -47,9 +46,7 @@ describe('Pricing token subscription', function () {
   };
   const token = async () => {
     const response = { body: { pricingToken: await rawToken() } };
-    const { payload } = await jwtVerify(response.body.pricingToken, encryptJWTSecret(process.env.JWT_SECRET!), {
-      algorithms: ['HS256'],
-    });
+    const { payload } = await verifyPricingToken(app, response.body.pricingToken);
     return payload as any;
   };
   const contractVersion = async () =>
