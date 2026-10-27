@@ -370,13 +370,19 @@ describe('Contract userId unique per organization', function () {
         expect(tokenB.status).toBe(200);
         expect(tokenB.body.pricingToken).not.toBe(tokenA.body.pricingToken);
         const claims: any = decodeJwt(tokenB.body.pricingToken);
-        expect(claims.sub).toBe(userId);
+        expect(claims.sub).toBe(`${orgB.id}:${userId}`);
+        expect(claims.userId).toBe(userId);
         expect(claims.organizationId).toBe(orgB.id);
+        expect(claims.aud).toBe(orgB.id);
+        expect(claims.iss).toBe(process.env.JWT_ISSUER || 'space');
         expect(claims.subscription.subscriptionPlans[serviceName]).toBe('PLATINUM');
       }
 
       const claimsA: any = decodeJwt(tokenA.body.pricingToken);
+      expect(claimsA.sub).toBe(`${orgA.id}:${userId}`);
+      expect(claimsA.userId).toBe(userId);
       expect(claimsA.organizationId).toBe(orgA.id);
+      expect(claimsA.aud).toBe(orgA.id);
       expect(claimsA.subscription.subscriptionPlans[serviceName]).toBe('GOLD');
     });
 
@@ -419,8 +425,10 @@ describe('Contract userId unique per organization', function () {
 
       const tokenUpper = await request(app).post(`${baseUrl}/features/${upper}/pricing-token`).set('x-api-key', keyA);
       const tokenLower = await request(app).post(`${baseUrl}/features/${lower}/pricing-token`).set('x-api-key', keyA);
-      expect((decodeJwt(tokenUpper.body.pricingToken) as any).sub).toBe(upper);
-      expect((decodeJwt(tokenLower.body.pricingToken) as any).sub).toBe(lower);
+      expect((decodeJwt(tokenUpper.body.pricingToken) as any).userId).toBe(upper);
+      expect((decodeJwt(tokenLower.body.pricingToken) as any).userId).toBe(lower);
+      expect((decodeJwt(tokenUpper.body.pricingToken) as any).sub).toBe(`${orgA.id}:${upper}`);
+      expect((decodeJwt(tokenLower.body.pricingToken) as any).sub).toBe(`${orgA.id}:${lower}`);
     });
   });
 
