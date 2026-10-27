@@ -33,25 +33,48 @@ const versionId = '66a1b2c3d4e5f6a7b8c9d0e1';
 const snapshot = { yamlPath: `/private/sphere/svc/${versionId}.yaml`,
   sphere: { pricingId, versionId, permanentUrl: `https://sphere.score.us.es/p/${pricingId}` } };
 
-test('a SPHERE snapshot opens the permanent link of its SPHERE pricing', () => {
-  assert.deepEqual(sphereViewLink(snapshot), { kind: 'permalink', url: `https://sphere.score.us.es/p/${pricingId}` });
-  assert.deepEqual(sphereViewLink(snapshot, 'https://sphere.score.us.es'), { kind: 'permalink', url: `https://sphere.score.us.es/p/${pricingId}` });
+const onVersion = `?version=${versionId}`;
+test('a SPHERE snapshot opens the permanent link of its SPHERE pricing, on the version SPACE copied', () => {
+  assert.deepEqual(sphereViewLink(snapshot), { kind: 'permalink', url: `https://sphere.score.us.es/p/${pricingId}${onVersion}` });
+  assert.deepEqual(sphereViewLink(snapshot, 'https://sphere.score.us.es'), { kind: 'permalink', url: `https://sphere.score.us.es/p/${pricingId}${onVersion}` });
 });
 test('a SPHERE snapshot uses the browser-facing SPHERE address', () => {
   const internal = { sphere: { pricingId, versionId, permanentUrl: `http://sphere-server:8080/p/${pricingId}` } };
-  assert.equal(sphereViewLink(internal, 'http://localhost:5402/')?.url, `http://localhost:5402/p/${pricingId}`);
+  assert.equal(sphereViewLink(internal, 'http://localhost:5402/')?.url, `http://localhost:5402/p/${pricingId}${onVersion}`);
 });
 test('a SPHERE snapshot without a usable permanent link builds it from the pricing ID', () => {
-  assert.equal(sphereViewLink({ sphere: { pricingId: pricingId.toUpperCase(), versionId } })?.url, `https://sphere.score.us.es/p/${pricingId}`);
+  assert.equal(sphereViewLink({ sphere: { pricingId: pricingId.toUpperCase(), versionId } })?.url, `https://sphere.score.us.es/p/${pricingId}${onVersion}`);
   assert.equal(sphereViewLink({ sphere: { pricingId, versionId, permanentUrl: 'javascript:alert(1)' } }, 'https://example.org/sphere')?.url,
-    `https://example.org/sphere/p/${pricingId}`);
+    `https://example.org/sphere/p/${pricingId}${onVersion}`);
   // A permanent link of another pricing is not trusted.
   assert.equal(sphereViewLink({ sphere: { pricingId, versionId, permanentUrl: `https://sphere.score.us.es/p/${versionId}` } })?.url,
-    `https://sphere.score.us.es/p/${pricingId}`);
+    `https://sphere.score.us.es/p/${pricingId}${onVersion}`);
+});
+test('the version is the SPHERE version ID, normalised, and the only thing added to the link', () => {
+  const url = new URL(sphereViewLink({ sphere: { pricingId, versionId: ` ${versionId.toUpperCase()} ` } })!.url);
+  assert.equal(url.origin + url.pathname, `https://sphere.score.us.es/p/${pricingId}`);
+  assert.deepEqual([...url.searchParams], [['version', versionId]]);
+  assert.equal(url.hash, '');
+  // A version already in the stored permanent link is replaced, never repeated; the rest is kept.
+  const stored = `https://sphere.score.us.es/p/${pricingId}?version=2.4.0&collection=saas#versions`;
+  const kept = new URL(sphereViewLink({ sphere: { pricingId, versionId, permanentUrl: stored } })!.url);
+  assert.deepEqual(kept.searchParams.getAll('version'), [versionId]);
+  assert.equal(kept.searchParams.get('collection'), 'saas');
+  assert.equal(kept.hash, '#versions');
+});
+test('a SPHERE snapshot without a usable version ID opens the pricing without a version', () => {
+  const family = `https://sphere.score.us.es/p/${pricingId}`;
+  for (const id of [undefined, '', '   ', '2.4.0', versionId.slice(1), `${versionId}0`, versionId.replace(/^./, 'g'), `${versionId.slice(0, 12)}/../${versionId.slice(12)}`]) {
+    assert.deepEqual(sphereViewLink({ sphere: { pricingId, versionId: id } }), { kind: 'permalink', url: family }, String(id));
+  }
+  // The pricing's own permanent link is still kept, query included, without adding a version.
+  const stored = `https://sphere.score.us.es/p/${pricingId}?collection=saas`;
+  assert.equal(sphereViewLink({ sphere: { pricingId, versionId: 'nope', permanentUrl: stored } })?.url, stored);
 });
 test('a SPHERE link never carries a YAML URL or the pricing content', () => {
   const url = sphereViewLink({ ...snapshot, url: 'https://example.org/pricing.yaml' }, 'https://sphere.score.us.es')!.url;
-  assert.ok(!/editor|pricingUrl|pricing=|yaml/i.test(url), url);
+  assert.ok(!/editor|pricingUrl|pricing=|yaml|private|#/i.test(url), url);
+  assert.deepEqual([...new URL(url).searchParams.keys()], ['version']);
 });
 test('a pricing defined by an external URL opens in the SPHERE editor', () => {
   assert.deepEqual(sphereViewLink({ url: 'https://example.org/pricings/zoom.yaml' }), {
@@ -178,5 +201,5 @@ test('an empty YAML file is not handed to SPHERE', () => {
 });
 test('an unusable SPHERE address falls back to the public SPHERE', () => {
   assert.equal(sphereViewLink({ url: 'https://example.org/p.yaml' }, 'not a url')!.url.startsWith(`${DEFAULT_SPHERE_URL}/editor?`), true);
-  assert.equal(sphereViewLink(snapshot, 'not a url')!.url, `https://sphere.score.us.es/p/${pricingId}`);
+  assert.equal(sphereViewLink(snapshot, 'not a url')!.url, `https://sphere.score.us.es/p/${pricingId}${onVersion}`);
 });
