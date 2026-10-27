@@ -113,9 +113,23 @@ info:
     - `contract-pricings`: `GET /contracts/{userId}/pricings`.
     - `novation-preview`: `POST /contracts/{userId}/novation/preview`.
     - `token-subscription`: the pricing token carries the `subscription` claim.
+    - `pricing-token-jwks`: pricing tokens are signed with ES256 (`kid` header) and the public keys are published at `GET /.well-known/jwks.json` (see below). Absent while the server runs the deprecated `PRICING_TOKEN_ALG=HS256` mode.
     - `contract-events`: authenticated Socket.IO namespace `/contracts` with contract events.
     - `sphere-private`: SPHERE-linked services accept a write-only `sphereApiKey` to read private versions (`sphere.hasApiKey`); private versions are never served statically.
     - `contract-userid-per-org`: a `userId` is unique per organization (see above), pricing tokens identify the contract by organization (`sub` = `urn:space:<organizationId>:<percent-encoded userId>`, `userId`, `organizationId`, `aud`, `iss`; see `PricingTokenPayload`), and platform ADMIN users name the organization (`organizationId`) on the direct routes that address contracts by `userId` or `groupId` (`400 ORGANIZATION_ID_REQUIRED` otherwise).
+
+    ## Verifying pricing tokens
+
+    Pricing tokens are signed with ES256 (ECDSA P-256, SHA-256). The public keys are published, without
+    authentication, as a JSON Web Key Set at `GET /api/v1/.well-known/jwks.json` (also `/.well-known/jwks.json` at the
+    root of the API server). Organizations verify tokens with these public keys only: nothing they hold lets them mint
+    a token. Verifiers configure the JWKS URL themselves, accept `ES256` only, select the key by the `kid` header,
+    require `exp`, check `iss` (`JWT_ISSUER`, default `space`) and `aud` (the organization they serve, the same as the
+    `organizationId` claim), and read the user from `userId` (`sub` is an opaque URN). Previous keys stay published
+    until their tokens expire, so a rotation needs no change on verifiers (fetch the JWKS again on an unknown `kid`).
+    Example with `jose`: `jwtVerify(token, createRemoteJWKSet(new URL('<SPACE>/api/v1/.well-known/jwks.json')),
+    { algorithms: ['ES256'], issuer: 'space', audience: '<organizationId>' })`.
+    See `docs/pricing-tokens.md` in the repository.
 
   contact:
     email: agarcia29@us.es
@@ -4252,7 +4266,10 @@ paths:
                 properties:
                   pricingToken:
                     type: string
-                    description: JWT (HS256) whose payload is a `PricingTokenPayload`
+                    description: |
+                      JWT whose payload is a `PricingTokenPayload`, signed with ES256; the `kid` header names the key
+                      in `GET /.well-known/jwks.json`. (HS256 without `kid` only on servers in the deprecated
+                      `PRICING_TOKEN_ALG=HS256` mode, which do not advertise `pricing-token-jwks`.)
         '404':
           $ref: '#/components/responses/ContractNotFound'
 
@@ -4552,6 +4569,42 @@ paths:
             text/html:
               schema:
                 type: string
+
+  /.well-known/jwks.json:
+    get:
+      summary: Public keys of the pricing tokens (JWKS)
+      description: |
+        The JSON Web Key Set (RFC 7517) with the public keys that verify pricing tokens: the current signing key
+        first, then previous keys whose tokens may not have expired yet (or the next key, published before it
+        signs). Only public members are ever included. Also served at `/.well-known/jwks.json` on the root of the
+        API server. Empty (`keys: []`) on servers in the deprecated `PRICING_TOKEN_ALG=HS256` mode, unless previous
+        ES256 keys are configured.
+
+        **Authentication**: Public (no API key required)
+      tags:
+        - Features
+      security: []
+      responses:
+        '200':
+          description: JWKS
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=300
+          content:
+            application/jwk-set+json:
+              schema:
+                $ref: '#/components/schemas/PricingTokenJwks'
+        '503':
+          description: The signing keys are not available
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
 
   /healthcheck:
     get:
@@ -4957,6 +5010,34 @@ components:
           organizationId: 507f1f77bcf86cd799439012
           contractVersion: 4-2c26b46b68ffc68f
           services: [acme]
+
+    PricingTokenJwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            required: [kty, crv, x, y, kid, alg, use]
+            properties:
+              kty: { type: string, enum: [EC] }
+              crv: { type: string, enum: [P-256] }
+              x: { type: string, description: base64url x coordinate }
+              y: { type: string, description: base64url y coordinate }
+              kid: { type: string, description: Key ID (RFC 7638 thumbprint unless configured), matches the token `kid` header }
+              alg: { type: string, enum: [ES256] }
+              use: { type: string, enum: [sig] }
+            additionalProperties: false
+      example:
+        keys:
+          - kty: EC
+            crv: P-256
+            x: f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU
+            y: x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0
+            kid: NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs
+            alg: ES256
+            use: sig
 
     PricingTokenPayload:
       type: object

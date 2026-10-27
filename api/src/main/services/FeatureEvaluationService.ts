@@ -29,6 +29,7 @@ import {
 import ContractService from './ContractService';
 import ServiceService from './ServiceService';
 import { PricingTokenSubscription, generateTokenFromEvalResult } from '../utils/jwt';
+import { isSignedWithCurrentPricingTokenKey } from '../utils/pricingTokenKeys';
 import { computeContractVersion } from '../utils/contracts/version';
 import { escapeVersion } from '../utils/helpers';
 import CacheService from './CacheService';
@@ -128,7 +129,8 @@ class FeatureEvaluationService {
     const tokenKey = featuresCacheKey(contract.organizationId, userId, 'pricingToken');
     const cachedToken = await this.cacheService.get(tokenKey);
 
-    if (cachedToken) {
+    // A token signed with a previous key (or HS256, before the switch) is re-issued.
+    if (cachedToken && (await isSignedWithCurrentPricingTokenKey(cachedToken))) {
       return cachedToken;
     }
 
