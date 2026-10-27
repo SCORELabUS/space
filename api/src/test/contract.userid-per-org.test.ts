@@ -365,12 +365,14 @@ describe('Contract userId unique per organization', function () {
       const tokenA = await request(app).post(`${baseUrl}/features/${userId}/pricing-token`).set('x-api-key', keyA);
       expect(tokenA.status).toBe(200);
 
+      let subB = '';
       for (let round = 0; round < 2; round++) {
         const tokenB = await request(app).post(`${baseUrl}/features/${userId}/pricing-token`).set('x-api-key', keyB);
         expect(tokenB.status).toBe(200);
         expect(tokenB.body.pricingToken).not.toBe(tokenA.body.pricingToken);
         const claims: any = decodeJwt(tokenB.body.pricingToken);
-        expect(claims.sub).toBe(`${orgB.id}:${userId}`);
+        expect(claims.sub).toBe(`urn:space:${orgB.id}:${encodeURIComponent(userId)}`);
+        subB = claims.sub;
         expect(claims.userId).toBe(userId);
         expect(claims.organizationId).toBe(orgB.id);
         expect(claims.aud).toBe(orgB.id);
@@ -379,7 +381,9 @@ describe('Contract userId unique per organization', function () {
       }
 
       const claimsA: any = decodeJwt(tokenA.body.pricingToken);
-      expect(claimsA.sub).toBe(`${orgA.id}:${userId}`);
+      expect(claimsA.sub).toBe(`urn:space:${orgA.id}:${encodeURIComponent(userId)}`);
+      // Same userId, two organizations: two subjects.
+      expect(claimsA.sub).not.toBe(subB);
       expect(claimsA.userId).toBe(userId);
       expect(claimsA.organizationId).toBe(orgA.id);
       expect(claimsA.aud).toBe(orgA.id);
@@ -427,8 +431,8 @@ describe('Contract userId unique per organization', function () {
       const tokenLower = await request(app).post(`${baseUrl}/features/${lower}/pricing-token`).set('x-api-key', keyA);
       expect((decodeJwt(tokenUpper.body.pricingToken) as any).userId).toBe(upper);
       expect((decodeJwt(tokenLower.body.pricingToken) as any).userId).toBe(lower);
-      expect((decodeJwt(tokenUpper.body.pricingToken) as any).sub).toBe(`${orgA.id}:${upper}`);
-      expect((decodeJwt(tokenLower.body.pricingToken) as any).sub).toBe(`${orgA.id}:${lower}`);
+      expect((decodeJwt(tokenUpper.body.pricingToken) as any).sub).toBe(`urn:space:${orgA.id}:${encodeURIComponent(upper)}`);
+      expect((decodeJwt(tokenLower.body.pricingToken) as any).sub).toBe(`urn:space:${orgA.id}:${encodeURIComponent(lower)}`);
     });
   });
 

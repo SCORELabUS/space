@@ -557,7 +557,9 @@ describe('Features API Test Suite', function () {
       expect(protectedHeader.alg).toEqual('HS256');
       expect(payload).toBeDefined();
       expect(payload.features).toEqual(DETAILED_EVALUATION_EXPECTED_RESULT);
-      expect(payload.sub).toEqual(`${newContract.organizationId}:${newContract.userContact.userId}`);
+      expect(payload.sub).toEqual(
+        `urn:space:${newContract.organizationId}:${encodeURIComponent(newContract.userContact.userId)}`
+      );
       expect(payload.userId).toEqual(newContract.userContact.userId);
       expect(payload.organizationId).toEqual(newContract.organizationId);
       expect(payload.aud).toEqual(newContract.organizationId);

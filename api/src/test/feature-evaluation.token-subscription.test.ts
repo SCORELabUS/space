@@ -102,7 +102,7 @@ describe('Pricing token subscription', function () {
       subscriptionAddOns: { [serviceName]: { extraPets: 2 } },
       contractVersion: await contractVersion(),
     });
-    expect(payload.sub).toBe(`${organization.id}:${userId}`);
+    expect(payload.sub).toBe(`urn:space:${organization.id}:${encodeURIComponent(userId)}`);
     expect(payload.userId).toBe(userId);
     expect(payload.organizationId).toBe(organization.id);
     expect(payload.features).toBeDefined();
