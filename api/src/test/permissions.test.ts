@@ -116,12 +116,12 @@ describe('Permissions Test Suite', function () {
         expect(response.status).toBe(200);
       });
 
-      it('Should allow POST /events/test-event without API key', async function () {
+      it('Should require an API key for POST /events/test-event', async function () {
         const response = await request(app)
           .post(`${baseUrl}/events/test-event`)
           .send({ serviceName: 'test', pricingVersion: 'v1' });
 
-        expect([200, 400, 404]).toContain(response.status);
+        expect(response.status).toBe(401);
       });
     });
   });

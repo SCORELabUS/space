@@ -265,8 +265,15 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
   // Event Routes (Public)
   // ============================================
   {
+    // Emits a pricing event to every connected client.
+    path: '/events/test-event',
+    methods: ['POST'],
+    allowedUserRoles: ['ADMIN'],
+    allowedOrgRoles: ['ALL'],
+  },
+  {
     path: '/events/**',
-    methods: ['GET', 'POST'],
+    methods: ['GET'],
     isPublic: true,
   },
 

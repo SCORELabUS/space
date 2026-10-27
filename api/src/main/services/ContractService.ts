@@ -23,6 +23,7 @@ import {
 } from '../controllers/validation/ContractValidation';
 import { performNovation } from '../utils/contracts/novation';
 import CacheService from './CacheService';
+import type EventService from './EventService';
 import {
   addPeriodToDate,
   convertKeysToLowercase,
@@ -155,6 +156,15 @@ class ContractService {
       };
     }
 
+  }
+
+  /** EventService, resolved lazily (it is registered after this service). */
+  _events(): EventService | undefined {
+    try {
+      return container.resolve('eventService');
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -533,6 +543,7 @@ class ContractService {
     contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
 
     await this.cacheService.set(`contracts.${contract.userContact.userId}`, contract, 3600, true); // Cache for 1 hour
+    this._events()?.emitContractEvent('CONTRACT_CREATED', contract);
 
     return contract;
   }
@@ -609,6 +620,7 @@ class ContractService {
 
     await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
     await this.cacheService.del(`features.${userId}.*`);
+    this._events()?.emitContractEvent('CONTRACT_NOVATED', result);
 
     return result;
   }
@@ -712,6 +724,7 @@ class ContractService {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
       this.cacheService.set(`contracts.${contract.userContact.userId}`, contract, 3600, true); // Cache for 1 hour
       this.cacheService.del(`features.${contract.userContact.userId}.*`);
+      this._events()?.emitContractEvent('CONTRACT_NOVATED', contract);
     }
 
     return contractsToReturn;
@@ -742,6 +755,7 @@ class ContractService {
 
     await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
     await this.cacheService.del(`features.${userId}.*`);
+    this._events()?.emitContractEvent('CONTRACT_RENEWED', result);
 
     return result;
   }
@@ -1085,6 +1099,7 @@ class ContractService {
     await this.contractRepository.destroy(userId, contract.organizationId);
 
     this.cacheService.del(`contracts.${userId}`);
+    this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true });
   }
 
   async _getCachedUsageLevel(

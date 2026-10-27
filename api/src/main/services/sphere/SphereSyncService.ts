@@ -312,6 +312,7 @@ export default class SphereSyncService {
         await this.repository.updateRun({ _id: run._id }, { $inc: { migrated: 1, replaced: migrated.replaced ? 1 : 0 } });
         await container.resolve('cacheService').del(`contracts.${contract.userContact.userId}`);
         await container.resolve('cacheService').del(`features.${contract.userContact.userId}.*`);
+        await this.emitNovated(contract._id);
         return;
       }
       contract = await this.repository.contract({ _id: contract._id });
@@ -344,9 +345,10 @@ export default class SphereSyncService {
         $push: { synchronizationHistory: { service: service.name, pricingId: service.sphere.pricingId,
           fromVersion: resetEscapeVersion(contract.contractedServices[service.name]), reason: 'service_removed', at: new Date() } } };
       if (Object.keys(contract.contractedServices).length === 1) update.$set = { 'billingPeriod.endDate': new Date(), 'billingPeriod.autoRenew': false };
-      await this.repository.updateContract({ _id: contract._id, contractedServices: contract.contractedServices }, update);
+      const removed = await this.repository.updateContract({ _id: contract._id, contractedServices: contract.contractedServices }, update);
       await container.resolve('cacheService').del(`contracts.${contract.userContact.userId}`);
       await container.resolve('cacheService').del(`features.${contract.userContact.userId}.*`);
+      if (removed?.modifiedCount) await this.emitNovated(contract._id);
     }
     await assertOwned();
     if (disable) {
@@ -360,6 +362,17 @@ export default class SphereSyncService {
     }
     await this.invalidate(service);
     return true;
+  }
+  /** Tell the contract's organization that synchronization changed its binding (after the write). */
+  private async emitNovated(contractId: unknown) {
+    try {
+      const events = container.resolve('eventService');
+      if (typeof events?.emitContractEvent !== 'function') return;
+      const updated = await this.repository.contract({ _id: contractId });
+      if (updated) events.emitContractEvent('CONTRACT_NOVATED', updated);
+    } catch (error) {
+      console.error('Contract event could not be emitted', (error as Error).message);
+    }
   }
   private async removeCopy(copy: any) {
     if (copy.yamlPath?.startsWith('/static/pricings/sphere/')) await fs.rm(path.resolve('public', '.' + copy.yamlPath), { force: true });

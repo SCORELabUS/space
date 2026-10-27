@@ -21,6 +21,7 @@ const EXPECTED = [
   'contract-pricings',
   'novation-preview',
   'token-subscription',
+  'contract-events',
 ];
 
 const tokens = (response: request.Response) =>
