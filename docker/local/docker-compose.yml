@@ -55,6 +55,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-test_secret}
       JWT_SALT: ${JWT_SALT:-wgv~eb6v=VWwC9GIG1q6rZ]J.tUM(M}
       JWT_EXPIRATION: ${JWT_EXPIRATION:-1h}
+      JWT_ISSUER: ${JWT_ISSUER:-space}
     volumes:
       - 'space-statics:/usr/src/server/public'
       # Files that must not be served without authorisation (private SPHERE snapshots).
