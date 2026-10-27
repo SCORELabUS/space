@@ -1,5 +1,7 @@
 import { withOrganizationLock } from './sphere/lock';
 import ServiceModel from '../repositories/mongoose/models/ServiceMongoose';
+import PricingModel from '../repositories/mongoose/models/PricingMongoose';
+import { createHash } from 'node:crypto';
 import { retrievePricingFromPath, retrievePricingFromText } from 'pricing4ts/server';
 import container from '../config/container';
 import ServiceRepository, { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository';
@@ -72,9 +74,10 @@ export function dormantServiceMessage(service: string, code: DormantReason): str
 /**
  * The pricings of a disabled service that is enabled again with `version`:
  * every version it had stays archived (contracts keep pointing to them), and
- * an entry that has the key of `version` is renamed to make room for it.
+ * an entry that has the key of `version` is renamed to make room for it, or,
+ * with `reactivated`, left out (that archived version becomes the active one).
  */
-function pricingsOnReenable(service: LeanService, version: string): Record<string, any> {
+function pricingsOnReenable(service: LeanService, version: string, reactivated = false): Record<string, any> {
   const plain = (value: any): Record<string, any> =>
     value instanceof Map ? Object.fromEntries(value) : { ...(value ?? {}) };
   const archived = plain(service.archivedPricings);
@@ -86,7 +89,7 @@ function pricingsOnReenable(service: LeanService, version: string): Record<strin
   };
 
   if (archived[version]) {
-    archived[freeKey(version)] = archived[version];
+    if (!reactivated) archived[freeKey(version)] = archived[version];
     delete archived[version];
   }
   for (const [key, locator] of Object.entries(plain(service.activePricings))) {
@@ -128,6 +131,36 @@ function compareNewestFirst(
   if (datedA && datedB && timeA !== timeB) return timeB - timeA;
   if (datedA !== datedB) return datedA ? -1 : 1;
   return resetEscapeVersion(String(b.version)).localeCompare(resetEscapeVersion(String(a.version)), undefined, { numeric: true });
+}
+
+/** What a stored pricing is made of (not where it is stored or whose it is). */
+const PRICING_CONTENT_FIELDS = ['version', 'currency', 'createdAt', 'features', 'usageLimits', 'plans', 'addOns'] as const;
+
+/**
+ * Hash of the content of a pricing as SPACE stores and serves it: the fields
+ * of `PRICING_CONTENT_FIELDS`, normalized by the pricing schema (so an upload
+ * and a stored document get the same defaults and casts), with keys sorted and
+ * document ids left out. Two uploads of the same pricing written differently
+ * (layout, comments, key order) have the same hash.
+ */
+export function pricingContentHash(pricing: any): string {
+  const picked = Object.fromEntries(PRICING_CONTENT_FIELDS.map(field => [field, pricing?.[field]]));
+  const normalized: any = new PricingModel(picked).toJSON({ flattenMaps: true });
+  const canonical = (value: any): any => {
+    if (value instanceof Date) return value.toISOString();
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.keys(value)
+          .filter(key => key !== '_id' && key !== 'id' && value[key] !== undefined)
+          .sort()
+          .map(key => [key, canonical(value[key])])
+      );
+    }
+    return value;
+  };
+  const material = canonical(Object.fromEntries(PRICING_CONTENT_FIELDS.map(field => [field, normalized[field]])));
+  return createHash('sha256').update(JSON.stringify(material)).digest('hex');
 }
 
 /** A Map or plain object of a lean document, as a plain object. */
@@ -572,12 +605,6 @@ class ServiceService {
     // Step 1: Parse and validate pricing
 
     const uploadedPricing: Pricing = await this._getPricingFromPath(pricingFile.path);
-    const pricingYamlPath = this._savePricingYamlFile(
-      pricingFile.path,
-      organizationId,
-      uploadedPricing.saasName,
-      uploadedPricing.version
-    );
     const formattedPricingVersion = escapeVersion(uploadedPricing.version);
     // Step 1.1: Load the service if already exists
     if (serviceName) {
@@ -591,16 +618,20 @@ class ServiceService {
         throw new Error(`NOT FOUND: Service with name ${serviceName}`);
       }
 
-      if (
-        (service.activePricings && service.activePricings.get(formattedPricingVersion)) ||
-        (service.archivedPricings && service.archivedPricings.get(formattedPricingVersion))
-      ) {
+      if (service.activePricings && service.activePricings.get(formattedPricingVersion)) {
         throw new Error(
           `Pricing version ${uploadedPricing.version} already exists for service ${serviceName}`
         );
       }
     }
 
+    // Not written yet: the file is only stored with a new pricing, never over
+    // the file of a version the service already has.
+    const pricingYamlPath = this._buildPricingYamlRelativePath(
+      organizationId,
+      uploadedPricing.saasName,
+      uploadedPricing.version
+    );
     const pricingData: ExpectedPricingType & { _serviceName: string; _organizationId: string } = {
       _serviceName: uploadedPricing.saasName,
       _organizationId: organizationId,
@@ -620,6 +651,10 @@ class ServiceService {
     // - If a disabled service exists with the same name, re-enable it, make the
     //   uploaded pricing the only active pricing and move all previous active/archived
     //   entries into archivedPricings (renaming collisions by appending timestamp)
+    // - If the version is archived (by the service, or by the disabled service),
+    //   that version is active again when the content is the same, and the
+    //   upload is refused otherwise (see `_reactivateArchivedVersion`).
+    let existingDisabled: LeanService | null = null;
     if (!service) {
       // Check if an enabled service exists
       const existingEnabled = await this.serviceRepository.findByName(
@@ -627,7 +662,7 @@ class ServiceService {
         organizationId,
         false
       );
-      const existingDisabled = await this.serviceRepository.findByName(
+      existingDisabled = await this.serviceRepository.findByName(
         uploadedPricing.saasName,
         organizationId,
         true
@@ -636,13 +671,21 @@ class ServiceService {
       if (existingEnabled) {
         throw new Error(`Invalid request: Service ${uploadedPricing.saasName} already exists`);
       }
+    }
 
+    const reactivated = await this._reactivateArchivedVersion(
+      service ?? existingDisabled,
+      formattedPricingVersion,
+      pricingData,
+      organizationId
+    );
+
+    if (reactivated) {
+      service = reactivated;
+    } else if (!service) {
       // Step 3: Create the service as it does not exist and add the pricing
-      const savedPricing = await this.pricingRepository.create(pricingData);
-
-      if (!savedPricing) {
-        throw new Error(`Pricing ${uploadedPricing.version} not saved`);
-      }
+      this._savePricingYamlFile(pricingFile.path, organizationId, uploadedPricing.saasName, uploadedPricing.version);
+      const savedPricing = await this._createPricing(pricingData);
 
       if (existingDisabled) {
         // Versions of the disabled service stay archived: contracts may still use them.
@@ -695,58 +738,14 @@ class ServiceService {
         }
       }
     } else {
-      // service exists (serviceName provided)
-      // If pricing already exists as ACTIVE, we disallow
-      if (service.activePricings && service.activePricings.get(formattedPricingVersion)) {
-        throw new Error(
-          `Pricing version ${uploadedPricing.version} already exists for service ${serviceName}`
-        );
-      }
-
-      // If pricing exists in archived, rename archived entry to free the key
-      const archivedExists =
-        service.archivedPricings && service.archivedPricings.get(formattedPricingVersion);
-      const updatePayload: any = {};
-
-      if (archivedExists) {
-        const newKey = `${formattedPricingVersion}_${Date.now()}`;
-        updatePayload[`archivedPricings.${newKey}`] =
-          service.archivedPricings!.get(formattedPricingVersion);
-        updatePayload[`archivedPricings.${formattedPricingVersion}`] = undefined;
-      }
-
-      // Step 3: Create the service as it does not exist and add the pricing
-      const savedPricing = await this.pricingRepository.create(pricingData);
-
-      if (!savedPricing) {
-        throw new Error(`Pricing ${uploadedPricing.version} not saved`);
-      }
-
-      // If the service is disabled, re-enable it and move previous active/archived to archived
-      if ((service as any).disabled) {
-        // Versions of the disabled service stay archived: contracts may still use them.
-        const newArchived = pricingsOnReenable(service, formattedPricingVersion);
-
-        updatePayload.disabled = false;
-        updatePayload.activePricings = new Map([
-          [
-            formattedPricingVersion,
-            {
-              id: savedPricing.id,
-            },
-          ],
-        ]);
-        updatePayload.archivedPricings = newArchived;
-      } else {
-        // Normal update: keep existing active pricings and just add the new one
-        updatePayload[`activePricings.${formattedPricingVersion}`] = {
-          id: savedPricing.id,
-        };
-      }
+      // service exists (serviceName provided) and does not have this version:
+      // add it to its active pricings.
+      this._savePricingYamlFile(pricingFile.path, organizationId, uploadedPricing.saasName, uploadedPricing.version);
+      const savedPricing = await this._createPricing(pricingData);
 
       const updatedService = await this.serviceRepository.update(
         service.name,
-        updatePayload,
+        { [`activePricings.${formattedPricingVersion}`]: { id: savedPricing.id } },
         organizationId
       );
 
@@ -757,16 +756,10 @@ class ServiceService {
       throw new Error(`Service ${uploadedPricing.saasName} not saved`);
     }
 
-    // Emit pricing creation event
-    this.eventService.emitPricingCreatedMessage(service.name, uploadedPricing.version);
+    // Emit pricing creation event (activation: emitted by _reactivateArchivedVersion)
+    if (!reactivated) this.eventService.emitPricingCreatedMessage(service.name, uploadedPricing.version);
 
-    // Step 4: Link the pricing to the service
-    // await this.pricingRepository.addServiceNameToPricing(
-    //   savedPricing.id!.toString(),
-    //   service!.name.toString()
-    // );
-
-    // Step 5: If everythign was ok, remove the uploaded file
+    // Step 4: If everything was ok, remove the uploaded file
 
     const directory = path.dirname(pricingFile.path);
     if (fs.readdirSync(directory).length === 1) {
@@ -777,8 +770,97 @@ class ServiceService {
 
     resetEscapeVersionInService(service);
 
-    // Step 6: Return the saved service
+    // Step 5: Return the saved service
     return service;
+  }
+
+  /**
+   * Store a new pricing.
+   *
+   * @throws `CONFLICT:` when a stored pricing already has this service, version
+   *         and organization (unique index) without the service listing it,
+   *         instead of a duplicate key error.
+   */
+  async _createPricing(pricingData: any): Promise<LeanPricing> {
+    let savedPricing: LeanPricing | null;
+    try {
+      savedPricing = await this.pricingRepository.create(pricingData);
+    } catch (error: any) {
+      if (error?.code === 11000) {
+        throw new Error(
+          `CONFLICT: A stored pricing already has version ${resetEscapeVersion(pricingData.version)} of service ${pricingData._serviceName} in this organization, but the service does not list it`
+        );
+      }
+      throw error;
+    }
+    if (!savedPricing) {
+      throw new Error(`Pricing ${pricingData.version} not saved`);
+    }
+    return savedPricing;
+  }
+
+  /**
+   * An upload of a version that `service` (enabled, or disabled and being
+   * enabled again) has archived. Versions are immutable once contracts may
+   * use them, so the archived version is never replaced:
+   * - same content (`pricingContentHash`, compared with the stored version):
+   *   the archived version is active again, the same pricing document (or
+   *   URL) as before, so contracts on it work as they did. A disabled service
+   *   is enabled with it as its only active version; its other versions stay
+   *   archived. PRICING_ACTIVED is announced.
+   * - other content, or stored content that cannot be read: `CONFLICT:`.
+   *
+   * @returns the updated service, or null when the version is not archived.
+   */
+  async _reactivateArchivedVersion(
+    service: LeanService | null,
+    version: string,
+    uploaded: any,
+    organizationId: string
+  ): Promise<LeanService | null> {
+    const locator: any = service ? plainMap(service.archivedPricings)[version] : undefined;
+    if (!service || !locator) return null;
+
+    const shown = resetEscapeVersion(version);
+    let stored: any = null;
+    try {
+      stored = locator.id
+        ? await this.pricingRepository.findById(String(locator.id))
+        : locator.url
+          ? await this._getPricingFromUrl(locator.url)
+          : null;
+    } catch {
+      stored = null;
+    }
+    if (!stored) {
+      throw new Error(
+        `CONFLICT: Version ${shown} of service ${service.name} is archived and its stored content cannot be read to compare it with this upload; upload it as another version`
+      );
+    }
+    if (pricingContentHash(stored) !== pricingContentHash(uploaded)) {
+      throw new Error(
+        `CONFLICT: Version ${shown} of service ${service.name} is archived with other content; a version cannot change once contracts may use it. Upload it as another version, or activate the archived one (PUT .../pricings/${shown}?availability=active)`
+      );
+    }
+
+    const update: any = service.disabled
+      ? {
+          disabled: false,
+          activePricings: new Map([[version, locator]]),
+          archivedPricings: pricingsOnReenable(service, version, true),
+        }
+      : {
+          [`activePricings.${version}`]: locator,
+          [`archivedPricings.${version}`]: undefined,
+        };
+    const updated = await this.serviceRepository.update(service.name, update, organizationId);
+    if (!updated) {
+      throw new Error(`NOT FOUND: Service with name ${service.name}`);
+    }
+
+    await this.cacheService.del(`service.${organizationId}.${service.name}`);
+    this.eventService.emitPricingActivedMessage(service.name, shown);
+    return updated;
   }
 
   async _createFromUrl(pricingUrl: string, organizationId: string, serviceName?: string) {
@@ -803,6 +885,14 @@ class ServiceService {
       }
 
       if (existingDisabled) {
+        const reactivated = await this._reactivateArchivedVersion(
+          existingDisabled,
+          formattedPricingVersion,
+          parsePricingToSpacePricingObject(uploadedPricing),
+          organizationId
+        );
+        if (reactivated) return reactivated;
+
         // Versions of the disabled service stay archived: contracts may still use them.
         const newArchived = pricingsOnReenable(existingDisabled, formattedPricingVersion);
 
@@ -865,38 +955,21 @@ class ServiceService {
         );
       }
 
-      const updatePayload: any = {};
-
-      // If exists in archived, rename archived entry first
-      if (service.archivedPricings && service.archivedPricings.has(formattedPricingVersion)) {
-        const newKey = `${formattedPricingVersion}_${Date.now()}`;
-        updatePayload[`archivedPricings.${newKey}`] =
-          service.archivedPricings.get(formattedPricingVersion);
-        updatePayload[`archivedPricings.${formattedPricingVersion}`] = undefined;
-      }
-
-      // If disabled, re-enable and move previous active into archived
-      if ((service as any).disabled) {
-        // Versions of the disabled service stay archived: contracts may still use them.
-        const newArchived = pricingsOnReenable(service, formattedPricingVersion);
-
-        updatePayload.disabled = false;
-        updatePayload.organizationId = organizationId;
-        updatePayload.activePricings = {
-          [formattedPricingVersion]: {
-            url: pricingUrl,
-          },
-        };
-        updatePayload.archivedPricings = newArchived;
-      } else {
-        updatePayload[`activePricings.${formattedPricingVersion}`] = {
-          url: pricingUrl,
-        };
+      // Archived: active again with the same content, refused otherwise.
+      const reactivated = await this._reactivateArchivedVersion(
+        service,
+        formattedPricingVersion,
+        parsePricingToSpacePricingObject(uploadedPricing),
+        organizationId
+      );
+      if (reactivated) {
+        resetEscapeVersionInService(reactivated);
+        return reactivated;
       }
 
       const updatedService = await this.serviceRepository.update(
         service.name,
-        updatePayload,
+        { [`activePricings.${formattedPricingVersion}`]: { url: pricingUrl } },
         organizationId
       );
 

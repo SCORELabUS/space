@@ -261,7 +261,9 @@ class ServiceController {
       }
       res.status(201).json(service);
     } catch (err: any) {
-      if (
+      if (err.message.startsWith('CONFLICT')) {
+        res.status(409).send({ error: err.message });
+      } else if (
         err.message.toLowerCase().includes('parsing') ||
         err.message.toLowerCase().includes('already exists') ||
         err.message.toLowerCase().includes('invalid')
@@ -304,7 +306,9 @@ class ServiceController {
 
       res.status(201).json(service);
     } catch (err: any) {
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err.message.startsWith('CONFLICT')) {
+        res.status(409).send({ error: err.message });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('exists')) {
         res.status(400).send({ error: err.message });
