@@ -4,7 +4,7 @@ import PricingModel from '../repositories/mongoose/models/PricingMongoose';
 import { createHash } from 'node:crypto';
 import { retrievePricingFromPath, retrievePricingFromText } from 'pricing4ts/server';
 import container from '../config/container';
-import ServiceRepository, { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository';
+import ServiceRepository, { exactName, ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository';
 import { parsePricingToSpacePricingObject } from '../utils/pricing-yaml2json';
 import { Pricing } from 'pricing4ts';
 import fetch from 'node-fetch';
@@ -25,7 +25,7 @@ import CacheService from './CacheService';
 import OrganizationRepository from '../repositories/mongoose/OrganizationRepository';
 import yaml from 'js-yaml';
 import { SphereVersionNotListedError } from './sphere/errors';
-import { isPrivateSnapshotPath, storedYamlFile } from './sphere/snapshots';
+import { isPrivateSnapshotPath, PUBLIC_SNAPSHOT_PREFIX, storedYamlFile } from './sphere/snapshots';
 import { contractCacheKeys } from '../utils/contracts/cacheKeys';
 
 /** A pricing version exists, but its Pricing2Yaml file cannot be provided. */
@@ -203,7 +203,8 @@ class ServiceService {
     for (const method of ['disable', 'destroy'] as const) {
       const original = this[method].bind(this);
       (this as any)[method] = async (name: string, organizationId: string) => {
-        const linked: any = await ServiceModel.findOne({ name, organizationId, source: 'sphere' }).lean();
+        // Exact name, any casing: another casing must not bypass the SPHERE removal.
+        const linked: any = await ServiceModel.findOne({ name: exactName(name), organizationId, source: 'sphere' }).lean();
         if (!linked) return original(name, organizationId);
         return withOrganizationLock(organizationId, async assertOwned => {
           const current: any = await ServiceModel.findById(linked._id).lean();
@@ -217,7 +218,7 @@ class ServiceService {
       const original = (this[method] as (...args: any[]) => Promise<any>).bind(this);
       (this as any)[method] = async (...args: any[]) => {
         const organizationId = args[args.length - 1];
-        if (await ServiceModel.exists({ name: args[0], organizationId, source: 'sphere' })) {
+        if (await ServiceModel.exists({ name: exactName(args[0]), organizationId, source: 'sphere' })) {
           if (method === 'update' && args[1] && 'defaultVersion' in args[1]) {
             throw new Error('INVALID DATA: the version for new contracts of a SPHERE-linked service is decided by its synchronization policy');
           }
@@ -1351,32 +1352,41 @@ class ServiceService {
    * organization (see `_removeServicesFromContracts`). Disabled services are
    * deleted too, and removed from the contracts that still hold them. The
    * contracts are updated first, so a failure leaves the services in place and
-   * the prune can be retried.
+   * the prune can be retried. Exactly the services that were read are deleted
+   * (a service created meanwhile was not removed from contracts, so it stays),
+   * and with them their pricing documents and stored YAML files.
    */
   async prune(organizationId?: string) {
     const linked = await ServiceModel.find({ ...(organizationId ? { organizationId } : {}), source: 'sphere' }).lean();
     for (const service of linked) await this.destroy(service.name, service.organizationId);
 
     // Every remaining service, enabled or disabled, of every page.
-    const remaining: { name: string; organizationId: string }[] = await ServiceModel.find(
+    const remaining: LeanService[] = await ServiceModel.find(
       organizationId ? { organizationId } : {},
-      { name: 1, organizationId: 1 }
+      { name: 1, organizationId: 1, activePricings: 1, archivedPricings: 1 }
     ).lean() as any;
-    const byOrganization = new Map<string, string[]>();
-    for (const { name, organizationId: org } of remaining) {
-      byOrganization.set(String(org), [...(byOrganization.get(String(org)) ?? []), name]);
+    const byOrganization = new Map<string, LeanService[]>();
+    for (const service of remaining) {
+      const org = String(service.organizationId);
+      byOrganization.set(org, [...(byOrganization.get(org) ?? []), service]);
     }
 
-    for (const [org, names] of byOrganization) {
+    let deleted = 0;
+    for (const [org, services] of byOrganization) {
+      const names = services.map(service => service.name);
       await this._removeServicesFromContracts(names, org);
       await this.cacheService.delMany(names.map(name => `service.${org}.${name}`));
+      deleted += await this.serviceRepository.destroyByIds(services.map(service => String((service as any)._id)), org);
+      await this._deletePricingsOfServices(services, org);
     }
 
-    const result = await this.serviceRepository.prune(organizationId);
-    return result;
+    return deleted;
   }
 
-  /** Delete a service irreversibly, after removing it from every contract of the organization. */
+  /**
+   * Delete a service irreversibly, after removing it from every contract of
+   * the organization, with its pricing documents and stored YAML files.
+   */
   async destroy(serviceName: string, organizationId: string) {
     const cacheKey = `service.${organizationId}.${serviceName}`;
     let service = await this.cacheService.get(cacheKey);
@@ -1396,10 +1406,59 @@ class ServiceService {
 
     await this._removeServicesFromContracts([service.name], organizationId);
 
-    const result = await this.serviceRepository.destroy(service.name, organizationId);
-    await this.cacheService.del(cacheKey);
+    const deleted = await this.serviceRepository.destroy(service.name, organizationId);
+    await this.cacheService.delMany([cacheKey, `service.${organizationId}.${service.name}`]);
+    if (!deleted) {
+      return null;
+    }
+    await this._deletePricingsOfServices([deleted], organizationId);
 
-    return result;
+    return true;
+  }
+
+  /**
+   * Delete the stored pricings of services that were just deleted from the
+   * organization: those they listed (by id) and those that carry their names
+   * (exact, case-insensitive), in that organization only, except any that a
+   * service of the organization still lists (one created again with the same
+   * name meanwhile). SPHERE snapshot copies are left to SPHERE
+   * synchronization. Then their YAML files, each only when no stored pricing
+   * (of any organization) refers to it any more.
+   */
+  async _deletePricingsOfServices(services: LeanService[], organizationId: string): Promise<void> {
+    const candidates = await this.pricingRepository.findOfServices(
+      organizationId,
+      services.map(service => service.name),
+      services.flatMap(pricingIdsOf)
+    );
+    if (candidates.length === 0) return;
+
+    const inUse = new Set(
+      (await this.serviceRepository.findPricingLocators(organizationId)).flatMap(pricingIdsOf)
+    );
+    const pricings = candidates.filter(pricing => !inUse.has(pricing.id));
+
+    await this.pricingRepository.destroyByIds(pricings.map(pricing => pricing.id));
+    await this.cacheService.delMany(pricings.map(pricing => `pricing.id.${pricing.id}`));
+
+    const yamlPaths = new Set(pricings.map(pricing => pricing.yamlPath).filter(Boolean) as string[]);
+    for (const yamlPath of yamlPaths) {
+      if (!this._isUploadedPricingYamlPath(yamlPath)) continue;
+      if (await this.pricingRepository.existsWithYamlPath(yamlPath)) continue;
+      const file = storedYamlFile(yamlPath);
+      if (!file) continue;
+      try {
+        fs.rmSync(file, { force: true });
+      } catch (error) {
+        // The pricing is gone; a file that cannot be removed is reported, not fatal.
+        console.error(`Pricing file ${yamlPath} could not be removed:`, (error as Error).message);
+      }
+    }
+  }
+
+  /** `yamlPath` of an uploaded pricing (not a SPHERE snapshot). */
+  _isUploadedPricingYamlPath(yamlPath: string): boolean {
+    return yamlPath.startsWith('/static/pricings/') && !yamlPath.startsWith(PUBLIC_SNAPSHOT_PREFIX) && !isPrivateSnapshotPath(yamlPath);
   }
 
   /**
