@@ -30,7 +30,8 @@ import { uploadPetclinicService, writePetclinicVariant } from './utils/services/
  */
 
 const B = 'vetclinic';
-const FORBIDDEN = 'moving a service to another organization requires the OWNER or ADMIN role in both organizations';
+const FORBIDDEN =
+  'moving a service to another organization requires the OWNER or ADMIN role in its organization and the OWNER, ADMIN or MANAGER role in the target organization';
 
 describe('Moving a service to another organization: authorization', function () {
   let app: Server;
@@ -175,15 +176,14 @@ describe('Moving a service to another organization: authorization', function () 
       expect(update).not.toHaveBeenCalled();
     });
 
-    it('for an ADMIN of the source organization who is MANAGER or EVALUATOR of the target', async function () {
+    it('for an ADMIN of the source organization who is EVALUATOR of the target', async function () {
       await member(source, caller, 'ADMIN');
-      await member(target, caller, 'MANAGER');
-      await expectRefused(await moveAs(caller), before, events);
+      await member(target, caller, 'EVALUATOR');
 
-      const evaluator = await newUser();
-      await member(source, evaluator, 'ADMIN');
-      await member(target, evaluator, 'EVALUATOR');
-      await expectRefused(await moveAs(evaluator), before, events);
+      const response = await moveAs(caller);
+
+      await expectRefused(response, before, events);
+      expect(response.body.error).toContain(FORBIDDEN);
       expect(update).not.toHaveBeenCalled();
     });
 
@@ -212,6 +212,19 @@ describe('Moving a service to another organization: authorization', function () 
 
     it('for the OWNER of the source who is ADMIN of the target', async function () {
       await member(target, sourceOwner, 'ADMIN');
+
+      await expectMoved(await moveAs(sourceOwner));
+    });
+
+    it('for an ADMIN of the source who is MANAGER of the target (the role that may create services there)', async function () {
+      await member(source, caller, 'ADMIN');
+      await member(target, caller, 'MANAGER');
+
+      await expectMoved(await moveAs(caller));
+    });
+
+    it('for the OWNER of the source who is MANAGER of the target', async function () {
+      await member(target, sourceOwner, 'MANAGER');
 
       await expectMoved(await moveAs(sourceOwner));
     });

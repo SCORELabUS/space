@@ -305,7 +305,7 @@ describe('Services API Test Suite', function () {
 
       const responseUpdate = await request(app)
         .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN of both organizations
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target
         .send({ organizationId: newOrganization.id });
 
       expect(responseUpdate.status).toEqual(200);
@@ -348,7 +348,7 @@ describe('Services API Test Suite', function () {
       // Move service to new organization
       const updateResponse = await request(app)
         .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN of both organizations
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target
         .send({ organizationId: newOrganization.id });
 
       expect(updateResponse.status).toEqual(200);
@@ -397,7 +397,7 @@ describe('Services API Test Suite', function () {
       const newOrganization = await createTestOrganization(ownerUser.username);
       const updateResponse = await request(app)
         .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN of both organizations
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target
         .send({ organizationId: newOrganization.id });
 
       expect(updateResponse.status).toEqual(200);
@@ -438,7 +438,7 @@ describe('Services API Test Suite', function () {
 
       const responseUpdate = await request(app)
         .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN of both organizations
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target
         .send({ name: newName, organizationId: newOrganization.id });
 
       expect(responseUpdate.status).toEqual(200);
@@ -499,7 +499,7 @@ describe('Services API Test Suite', function () {
 
       const updateResponse = await request(app)
         .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN of both organizations
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target
         .send({ name: newName, organizationId: newOrganization.id });
 
       expect(updateResponse.status).toEqual(200);

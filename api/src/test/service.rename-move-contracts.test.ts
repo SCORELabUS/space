@@ -59,8 +59,8 @@ describe('Renaming and moving services: contracts', function () {
   const stored = async (id: string, organizationId = source.id) =>
     ContractMongoose.findOne({ organizationId, 'userContact.userId': id }).lean() as any;
   const keysOf = (contract: any, field: string) => Object.keys(contract?.[field] ?? {}).map(key => key.toLowerCase());
-  // A move (organizationId) needs OWNER or ADMIN of both organizations: the
-  // owner of both, on the organization-scoped route.
+  // A move (organizationId) needs OWNER or ADMIN here and OWNER, ADMIN or
+  // MANAGER in the target: the owner of both, on the organization-scoped route.
   const update = (body: any, name = 'Vetclinic', key = sourceKey) =>
     body.organizationId
       ? request(app).put(`${baseUrl}/organizations/${source.id}/services/${name}`).set('x-api-key', owner.apiKey).send(body)

@@ -700,7 +700,7 @@ describe('Contract userId unique per organization', function () {
       expect(inA.status, JSON.stringify(inA.body)).toBe(201);
       expect((await createContract(keyB, shared, 'mover-b', 'GOLD')).status).toBe(201);
 
-      // A move needs OWNER or ADMIN of both organizations (here a platform ADMIN).
+      // A move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target (here a platform ADMIN).
       const move = await request(app)
         .put(`${baseUrl}/organizations/${orgA.id}/services/${zoomName}`)
         .set('x-api-key', admin.apiKey)
