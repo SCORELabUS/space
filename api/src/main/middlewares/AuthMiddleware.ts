@@ -297,26 +297,33 @@ const hasPermission = (requiredRoles: (OrganizationApiKeyRole | OrganizationUser
   };
 };
 
-/** Organization roles that may move services out of and into an organization. */
-const SERVICE_MOVE_ROLES: OrganizationUserRole[] = ['OWNER', 'ADMIN'];
+/**
+ * Organization roles that may move a service out of an organization (for it, a
+ * move is like deleting the service, which needs OWNER or ADMIN) and into one
+ * (the roles that may create services there).
+ */
+const SERVICE_MOVE_SOURCE_ROLES: OrganizationUserRole[] = ['OWNER', 'ADMIN'];
+const SERVICE_MOVE_TARGET_ROLES: OrganizationUserRole[] = ['OWNER', 'ADMIN', 'MANAGER'];
 
 const SERVICE_MOVE_FORBIDDEN =
-  'Forbidden: moving a service to another organization requires the OWNER or ADMIN role in both organizations';
+  'Forbidden: moving a service to another organization requires the OWNER or ADMIN role in its organization and ' +
+  'the OWNER, ADMIN or MANAGER role in the target organization';
 
 const SERVICE_MOVE_ORGANIZATION_KEY =
   'Forbidden: an organization API key cannot move services to another organization. Moving a service requires a ' +
-  'user API key with the OWNER or ADMIN role in both organizations (PUT /organizations/{organizationId}/services/{serviceName})';
+  'user API key with the OWNER or ADMIN role in its organization and the OWNER, ADMIN or MANAGER role in the target ' +
+  'organization (PUT /organizations/{organizationId}/services/{serviceName})';
 
 /**
  * Authorize moving a service to another organization (`organizationId` in the
  * body of `PUT .../services/{serviceName}`), before anything is read or
  * written for the move. A move takes the service and its contracts out of one
  * organization (like deleting it there, which needs OWNER or ADMIN) and into
- * another (which the caller must be allowed to manage too), so:
+ * another (where the caller must be allowed to create services), so:
  * - organization API keys are refused: a key is a credential of one
  *   organization only;
  * - users need OWNER or ADMIN in the source organization (the route already
- *   checked membership) and in the target organization;
+ *   checked membership) and OWNER, ADMIN or MANAGER in the target organization;
  * - platform ADMIN users may move any service.
  * A target organization that does not exist gets the same 403 as one the
  * caller has no rights in, so the answer does not tell which organization ids
@@ -338,7 +345,7 @@ const authorizeServiceMove = async (req: Request, res: Response, next: NextFunct
     return next();
   }
 
-  if (!SERVICE_MOVE_ROLES.includes(req.user.orgRole as OrganizationUserRole)) {
+  if (!SERVICE_MOVE_SOURCE_ROLES.includes(req.user.orgRole as OrganizationUserRole)) {
     return res.status(403).json({ error: SERVICE_MOVE_FORBIDDEN });
   }
 
@@ -364,7 +371,7 @@ const authorizeServiceMove = async (req: Request, res: Response, next: NextFunct
     }
   }
 
-  if (!targetRole || !SERVICE_MOVE_ROLES.includes(targetRole)) {
+  if (!targetRole || !SERVICE_MOVE_TARGET_ROLES.includes(targetRole)) {
     return res.status(403).json({ error: SERVICE_MOVE_FORBIDDEN });
   }
 
