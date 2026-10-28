@@ -150,9 +150,10 @@ info:
     - The pricings of the service follow it (`GET .../services/{newName}/pricings` in its organization).
 
     **Who may move a service.** A move takes the service and its contracts out of one organization and into another,
-    so the caller must be allowed to manage services in both: a user with the OWNER or ADMIN role in the organization
-    the service is in and in the target organization (`PUT /organizations/{organizationId}/services/{serviceName}`),
-    or a platform ADMIN. Organization API keys cannot move services (`403`): a key belongs to one organization. A
+    so the caller must be allowed to do that in both: a user with the OWNER or ADMIN role in the organization the
+    service is in (for it, a move is like deleting the service) and the OWNER, ADMIN or MANAGER role in the target
+    organization (the roles that may create services there), on
+    `PUT /organizations/{organizationId}/services/{serviceName}`, or a platform ADMIN. Organization API keys cannot move services (`403`): a key belongs to one organization. A
     target organization that does not exist gets the same `403` as one the caller has no rights in. This is checked
     before anything is read or written for the move. Renaming and `defaultVersion` keep their permissions.
     Everything that can refuse the request is checked first, and a `409` changes nothing: the name is taken by
@@ -2026,8 +2027,8 @@ paths:
 
         **Permission**: 
         - USER user: OWNER/ADMIN/MANAGER role required to rename it or set `defaultVersion`. Moving it to another
-          organization (`organizationId`) requires the OWNER or ADMIN role in this organization **and** in the target
-          organization; otherwise `403`, also when the target organization does not exist (see "Renaming and moving
+          organization (`organizationId`) requires the OWNER or ADMIN role in this organization **and** the OWNER,
+          ADMIN or MANAGER role in the target organization; otherwise `403`, also when the target organization does not exist (see "Renaming and moving
           services").
         - ADMIN user: can update services in any organization, and move them to any organization (`400` when it does
           not exist)
@@ -2089,7 +2090,8 @@ paths:
         '403':
           description: |
             Forbidden. For a move (`organizationId`): the caller is an organization API key, or does not have the
-            OWNER or ADMIN role in both organizations, or the target organization does not exist (the same answer, so
+            OWNER or ADMIN role in the service's organization and the OWNER, ADMIN or MANAGER role in the target, or
+            the target organization does not exist (the same answer, so
             that it does not reveal which organization ids exist). Nothing was changed.
         '404':
           description: Service not found
@@ -2665,7 +2667,8 @@ paths:
           - Moving the service to another organization (`organizationId` other than the key's organization) is
             refused with `403` for every scope: an organization API key belongs to one organization. Use
             `PUT /organizations/{organizationId}/services/{serviceName}` with a user API key that has the OWNER or
-            ADMIN role in both organizations (see "Renaming and moving services").
+            ADMIN role in this organization and the OWNER, ADMIN or MANAGER role in the target (see "Renaming and
+            moving services").
 
         **Cascading Operations** (every contract of the organization; see "Renaming and moving services"):
         - Renaming a service renames it in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
@@ -2719,7 +2722,8 @@ paths:
         '403':
           description: |
             Forbidden. For a move (`organizationId`): the caller is an organization API key, or does not have the
-            OWNER or ADMIN role in both organizations, or the target organization does not exist (the same answer, so
+            OWNER or ADMIN role in the service's organization and the OWNER, ADMIN or MANAGER role in the target, or
+            the target organization does not exist (the same answer, so
             that it does not reveal which organization ids exist). Nothing was changed.
         '404':
           description: Service not found
