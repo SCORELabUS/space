@@ -129,11 +129,6 @@ class FeatureEvaluationService {
   }
 
   async generatePricingToken(userId: string, reqOrg: any, options: { server: boolean }): Promise<string> {
-    const prepared = currentIdempotencyExecution()?.record.plan;
-    if (prepared && ['consume', 'revert'].includes(prepared.kind)) {
-      const result = await executeIdempotentAction(prepared);
-      return prepared.kind === 'consume' ? consumptionEvaluation(prepared, result) : result ?? true;
-    }
     // Resolve the contract within the caller's organization before anything
     // cached under this userId is returned.
     const contract = await this.contractService.show(userId, reqOrg.id);
@@ -207,6 +202,11 @@ class FeatureEvaluationService {
     reqOrg: any,
     options: SingleFeatureEvalQueryParams
   ): Promise<boolean | FeatureEvaluationResult | ConsumptionRevertResult> {
+    const prepared = currentIdempotencyExecution()?.record.plan;
+    if (prepared && ['consume', 'revert'].includes(prepared.kind)) {
+      const result = await executeIdempotentAction(prepared);
+      if (prepared.kind !== 'consume' || result.status !== 'changed') return prepared.kind === 'consume' ? consumptionEvaluation(prepared, result) : result ?? true;
+    }
     // Resolve the contract within the caller's organization before anything
     // cached under this userId is returned.
     const { organizationId } = await this.contractService.show(userId, reqOrg.id);

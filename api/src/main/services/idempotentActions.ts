@@ -87,9 +87,17 @@ export async function executeIdempotentAction(proposed: IdempotentAction): Promi
         } else {
           await consumptions.delete(action.consumption.id);
           const latest = await contracts.findByUserId(action.consumption.userId, action.organizationId);
-          if (!latest) throw new Error('Contract not found while recovering consumption');
+          if (!latest || latest.id !== action.writes![0].contractId) throw new Error('Original contract not found while recovering consumption');
+          for (const path of Object.keys(action.increments ?? {})) {
+            const [service, limit] = path.split('.');
+            if (latest.usageLevels?.[service]?.[limit] === undefined) throw new Error(`Usage level ${path} not found`);
+          }
           const oldVersion = computeContractVersion(action.consumption.source);
-          if (oldVersion !== computeContractVersion(latest)) {
+          const exceedsLimit = Object.entries(action.writes![0].consume!.ceilings).some(([path, ceiling]) => {
+            const [service, limit] = path.split('.');
+            return latest.usageLevels[service][limit].consumed + action.increments![path] > ceiling;
+          });
+          if (oldVersion !== computeContractVersion(latest) || !exceedsLimit) {
             // No accepted step exists. Re-evaluate the new subscription using a
             // fresh plan, while keeping this request's stable key reservation.
             await execution.repository.resetUnappliedPlan(execution.organizationId, execution.key, execution.owner);

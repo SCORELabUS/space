@@ -82,12 +82,106 @@ describe('Idempotency crash recovery', () => {
     expect(await UsageConsumption.countDocuments({ organizationId: organization.id, userId })).toBe(1);
   });
 
+  it('recovers the last available unit as the original successful evaluation without consuming it twice', async () => {
+    expect((await create()).status).toBe(201);
+    // The stock GOLD plan includes four pets. Leave exactly one available.
+    const previous = await consume(undefined, 3);
+    expect(previous.status).toBe(200); expect(previous.body.eval).toBe(true);
+    expect(await consumed()).toBe(3);
+    const key = uuidv4(); interruptAfterApply();
+    failed(await consume(key)); expect(await consumed()).toBe(4);
+    const selected = (await journal(key)).plan.consumption.id;
+
+    const recovered = await recoverAndReplay(() => consume(key));
+    expect(recovered.body.eval).toBe(true);
+    expect(recovered.body.consumptionId).toBe(selected);
+    expect(recovered.body.used['petclinic-maxPets']).toBe(4);
+    expect(await consumed()).toBe(4);
+    expect(await UsageConsumption.countDocuments({ organizationId: organization.id, userId })).toBe(2);
+    expect((await UsageConsumption.findById(selected).lean())?.state).toBe('applied');
+  });
+
   it('recovers a usage increment after its write without applying it twice', async () => {
     expect((await create()).status).toBe(201); const key = uuidv4(); interruptAfterApply();
     failed(await increment(key)); expect(await consumed()).toBe(2);
     const response = await recoverAndReplay(() => increment(key));
     expect(response.body.usageLevels[SERVICE].maxPets.consumed).toBe(2); expect(await consumed()).toBe(2);
     expect((await stored()).history).toHaveLength(0);
+  });
+
+  it('replays an interrupted reset without erasing a later consumption and returns its original result', async () => {
+    expect((await create()).status).toBe(201);
+    expect((await consume(undefined, 2)).status).toBe(200);
+    expect(await consumed()).toBe(2);
+    const key = uuidv4(); interruptAfterApply();
+    const call = () => keyed('put', `/contracts/${userId}/usageLevels?reset=true`, key);
+    failed(await call()); expect(await consumed()).toBe(0);
+    const original: any = await Contract.findOne({ organizationId: organization.id, 'userContact.userId': userId })
+      .select('+idempotencyReceipt').lean();
+    const snapshot = original.idempotencyReceipt.result;
+    expect(snapshot.usageLevels[SERVICE].maxPets.consumed).toBe(0);
+
+    const later = await consume();
+    expect(later.status).toBe(200); expect(later.body.eval).toBe(true);
+    expect(await consumed()).toBe(1);
+    const recovered = await recoverAndReplay(call);
+    expect(recovered.body.id).toBe(snapshot.id);
+    expect(recovered.body.usageLevels[SERVICE].maxPets.consumed).toBe(0);
+    expect(await consumed()).toBe(1);
+    expect((await UsageConsumption.findById(later.body.consumptionId).lean())?.revertedAt).toBeUndefined();
+  });
+
+  it('renews a running request through its heartbeat while a same-key contender remains blocked', async () => {
+    expect((await create()).status).toBe(201);
+    vi.stubEnv('IDEMPOTENCY_WAIT_MS', '0');
+    const realSetInterval = globalThis.setInterval;
+    let heartbeat: (() => void) | undefined;
+    vi.spyOn(globalThis, 'setInterval').mockImplementation(((callback: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+      if (ms === 20_000) heartbeat = () => callback(...args);
+      return realSetInterval(callback, ms, ...args);
+    }) as typeof setInterval);
+
+    const receipts: any = container.resolve('idempotencyContractRepository');
+    const originalApply = receipts.apply.bind(receipts);
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const apply = vi.spyOn(receipts, 'apply').mockImplementation(async (...args: any[]) => {
+      entered(); await gate; return originalApply(...args);
+    });
+    const repository: any = container.resolve('idempotencyKeyRepository');
+    const originalRenew = repository.renew.bind(repository);
+    let renewed!: () => void;
+    const didRenew = new Promise<void>(resolve => { renewed = resolve; });
+    const renew = vi.spyOn(repository, 'renew').mockImplementationOnce(async (...args: any[]) => {
+      const record = await originalRenew(...args); renewed(); return record;
+    });
+    const key = uuidv4();
+    const pending = increment(key).then(response => response);
+    let first!: request.Response;
+    try {
+      await started;
+      expect(heartbeat).toBeTypeOf('function');
+      // Make the improvement deterministic without advancing global timers or sleeping.
+      await IdempotencyKey.updateOne({ organizationId: organization.id, key }, { $set: { lockedUntil: new Date(Date.now() + 5000) } });
+      const before = await journal(key);
+      heartbeat!(); await didRenew;
+      const after = await journal(key);
+      expect(renew).toHaveBeenCalledWith(organization.id, key, before.owner, 60);
+      expect(after.lockedUntil.getTime()).toBeGreaterThan(before.lockedUntil.getTime());
+      expect(after.operationId).toBe(before.operationId);
+      const contender = await increment(key);
+      expect(contender.status).toBe(409);
+      expect(contender.body.code).toBe('IDEMPOTENCY_IN_PROGRESS');
+      expect(contender.headers['retry-after']).toBe('1');
+      expect(await consumed()).toBe(0);
+    } finally { release(); first = await pending; }
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(await consumed()).toBe(2);
+    const retry = await increment(key);
+    expect(retry.status).toBe(200); expect(retry.headers['idempotent-replayed']).toBe('true');
+    expect(retry.body).toEqual(first.body); expect(await consumed()).toBe(2);
   });
 
   it('recovers a creation with its preallocated identity and original 201 response', async () => {
@@ -193,5 +287,32 @@ describe('Idempotency crash recovery', () => {
     expect((await UsageConsumption.findById(second.body.consumptionId).lean())?.revertedAt).toBeUndefined();
     const last = await request(app).post(`${baseUrl}/features/${userId}/${FEATURE}?revert=true&consumptionId=${second.body.consumptionId}`).set('x-api-key', apiKey);
     expect(last.status, JSON.stringify(last.body)).toBe(204); expect(await consumed()).toBe(0);
+  });
+
+  it('finishes the original legacy revert after its only consumption was already acknowledged', async () => {
+    expect((await create()).status).toBe(201);
+    const target = await consume(); expect(target.status).toBe(200); expect(await consumed()).toBe(1);
+    const repository: any = container.resolve('usageConsumptionRepository');
+    const original = repository.complete.bind(repository);
+    vi.spyOn(repository, 'complete').mockImplementationOnce(async (...args: any[]) => {
+      await original(...args); throw new Error('Injected failure after the only legacy consumption was refunded and acknowledged');
+    });
+    const selection = vi.spyOn(repository, 'claimRecent');
+    const key = uuidv4();
+    const call = () => keyed('post', `/features/${userId}/${FEATURE}?revert=true`, key);
+    failed(await call()); expect(await consumed()).toBe(0);
+    expect((await UsageConsumption.findById(target.body.consumptionId).lean())?.revertedAt).toBeInstanceOf(Date);
+    expect(selection).toHaveBeenCalledTimes(1);
+    const prepared = await journal(key);
+    expect(prepared.plan.consumption.id).toBe(target.body.consumptionId);
+    const recovered = await recoverAndReplay(call, 204);
+    expect(recovered.text).toBe(''); expect(await consumed()).toBe(0);
+    // A retry resumes the frozen plan; finding no unrefunded consumption is not recovery.
+    expect(selection).toHaveBeenCalledTimes(1);
+    const completed = await journal(key);
+    expect(completed.operationId).toBe(prepared.operationId);
+    expect(completed.plan.consumption.id).toBe(target.body.consumptionId);
+    expect(completed.result).toEqual({ value: null });
+    expect(await UsageConsumption.countDocuments({ organizationId: organization.id, userId })).toBe(1);
   });
 });
