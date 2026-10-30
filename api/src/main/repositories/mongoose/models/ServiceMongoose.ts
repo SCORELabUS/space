@@ -1,3 +1,4 @@
+import { publicSphereSource } from '../../../services/sphere/types';
 import { assertOrganizationLease } from '../../../services/sphere/lock';
 import mongoose, { Schema } from 'mongoose';
 
@@ -29,6 +30,8 @@ const serviceSchema = new Schema(
       transform: function (doc, resultObject, options) {
         delete resultObject._id;
         delete resultObject.__v;
+        // The SPHERE API key never leaves the database: responses show hasApiKey.
+        if (resultObject.sphere) resultObject.sphere = publicSphereSource(resultObject.sphere);
         return resultObject;
       },
     },

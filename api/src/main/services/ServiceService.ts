@@ -433,6 +433,7 @@ class ServiceService {
   async showPublicPricingUrl(serviceName: string, pricingVersion: string, organizationId: string) {
     const pricing = await this.showPricing(serviceName, pricingVersion, organizationId);
 
+
     if (pricing?.yamlPath) {
       return pricing.yamlPath;
     }

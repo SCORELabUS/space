@@ -38,6 +38,23 @@ Relative to either service collection route:
 - `PUT /{serviceName}/synchronization`: change policy/selection and queue reconciliation. Changing source identity is not supported.
 - `POST /{serviceName}/synchronization/run`: request reconciliation; returns `202`. Poll the status endpoint for completion.
 
+## Private pricings
+
+By default SPACE reads only the public versions of a SPHERE pricing. To link private versions, give the service a SPHERE API key that may read them. Use a key with **MANAGEMENT** or **ALL** scope on the organisation that owns the pricing: SPHERE treats those as owner/admin access. A **VIEW** key acts as a plain member of the organisation, so it only reveals the private versions that the key's user may read; with a VIEW key, grant that user read access on the pricing first, or SPACE will keep seeing public versions only. SPACE then sends it as `x-api-key` on every SPHERE request of that service, and SPHERE (from the release that lists private versions to authorised callers) includes the private versions in the manifest, each flagged `"private": true`.
+
+1. Set `SPHERE_KEY_ENCRYPTION_KEY` on the SPACE server: 32 random bytes as base64 or hex, for example `openssl rand -base64 32`. Without it SPACE rejects every `sphereApiKey` with `400`.
+2. Pass `sphereApiKey` when creating the service (`"source": "sphere"`) or later with `PUT /{serviceName}/synchronization`. `POST /sphere/preview` also accepts it, for that request only, so private versions can be inspected before linking.
+3. The key is write-only: SPACE stores it encrypted (AES-256-GCM, bound to the service) and never returns it. `GET` of the service and of its synchronization state shows `sphere.hasApiKey` (`configuration.hasApiKey`) instead.
+4. On `PUT`, omit `sphereApiKey` to keep the stored key, send a new one to replace it, or `null` to remove it. SPACE checks the key against SPHERE before storing it; a key SPHERE refuses is rejected with `400`.
+
+Each stored key is bound to the service, to its SPHERE pricing and to the SPHERE API origin it was entered for (`SPHERE_API_URL`, or the origin of `SPHERE_PUBLIC_URL`). If that origin changes, SPACE does not send the key to the new origin: synchronization of the service reports `degraded` with an explicit error until the key is entered again for the new SPHERE.
+
+All SPHERE snapshots, public and private, are stored outside `public/`, under `SPACE_PRIVATE_FILES_DIR` (default `./private`). They are served through the authorized `GET .../pricings/{version}?format=yaml` route. The legacy `public-url` endpoint returns that authenticated download route, with `requiresAuthentication: true`; it never exposes a static public file. Persist the private directory (the Docker Compose and Kubernetes manifests mount it). Missing files answer `404 PRICING_YAML_UNAVAILABLE` while parsed pricing and contracts remain available.
+
+Rotating `SPHERE_KEY_ENCRYPTION_KEY`: set the new key and keep the old one as `SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS`. A stored key that only the previous key decrypts is re-encrypted with the new one the next time the service uses it (synchronization runs every poll interval); remove `SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS` afterwards. If `SPHERE_KEY_ENCRYPTION_KEY` changes without the previous key, stored keys can no longer be decrypted: synchronization of those services reports `degraded` with an explicit error until the key is entered again. Removing the key does not delete private versions already imported; new versions are then chosen from the public ones only.
+
+The `/private/sphere/...` `yamlPath` is a storage reference, not a public URL. A visibility change in SPHERE cannot expose an already imported snapshot: all copies use protected storage.
+
 Organization keys need ALL or MANAGEMENT to mutate synchronization. EVALUATION may read status. User keys use organization routes with membership checks; OWNER, ADMIN and MANAGER may manage settings, and EVALUATOR may read them. The global permission table and route membership middleware both apply.
 
 The frontend's **Add New Service** form offers file, YAML URL and SPHERE sources. Linked service details display state, applied target, last successful synchronization, retained versions and migration counts. Manual pricing upload/archive/delete and local renaming/moving of linked services are rejected; use synchronization settings. Converting existing manual services or switching pricing identity is outside v1.
@@ -46,10 +63,10 @@ The frontend's **Add New Service** form offers file, YAML URL and SPHERE sources
 
 | API value | Existing bindings | New bindings | Target |
 | --- | --- | --- | --- |
-| `all_last` | Migrate | Forced target | Latest public pricing date |
-| `new_last` | Keep version | Forced target | Latest public pricing date |
-| `all_pick` | Migrate | Forced target | Selected public version ID |
-| `new_pick` | Keep version | Forced target | Selected public version ID |
+| `all_last` | Migrate | Forced target | Latest accessible pricing date |
+| `new_last` | Keep version | Forced target | Latest accessible pricing date |
+| `all_pick` | Migrate | Forced target | Selected accessible version ID |
+| `new_pick` | Keep version | Forced target | Selected accessible version ID |
 
 Adding a service to an existing contract is a new binding. The server enforces the target even when a client sends a different version. Invalid newly requested subscriptions fail validation; the automatic replacement rule applies only to migrations of existing subscriptions.
 
@@ -77,7 +94,7 @@ The worker persists run state and obtains a renewable organization lease. Bindin
 
 The only retained snapshots are currently contracted versions plus the applied target. Expired contracts still count while their current binding exists. History alone does not retain YAML. Removed local historical pricing details can be read through the existing pricing-detail endpoint, which fetches public SPHERE content without persisting it. If SPHERE no longer exposes it, retrieval reports unavailability.
 
-If the target disappears, becomes private, or SPHERE fails, SPACE keeps the applied target and permits new contracts with that copy. Last policies never automatically downgrade; they can advance to a later public version. Functional edits under an imported version ID are blocked. Renaming the SaaS or changing YAML mapping order does not change the functional fingerprint.
+If the target disappears, becomes private, or SPHERE fails, SPACE keeps the applied target and permits new contracts with that copy. Last policies never automatically downgrade; they can advance to a later accessible version. Functional edits under an imported version ID are blocked. Renaming the SaaS or changing YAML mapping order does not change the functional fingerprint.
 
 Snapshots are stored outside `public/`, under the private files directory (`SPACE_PRIVATE_FILES_DIR`, default `./private`, at `sphere/<serviceId>/<versionId>.yaml`; `yamlPath` `/private/sphere/...`), like uploaded pricing files. They are not served as static files: the owning organization reads them with `GET .../pricings/{version}?format=yaml`. Snapshots that earlier versions stored under `public/static/pricings/sphere/` are moved there at startup. Cleanup rechecks bindings and removes obsolete database documents, YAML files and caches. Staged copies may briefly exist during an unfinished run. Periodic reconciliation also removes database-backed initial imports whose service was never created, using the organization lease to avoid racing service creation. Cache invalidation includes pricing, service, contract, feature evaluations and pricing tokens. Redis distributes pricing events across instances. JWTs already held by clients retain their existing refresh/expiration semantics; clearing server cache does not revoke them.
 
@@ -107,3 +124,12 @@ SPHERE_SYNC_TEST_REDIS=true pnpm --dir api exec vitest run src/test/sphere-redis
 ### Verification performed for this change
 
 Both production builds and changed-file lint checks passed (existing hook/chunk-size warnings remain). The isolated suites passed 198 SPHERE tests and 76 SPACE tests. A separate cross-project HTTP smoke check used real SPHERE routes, real SPACE import/migration code and disposable MongoDB databases: private-version filtering, publishing a new public target, migration with preserved consumption/billing, retention, permanent-link renaming and offline operation passed. Cache and event effects were stubbed in that HTTP smoke check. Two additional tests against a disposable Redis instance verified contract/evaluation/pricing-token invalidation and event delivery between two API instances. Browser checks covered desktop/mobile, dark mode, the SPHERE form, All-policy warning, Escape dismissal and the service panel. The full legacy API suites were not run because they require their separate seeded test environment.
+
+
+### Linking private pricings in the interface
+
+In Add service → Link to SPHERE, enter the permanent link and select Check pricing. An accessible public pricing unlocks synchronization settings immediately. If SPHERE answers 401/403/404, SPACE offers a masked API-key field: “This pricing may be private. Enter a SPHERE API key with access to continue.” SPHERE deliberately gives the same 404 for missing and unreadable resources, so the interface does not claim that every 404 proves privacy. A valid key unlocks the policy/version controls and Link service; rejected keys keep them blocked. Public pricings also offer Use a SPHERE API key to discover permitted private versions of mixed-visibility families.
+
+The form discards validation after a link/key change, ignores cancelled or stale requests, and clears the key when closed. Keys are sent in request bodies, never URLs or browser storage. The server checks access again when creating the service and saves the key encrypted. A server must have `SPHERE_KEY_ENCRYPTION_KEY` configured before credentials can be saved.
+
+Edit synchronization uses the saved credential on the server without returning it. Managers can replace or remove it; each change must be validated before Save synchronization. The preview body accepts optional `serviceName` in the authenticated organization: the stored permanent-link identity must match. Omitting `sphereApiKey` then uses the saved key, null previews public access, and a string previews a replacement without saving it. Access errors have safe codes `SPHERE_ACCESS_REQUIRED`/`SPHERE_KEY_REJECTED`; transport/upstream 500 errors are kept distinct.

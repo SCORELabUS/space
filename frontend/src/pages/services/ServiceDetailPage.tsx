@@ -23,6 +23,14 @@ export default function ServiceDetailPage() {
   const { name } = useParams<{ name: string }>();
   const { user } = useAuth();
   const { currentOrganization } = useOrganization();
+  // Service drafts may contain a new SPHERE key. Never carry them into another context.
+  return <ServiceDetailContent key={JSON.stringify([name, user.apiKey, currentOrganization?.id])} />;
+}
+
+function ServiceDetailContent() {
+  const { name } = useParams<{ name: string }>();
+  const { user } = useAuth();
+  const { currentOrganization } = useOrganization();
   const [syncState, setSyncState] = useState<SyncState | null>(null);
   const [activePricings, setActivePricings] = useState<Pricing[]>([]);
   const [archivedPricings, setArchivedPricings] = useState<Pricing[]>([]);

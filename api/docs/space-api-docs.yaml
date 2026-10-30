@@ -95,6 +95,7 @@ info:
     - `novation-preview`: `POST /contracts/{userId}/novation/preview`.
     - `token-subscription`: the pricing token carries the `subscription` claim.
     - `contract-events`: authenticated Socket.IO namespace `/contracts` with contract events.
+    - `sphere-private`: SPHERE-linked services accept a write-only `sphereApiKey` to read private versions (`sphere.hasApiKey`); private versions are never served statically.
 
   contact:
     email: agarcia29@us.es
@@ -165,7 +166,7 @@ paths:
     post:
       security:
         - ApiKeyAuth: []
-      summary: Preview a public SPHERE permanent link
+      summary: Preview a SPHERE pricing and validate access
       requestBody:
         content:
           application/json:
@@ -180,6 +181,19 @@ paths:
                   enum: [all_last, new_last, all_pick, new_pick]
                 selectedVersionId:
                   type: string
+                serviceName:
+                  type: string
+                  description: >-
+                    Optional existing linked service in the authenticated organization. The permanent link must
+                    match its stored pricing identity. If sphereApiKey is omitted, the server uses its stored
+                    credential without returning it to the caller.
+                sphereApiKey:
+                  type: string
+                  nullable: true
+                  writeOnly: true
+                  description: >-
+                    Optional SPHERE API key used for this preview only, never stored. With it SPHERE also lists
+                    permitted private versions. Null previews anonymous access, even when serviceName has a saved key.
       responses:
         "200":
           description: Successful response
@@ -188,7 +202,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/SphereManifest'
         "400":
-          description: Invalid source or configuration
+          description: Invalid configuration, restricted or unavailable SPHERE pricing, rejected key or unavailable credential storage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  code:
+                    type: string
+                    enum: [SPHERE_ACCESS_REQUIRED, SPHERE_KEY_REJECTED, SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE]
+                    description: >-
+                      Present for access/key/storage failures. ACCESS_REQUIRED does not prove a resource is private:
+                      SPHERE also hides missing resources with 404. Network and upstream 500 failures do not use an access code.
         "404":
           description: Resource not available
         "202":
@@ -245,6 +271,18 @@ paths:
                   enum: [all_last, new_last, all_pick, new_pick]
                 selectedVersionId:
                   type: string
+                pollIntervalMinutes:
+                  type: integer
+                  enum: [1, 5, 15]
+                sphereApiKey:
+                  type: string
+                  nullable: true
+                  writeOnly: true
+                  description: >-
+                    SPHERE API key (`sk-...`) to read private versions. Write-only: stored encrypted (AES-256-GCM,
+                    key from `SPHERE_KEY_ENCRYPTION_KEY`) and never returned; responses show
+                    `configuration.hasApiKey`. Omit to keep the stored key, `null` removes it. Rejected with 400
+                    when `SPHERE_KEY_ENCRYPTION_KEY` is not set or SPHERE refuses the key.
       responses:
         "200":
           description: Successful response
@@ -304,7 +342,7 @@ paths:
     post:
       security:
         - ApiKeyAuth: []
-      summary: Preview a public SPHERE permanent link
+      summary: Preview a SPHERE pricing and validate access
       parameters:
         - in: path
           name: organizationId
@@ -325,6 +363,19 @@ paths:
                   enum: [all_last, new_last, all_pick, new_pick]
                 selectedVersionId:
                   type: string
+                serviceName:
+                  type: string
+                  description: >-
+                    Optional existing linked service in the authenticated organization. The permanent link must
+                    match its stored pricing identity. If sphereApiKey is omitted, the server uses its stored
+                    credential without returning it to the caller.
+                sphereApiKey:
+                  type: string
+                  nullable: true
+                  writeOnly: true
+                  description: >-
+                    Optional SPHERE API key used for this preview only, never stored. With it SPHERE also lists
+                    permitted private versions. Null previews anonymous access, even when serviceName has a saved key.
       responses:
         "200":
           description: Successful response
@@ -333,7 +384,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/SphereManifest'
         "400":
-          description: Invalid source or configuration
+          description: Invalid configuration, restricted or unavailable SPHERE pricing, rejected key or unavailable credential storage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  code:
+                    type: string
+                    enum: [SPHERE_ACCESS_REQUIRED, SPHERE_KEY_REJECTED, SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE]
+                    description: >-
+                      Present for access/key/storage failures. ACCESS_REQUIRED does not prove a resource is private:
+                      SPHERE also hides missing resources with 404. Network and upstream 500 failures do not use an access code.
         "404":
           description: Resource not available
         "202":
@@ -400,6 +463,18 @@ paths:
                   enum: [all_last, new_last, all_pick, new_pick]
                 selectedVersionId:
                   type: string
+                pollIntervalMinutes:
+                  type: integer
+                  enum: [1, 5, 15]
+                sphereApiKey:
+                  type: string
+                  nullable: true
+                  writeOnly: true
+                  description: >-
+                    SPHERE API key (`sk-...`) to read private versions. Write-only: stored encrypted (AES-256-GCM,
+                    key from `SPHERE_KEY_ENCRYPTION_KEY`) and never returned; responses show
+                    `configuration.hasApiKey`. Omit to keep the stored key, `null` removes it. Rejected with 400
+                    when `SPHERE_KEY_ENCRYPTION_KEY` is not set or SPHERE refuses the key.
       responses:
         "200":
           description: Successful response
@@ -4596,6 +4671,9 @@ components:
         version: { type: string }
         createdAt: { type: string, format: date-time }
         contentHash: { type: string, description: SHA-256 of canonical functional pricing content }
+        private:
+          type: boolean
+          description: Present only for callers whose SPHERE API key may read the pricing; `true` for a private version.
     SphereConfiguration:
       type: object
       required: [permanentUrl, policy]
@@ -4616,6 +4694,21 @@ components:
           enum: [1, 5, 15]
           default: 5
           description: How often SPACE checks SPHERE for a newer public version for this linked service.
+        sphereApiKey:
+          type: string
+          nullable: true
+          writeOnly: true
+          description: >-
+            Optional SPHERE API key (`sk-...`). SPACE sends it as `x-api-key` on every SPHERE request of this service,
+            so that private versions the key may read are listed and imported. Use a MANAGEMENT or ALL key of the organisation
+            that owns the pricing; a VIEW key only reveals what its user may read. Write-only: stored encrypted
+            (AES-256-GCM with the key in `SPHERE_KEY_ENCRYPTION_KEY`, bound to the service, its SPHERE pricing and the
+            SPHERE API origin) and never returned; if the SPHERE origin changes, SPACE does not send it there and the
+            service reports `degraded` until the key is entered again. Rotate the encryption key with
+            `SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS`. Rejected with 400 when `SPHERE_KEY_ENCRYPTION_KEY` is not set.
+            Private versions are stored outside the statically served files: they are only available through
+            `GET .../pricings/{version}?format=yaml` (authorised) and have no public URL (`.../public-url` answers
+            `404`).
     SphereCreateService:
       allOf:
         - $ref: '#/components/schemas/SphereConfiguration'
@@ -4652,6 +4745,7 @@ components:
             - type: object
               properties:
                 target: { $ref: '#/components/schemas/SphereVersion' }
+                hasApiKey: { type: boolean, description: Whether a SPHERE API key is stored for this service. }
                 revision: { type: integer }
                 status: { type: string, enum: [ready, queued, checking, applying, blocked, degraded] }
                 error: { type: string, nullable: true }
@@ -4823,6 +4917,19 @@ components:
         defaultVersion:
           type: string
           description: Manual services only, optional. Version for new contracts (see `NewContractsPricing`).
+        source:
+          type: string
+          enum: [manual, sphere]
+        sphere:
+          type: object
+          description: SPHERE binding of a linked service (see `SphereSyncState.configuration`); the API key is never included.
+          properties:
+            pricingId: { type: string }
+            permanentUrl: { type: string, format: uri }
+            policy: { type: string, enum: [all_last, new_last, all_pick, new_pick] }
+            target: { $ref: '#/components/schemas/SphereVersion' }
+            status: { type: string, enum: [ready, queued, checking, applying, blocked, degraded] }
+            hasApiKey: { type: boolean, description: Whether a SPHERE API key is stored for this service. }
 
     NewContractsPricing:
       type: object

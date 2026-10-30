@@ -22,6 +22,7 @@ const EXPECTED = [
   'novation-preview',
   'token-subscription',
   'contract-events',
+  'sphere-private',
 ];
 
 const tokens = (response: request.Response) =>
