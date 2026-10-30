@@ -19,7 +19,7 @@ import {
   SubscriptionValidationError,
   validateSubscription,
 } from '../controllers/validation/ContractValidation';
-import { performNovation } from '../utils/contracts/novation';
+import { novationFields, performNovation } from '../utils/contracts/novation';
 import CacheService from './CacheService';
 import {
   addPeriodToDate,
@@ -306,9 +306,9 @@ class ContractService {
    *        what the version covers (subscription, billing period, histories),
    *        so a novation that lands between the read and the write is not
    *        overwritten. A mismatch throws `ContractChangedError` and writes
-   *        nothing. Usage levels are not part of the version: the write still
-   *        sets the whole contract as read, so consumption recorded in that
-   *        window (`$inc`) can be lost, with or without a precondition.
+   *        nothing. Usage levels are not part of the version; the write only
+   *        sets novation fields, preserving concurrent consumption and contact
+   *        changes with or without a precondition.
    */
   async novate(
     userId: string,
@@ -348,7 +348,7 @@ class ContractService {
 
     const result = await this.contractRepository.update(
       userId,
-      newContract,
+      novationFields(newContract),
       contract.organizationId,
       guard
     );
@@ -368,7 +368,9 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
+    // A consumption may have landed after this write returned. Do not cache
+    // its earlier snapshot over the newer state.
+    await this.cacheService.del(`contracts.${userId}`);
     await this.cacheService.del(`features.${userId}.*`);
 
     return result;
@@ -462,9 +464,14 @@ class ContractService {
         throw new ContractChangedError(changed, novated);
       }
     } else {
-      const result = await this.contractRepository.bulkUpdate(updatedContracts);
-
-      if (!result) {
+      const rejected = await this.contractRepository.bulkUpdateGuarded(
+        updatedContracts.map(contract => ({ contract, guard: {} }))
+      );
+      if (rejected.length > 0) {
+        for (const contract of updatedContracts) {
+          await this.cacheService.del(`contracts.${contract.userContact.userId}`);
+          await this.cacheService.del(`features.${contract.userContact.userId}.*`);
+        }
         throw new Error(`Failed to update contracts for groupId ${groupId} within organization ${organizationId}`);
       }
     }
@@ -473,8 +480,8 @@ class ContractService {
 
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
-      this.cacheService.set(`contracts.${contract.userContact.userId}`, contract, 3600, true); // Cache for 1 hour
-      this.cacheService.del(`features.${contract.userContact.userId}.*`);
+      await this.cacheService.del(`contracts.${contract.userContact.userId}`);
+      await this.cacheService.del(`features.${contract.userContact.userId}.*`);
     }
 
     return contractsToReturn;
@@ -724,7 +731,9 @@ class ContractService {
       ); // 120 secs = 2 mins
     }
 
-    await this.cacheService.set(`contracts.${userId}`, updatedContract, 3600, true); // Cache for 1 hour
+    // A novation may have changed the subscription since the increment. Avoid
+    // restoring its previous plan from this consumption snapshot.
+    await this.cacheService.del(`contracts.${userId}`);
   }
 
   /**

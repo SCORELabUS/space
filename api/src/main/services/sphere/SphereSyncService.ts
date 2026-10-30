@@ -12,6 +12,7 @@ import { validatePricingData } from '../validation/PricingServiceValidation';
 import SphereClient, { functionalHash } from './SphereClient';
 import { SphereConfiguration, SphereManifest, SphereVersion, SyntaxUpgrade, isSphereSyncEnabled, sameSnapshotCreatedAt, selectVersion, validateConfiguration } from './types';
 import { migrateSubscription, migrateUsage } from './migration';
+import { isSphereSnapshotYamlPath, pricingYamlFile, removePricingYaml, sphereSnapshotYamlPath } from '../pricingFiles';
 import { withOrganizationLock } from './lock';
 import { SphereVersionNotListedError } from './errors';
 
@@ -237,8 +238,10 @@ export default class SphereSyncService {
     const data = parsePricingToSpacePricingObject(parsed);
     const errors = validatePricingData(data);
     if (errors.length) throw new Error(`Invalid pricing: ${errors.join(', ')}`);
-    const yamlPath = `/static/pricings/sphere/${service._id}/${version.versionId}.yaml`;
-    const file = path.resolve('public', '.' + yamlPath);
+    // Outside public/: snapshots are read only through GET .../pricings/{version}?format=yaml.
+    const yamlPath = sphereSnapshotYamlPath(String(service._id), version.versionId);
+    const file = pricingYamlFile(yamlPath);
+    if (!file) throw new Error(`Invalid SPHERE snapshot path ${yamlPath}`);
     await fs.mkdir(path.dirname(file), { recursive: true });
     // Persist the parsed Pricing2Yaml model, not the remote source text. This
     // makes a confirmed legacy-syntax upgrade explicit and reproducible.
@@ -362,7 +365,7 @@ export default class SphereSyncService {
     return true;
   }
   private async removeCopy(copy: any) {
-    if (copy.yamlPath?.startsWith('/static/pricings/sphere/')) await fs.rm(path.resolve('public', '.' + copy.yamlPath), { force: true });
+    if (isSphereSnapshotYamlPath(copy.yamlPath)) removePricingYaml(copy.yamlPath);
     await this.repository.deletePricing({ _id: copy._id });
     await container.resolve('cacheService').del(`pricing.id.${copy._id}`);
   }

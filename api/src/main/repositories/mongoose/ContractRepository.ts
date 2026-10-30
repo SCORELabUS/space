@@ -2,6 +2,7 @@ import RepositoryBase from '../RepositoryBase';
 import ContractMongoose from './models/ContractMongoose';
 import { ContractToCreate, LeanContract } from '../../types/models/Contract';
 import { toPlainObject } from '../../utils/mongoose';
+import { novationFields } from '../../utils/contracts/novation';
 
 type ContractMatchPipeline = {
   pipeline: any[];
@@ -334,8 +335,9 @@ class ContractRepository extends RepositoryBase {
   }
 
   /**
-   * Write several contracts, each only while its stored version still
-   * satisfies its guard (see `contractVersionGuard`). Never upserts.
+   * Write the novation fields of several contracts, each only while its stored
+   * version satisfies its guard (see `contractVersionGuard`). An empty guard
+   * applies an unconditional novation. Never upserts or overwrites consumption.
    *
    * @returns the userIds whose guard no longer held, so nothing was written.
    */
@@ -348,7 +350,7 @@ class ContractRepository extends RepositoryBase {
       const { userId } = contract.userContact;
       const result = await ContractMongoose.updateOne(
         { ...guard, ...byUserId(userId, contract.organizationId) },
-        { $set: contract }
+        { $set: novationFields(contract) }
       );
       if (result.matchedCount === 0) rejected.push(userId);
     }
