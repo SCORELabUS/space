@@ -241,6 +241,29 @@ describe('Uploading a pricing version the service has archived', function () {
       expect(fs.readFileSync(file).equals(bytes)).toBe(true);
     });
 
+    it.each(['feature', 'add-on'])('does not ignore a legitimate %s named _id when comparing archived content', async function (kind) {
+      const file = await yamlFileOf();
+      const bytes = fs.readFileSync(file);
+      const before = await service();
+      const changed = vetclinicFile('1.0', pricing => {
+        if (kind === 'feature') {
+          pricing.features._id = {
+            valueType: 'BOOLEAN', defaultValue: true, type: 'DOMAIN',
+          };
+          pricing.plans.GOLD.features._id = false;
+        } else {
+          pricing.addOns._id = { ...pricing.addOns.extraPets, price: 7 };
+        }
+      });
+
+      const response = await addVersion(changed);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(await service()).toEqual(before);
+      expect(await pricingDocs()).toHaveLength(2);
+      expect(fs.readFileSync(file).equals(bytes)).toBe(true);
+    });
+
     it('compares content, not formatting: the same pricing written differently is the same version', async function () {
       const reformatted = path.resolve(path.dirname(vetclinic1()), `reformatted-${uuidv4()}.yaml`);
       const pricing: any = yaml.load(fs.readFileSync(vetclinic1(), 'utf8'));

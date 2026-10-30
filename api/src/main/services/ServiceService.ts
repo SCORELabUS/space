@@ -139,9 +139,9 @@ const PRICING_CONTENT_FIELDS = ['version', 'currency', 'createdAt', 'features', 
 /**
  * Hash of the content of a pricing as SPACE stores and serves it: the fields
  * of `PRICING_CONTENT_FIELDS`, normalized by the pricing schema (so an upload
- * and a stored document get the same defaults and casts), with keys sorted and
- * document ids left out. Two uploads of the same pricing written differently
- * (layout, comments, key order) have the same hash.
+ * and a stored document get the same defaults and casts), with keys sorted.
+ * Only the explicit root content fields participate; nested map keys are
+ * retained. Layout, comments and key order do not affect the hash.
  */
 export function pricingContentHash(pricing: any): string {
   const picked = Object.fromEntries(PRICING_CONTENT_FIELDS.map(field => [field, pricing?.[field]]));
@@ -152,7 +152,9 @@ export function pricingContentHash(pricing: any): string {
     if (value && typeof value === 'object') {
       return Object.fromEntries(
         Object.keys(value)
-          .filter(key => key !== '_id' && key !== 'id' && value[key] !== undefined)
+          // Map keys such as features.id and plans.BASIC.features._id are pricing content.
+          // Storage metadata is already excluded by PRICING_CONTENT_FIELDS at the root.
+          .filter(key => value[key] !== undefined)
           .sort()
           .map(key => [key, canonical(value[key])])
       );
