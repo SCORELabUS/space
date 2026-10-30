@@ -13,6 +13,7 @@ import MongoosePricingRepository from "../repositories/mongoose/PricingRepositor
 import MongooseContractRepository from "../repositories/mongoose/ContractRepository";
 import MongooseAnalyticsRepository from "../repositories/mongoose/AnalyticsRepository";
 import MongooseOrganizationRepository from "../repositories/mongoose/OrganizationRepository";
+import MongooseUsageConsumptionRepository from "../repositories/mongoose/UsageConsumptionRepository";
 
 import CacheService from "../services/CacheService";
 import ServiceService from "../services/ServiceService";
@@ -27,7 +28,7 @@ dotenv.config();
 
 function initContainer(databaseType: string): AwilixContainer {
   const container: AwilixContainer = createContainer();
-  let userRepository, serviceRepository, pricingRepository, contractRepository, organizationRepository, analyticsRepository;
+  let userRepository, serviceRepository, pricingRepository, contractRepository, organizationRepository, analyticsRepository, usageConsumptionRepository;
   switch (databaseType) {
     case "mongoDB":
       userRepository = new MongooseUserRepository();
@@ -36,6 +37,7 @@ function initContainer(databaseType: string): AwilixContainer {
       contractRepository = new MongooseContractRepository();
       organizationRepository = new MongooseOrganizationRepository();
       analyticsRepository = new MongooseAnalyticsRepository();
+      usageConsumptionRepository = new MongooseUsageConsumptionRepository();
       break;
     default:
       throw new Error(`Unsupported database type: ${databaseType}`);
@@ -47,6 +49,7 @@ function initContainer(databaseType: string): AwilixContainer {
     contractRepository: asValue(contractRepository),
     organizationRepository: asValue(organizationRepository),
     analyticsRepository: asValue(analyticsRepository),
+    usageConsumptionRepository: asValue(usageConsumptionRepository),
     userService: asClass(UserService).singleton(),
     serviceRelocationRepository: asClass(ServiceRelocationRepository).singleton(),
     sphereSyncRepository: asClass(SphereSyncRepository).singleton(),

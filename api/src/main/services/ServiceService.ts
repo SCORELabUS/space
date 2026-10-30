@@ -20,6 +20,7 @@ import { LeanService } from '../types/models/Service';
 import { ExpectedPricingType, LeanPricing } from '../types/models/Pricing';
 import { FallBackSubscription, LeanContract } from '../types/models/Contract';
 import ContractRepository, { SERVICE_MAPS } from '../repositories/mongoose/ContractRepository';
+import UsageConsumptionRepository from '../repositories/mongoose/UsageConsumptionRepository';
 import { isSubscriptionValidInPricing } from '../controllers/validation/ContractValidation';
 import { generateUsageLevels } from '../utils/contracts/helpers';
 import { escapeVersion, resetEscapeVersion } from '../utils/helpers';
@@ -191,6 +192,7 @@ class ServiceService {
   private readonly serviceRepository: ServiceRepository;
   private readonly pricingRepository: PricingRepository;
   private readonly contractRepository: ContractRepository;
+  private readonly usageConsumptionRepository: UsageConsumptionRepository;
   private readonly organizationRepository: OrganizationRepository;
   private readonly cacheService: CacheService;
   private readonly eventService;
@@ -199,6 +201,7 @@ class ServiceService {
     this.serviceRepository = container.resolve('serviceRepository');
     this.pricingRepository = container.resolve('pricingRepository');
     this.contractRepository = container.resolve('contractRepository');
+    this.usageConsumptionRepository = container.resolve('usageConsumptionRepository');
     this.organizationRepository = container.resolve('organizationRepository');
     this.eventService = container.resolve('eventService');
     this.cacheService = container.resolve('cacheService');
@@ -212,7 +215,10 @@ class ServiceService {
           const current: any = await ServiceModel.findById(linked._id).lean();
           if (current?.sphere.status === 'applying') throw new Error('Synchronization is applying; retry after recovery');
           await assertOwned();
-          return container.resolve('sphereSyncService').removeLinkedService(String(linked._id), method === 'disable', assertOwned);
+          const removed = await container.resolve('sphereSyncService').removeLinkedService(String(linked._id), method === 'disable', assertOwned);
+          // Deleted (not disabled): its consumption records go with it, as in `_removeServicesFromContracts`.
+          if (method === 'destroy') await this.usageConsumptionRepository.deleteOfServices(organizationId, [linked.name]);
+          return removed;
         });
       };
     }
@@ -1215,6 +1221,16 @@ class ServiceService {
         await assertOwned();
         await this.relocations.applied(step._id, changed);
         const before = step.before;
+        // Replayed alongside the durable contract step, including when the
+        // contract write survived a crash before its acknowledgement.
+        if (changed && current) {
+          if (change.organizationId && current.organizationId === operation.sourceOrganizationId) {
+            await this.usageConsumptionRepository.deleteOfServices(operation.sourceOrganizationId, [operation.sourceName], before.userContact.userId);
+          } else {
+            await this.usageConsumptionRepository.renameOrMoveService(operation.sourceOrganizationId, before.userContact.userId,
+              operation.sourceName, current.organizationId !== operation.sourceOrganizationId ? change : { name: change.name });
+          }
+        }
         await this.cacheService.delMany([...contractCacheKeys(before), ...contractCacheKeys({ ...before, organizationId: operation.targetOrganizationId })]);
         if (changed && current) {
           const written = { ...current, id: String(current._id) };
@@ -1300,6 +1316,7 @@ class ServiceService {
 
     return { serviceName, organizationId, change, userIds: rows.map(row => row.userId) };
   }
+
 
   async updatePricingAvailability(
     serviceName: string,
@@ -1858,6 +1875,8 @@ class ServiceService {
    * a novation that lands in between is never overwritten: the contract is
    * read again and the removal retried. Every changed contract gets its cached
    * copy, evaluations and pricing token dropped and a CONTRACT_NOVATED event.
+   * Then the consumption records (`consumptionId`) of these services in the
+   * organization are deleted: their usage levels are gone.
    *
    * @returns how many contracts were changed.
    * @throws on any failure (nothing is reported as done that was not).
@@ -1891,6 +1910,8 @@ class ServiceService {
         );
       }
     }
+
+    await this.usageConsumptionRepository.deleteOfServices(organizationId, serviceNames);
 
     return changed;
   }

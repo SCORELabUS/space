@@ -1,5 +1,6 @@
 import container from '../../config/container';
 import ContractService from '../../services/ContractService';
+import { LeanContract } from '../../types/models/Contract';
 import {
   DetailedFeatureEvaluation,
   EvaluationContext,
@@ -31,6 +32,17 @@ async function evaluateAllFeatures(
   return result;
 }
 
+/**
+ * The subscription a consumption was evaluated against changed before it
+ * could be written: evaluate again on the stored contract.
+ */
+class ConsumptionRetryError extends Error {
+  constructor() {
+    super('CONFLICT: The contract changed while the consumption was being applied; retry');
+    this.name = 'ConsumptionRetryError';
+  }
+}
+
 async function evaluateFeature(
   featureId: string,
   pricingContext: PricingContext,
@@ -41,11 +53,13 @@ async function evaluateFeature(
     expectedConsumption?: Record<string, number>;
     userId?: string;
     organizationId?: string;
+    /** The contract the contexts were built from; the consumption is only applied to that subscription. */
+    contract?: LeanContract;
   } = {
     simple: true,
   }
 ): Promise<boolean | FeatureEvaluationResult> {
-  const featureEvaluation: FeatureEvaluationResult = _evaluate(
+  let featureEvaluation: FeatureEvaluationResult = _evaluate(
     featureId,
     pricingContext,
     subscriptionContext,
@@ -66,12 +80,11 @@ async function evaluateFeature(
         }
       }
 
-      // Then apply all consumptions after validation has passed.
-      //
-      // In one call rather than one per limit: each application reads the whole
-      // contract, increments one usage level and writes the whole contract
-      // back, so running them concurrently made every one of them start from
-      // the same state and only the last write survive.
+      // Then apply all consumptions in one conditional atomic update: every
+      // level is incremented only while it stays within its limit (the limit
+      // of the contract's current subscription, as computed above), all of
+      // them or none. The decision above was made on the contract as it was
+      // read; the update makes sure it still holds when it is written.
       if (options.userId) {
         // A userId is only unique within an organization.
         if (!options.organizationId) {
@@ -84,11 +97,32 @@ async function evaluateFeature(
           consumptions[limit] = expectedConsumption[limit];
         }
 
-        await contractService._applyExpectedConsumptions(
+        const outcome = await contractService._applyExpectedConsumptions(
           options.userId,
           consumptions,
-          options.organizationId
+          options.organizationId,
+          { limits: featureEvaluation.limit ?? {}, contract: options.contract, featureId }
         );
+
+        if (outcome.status === 'changed') {
+          throw new ConsumptionRetryError();
+        }
+
+        // `used` from the stored levels rather than from the contract that was
+        // read: under concurrency they differ, and the stored ones are what
+        // the limit was checked against.
+        const used = _usedAfter(featureEvaluation.used, consumptions, outcome.contract, outcome.status === 'applied');
+
+        if (outcome.status === 'limit') {
+          // Exactly what an evaluation over the limit answers.
+          featureEvaluation = { eval: false, used, limit: featureEvaluation.limit, error: null };
+        } else {
+          featureEvaluation = {
+            ...featureEvaluation,
+            used,
+            ...(outcome.consumptionId ? { consumptionId: outcome.consumptionId } : {}),
+          };
+        }
       }
     }
   }
@@ -98,6 +132,30 @@ async function evaluateFeature(
   } else {
     return featureEvaluation;
   }
+}
+
+/**
+ * `used` of a consumption from the stored usage levels: the level after the
+ * consumption when it was applied, or the level plus the consumption (what it
+ * would have reached) when it was refused. Limits whose level cannot be found
+ * keep the value computed from the contract that was read.
+ */
+function _usedAfter(
+  computed: Record<string, number | boolean>,
+  consumptions: Record<string, number>,
+  contract: LeanContract | undefined,
+  applied: boolean
+): Record<string, number | boolean> {
+  const used: Record<string, number | boolean> = { ...computed };
+  for (const limit of Object.keys(computed)) {
+    const serviceName = limit.split('-')[0];
+    const usageLimit = limit.split('-')[1];
+    const consumed = contract?.usageLevels?.[serviceName]?.[usageLimit]?.consumed;
+    if (typeof consumed === 'number') {
+      used[limit] = applied ? consumed : consumed + consumptions[limit];
+    }
+  }
+  return used;
 }
 
 function _evaluate(
@@ -274,4 +332,4 @@ function _updateUsageLevel(
   return currentUsageLevel + expectedConsumption;
 }
 
-export { evaluateAllFeatures, evaluateFeature };
+export { evaluateAllFeatures, evaluateFeature, ConsumptionRetryError };

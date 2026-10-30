@@ -20,6 +20,7 @@ export interface UserContact {
   phone?: string;
 }
 export interface LeanContract {
+  id?: string;
   userContact: UserContact;
   billingPeriod: {
     startDate: Date;

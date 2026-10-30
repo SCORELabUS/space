@@ -65,6 +65,63 @@ info:
     - **Org Key (scope)**: Requires Organization API Key with specified scope
     - **Org Members (role)**: Requires User API key. If the key does not have ADMIN role, the user must be a member of the organization and have –at least– the specified role.
 
+    ## Usage limits and consumption
+
+    `POST /features/{userId}/{featureId}` with an expected consumption (body: usage limit id -> amount, for
+    every limit of the feature) evaluates the feature and, when it is enabled, consumes. The limit is
+    enforced by the write itself: each usage level is incremented only while `consumed + amount` stays
+    within its limit, the limit of the contract's current subscription with its add-ons, for every limit of
+    the feature at once, and only while that subscription is still the stored one. Concurrent requests can
+    therefore never take a level past its limit: those that do not fit are answered exactly like an
+    evaluation over the limit (`eval: false`, `used` = level + amount, `limit`, `error: null`) and consume
+    nothing. Only positive amounts are bounded; a limit that is not a finite number (boolean, missing,
+    unlimited) bounds nothing.
+
+    Every applied consumption has a `consumptionId` in the response. `?revert=true&consumptionId=<id>`
+    reverts exactly that consumption: its amounts are subtracted once (repeating the revert does nothing),
+    never below zero, without touching anything else, so consumptions and changes recorded since are kept.
+    A level renewed since the consumption is left as it is. Ids are kept for
+    `CONSUMPTION_RETENTION_SECONDS` (default 24 hours) and are confined to the organization, `userId` and
+    feature; an unknown or expired id answers `404`. `?revert=true` without an id (optionally
+    `&latest=true`) is deprecated: it reverts the oldest (latest) consumption of the feature made in the
+    last two minutes, in the same way; it used to restore a cached snapshot of the level, which also undid
+    everything recorded after it.
+
+    Consumption intent is persisted before its atomic increment. Private, expiring receipts are written in
+    the same contract update as the increment or refund; interrupted acknowledgements can be recovered
+    without compensating against a newer billing period or subtracting twice. Cache failures never reopen
+    an applied refund. The original contract identity is checked, so recreating the same userId does not
+    make old records refundable against a new contract. The deprecated two-minute lookup also excludes
+    expired records, even before MongoDB TTL cleanup removes them.
+
+    Consumption records follow their service: renaming a service, or moving it to another organization,
+    rewrites the records of the contracts it rewrites (the service name, and the organization of the
+    contracts that move with it), so a revert by `consumptionId` keeps subtracting exactly what was consumed,
+    addressed with the new feature id (`<new service>-<feature>`) from the organization the contract is in
+    now. These record updates participate in the recoverable relocation steps, so a retry after a partial
+    relocation completes them without repeating contract mutations. Records of a contract that stays and loses the moved service, and of deleted services (prune,
+    destroy: exact name, case-insensitively, in that organization only), are deleted (`404`).
+
+    Each usage level of a consumption is reverted on the service it belongs to:
+    - when the contract no longer has that service (a rename or move that raced with the consumption, or the
+      service was removed from the contract), the consumption cannot be reverted exactly: the revert answers
+      `409`, subtracts nothing and does not mark the consumption reverted, even if its other levels are
+      there;
+    - when the service is still in the contract but no longer has that usage level (for example, its pricing
+      version was archived with a fallback that has no such limit, which regenerates the service's usage
+      levels), there is nothing to give back for it: the level is skipped and the other
+      levels are reverted as above, in one update. The revert then answers `200` with
+      `{ consumptionId, reverted: { <service>-<limit>: amount }, skipped: [<service>-<limit>] }`
+      (`ConsumptionRevertResult`) instead of `204`, and the consumption is reverted (repeating it answers
+      `204`).
+
+    A feature of a disabled service (dormant, see "Disabling and deleting services") consumes nothing, and a
+    revert of one of its consumptions, by id or not, answers `409 SERVICE_DISABLED` and changes nothing; the
+    consumption can be reverted exactly once the service is enabled again, within the retention period.
+
+    Renewable usage levels are renewed once per period: `consumed` goes back to 0 and `resetTimeStamp`
+    moves forward by whole periods.
+
     ## Organization isolation of contracts
 
     Contracts are addressed by `userId`, which is chosen by the host application. Every route that takes a
@@ -112,7 +169,9 @@ info:
       in the `dormantServices` claim; its `subscription` claim is still the contract.
     - Evaluation of one of its features (`POST /features/{userId}/{featureId}`) answers `200` with `eval: false` and
       `error.code: SERVICE_DISABLED`, like `FLAG_NOT_FOUND` for an unknown feature. Nothing is consumed: an expected
-      consumption gets the same answer, and `?revert=true` answers `409 SERVICE_DISABLED`.
+      consumption gets the same answer (no `consumptionId`), and `?revert=true` answers `409 SERVICE_DISABLED`, with or
+      without `consumptionId`: the consumption is not reverted, and the same revert applies once the service is enabled
+      again (while its id is retained).
     - `PUT /contracts/{userId}/usageLevels` answers `409 SERVICE_DISABLED` for increments of its usage levels; resets leave them as they are (and so does the automatic renewal of renewable levels).
     - `GET /contracts/{userId}/pricings` marks it with `serviceStatus: disabled`.
     - Novations may keep it exactly as it is (same version, plan and add-ons; listed in the preview's `dormantServices`),
@@ -189,6 +248,7 @@ info:
 
     - `contract-org-scope`: `userId` lookups are confined to the caller's organization (see above).
     - `contract-version`: contracts carry `contractVersion` and an `ETag`; novations accept `If-Match` / `expectedContractVersion` and answer `412 CONTRACT_CHANGED`.
+    - `atomic-usage-limits`: consumption never exceeds a usage limit under concurrency, applied consumptions carry `consumptionId`, and `?revert=true&consumptionId=` reverts exactly one consumption (see "Usage limits and consumption").
     - `keep-billing-period`: `keepBillingPeriod` on novations, and subscriptions validated strictly against the pricing (`400` with `errors`; archived versions rejected for new contracts and version changes).
     - `reject-private`: the opt-in `rejectPrivate` option (query or body) of contract creation and novations, which rejects private plans and add-ons.
     - `pricing-yaml`: `GET .../pricings/{version}?format=yaml` returns the stored Pricing2Yaml file.
@@ -4331,7 +4391,9 @@ paths:
     put:
       summary: Reset usage levels
       description: |
-        Resets usage level counters for a contract.
+        Resets usage level counters for a contract (`reset=true`, `usageLimit=`), or adds the amounts of the
+        body to them. Only the levels concerned are written (increments atomically), so consumptions recorded
+        meanwhile on other levels are kept. Increments are not bounded by the limits.
 
         **Authentication**: User API Key (ADMIN) | Organization API Key
 
@@ -4675,8 +4737,17 @@ paths:
     post:
       summary: Evaluate single feature
       description: |
-        Evaluates a specific feature for a user with expected consumption, returning 
-        whether the feature is allowed and any usage warnings.
+        Evaluates one feature for a user. With an expected consumption (the body), a feature that is enabled
+        also consumes: the usage levels of every limit involved are incremented in one atomic update that
+        only applies while each level stays within its limit (see "Usage limits and consumption"). When it
+        does not fit, the answer is that of an evaluation over the limit and nothing is consumed. An
+        applied consumption is identified by `consumptionId`.
+
+        With `revert=true` nothing is evaluated: the consumption named by `consumptionId` is reverted
+        (`204`; again `204` if it was already reverted). Without `consumptionId` (deprecated), the oldest
+        consumption of the feature made in the last two minutes, or the latest with `latest=true`, is
+        reverted; when there is none, nothing changes (`204`). Either way, a revert that skipped usage levels
+        which their service no longer has answers `200` with a `ConsumptionRevertResult` instead of `204`.
 
         **Authentication**: Organization API Key only
 
@@ -4698,6 +4769,7 @@ paths:
         - name: featureId
           in: path
           required: true
+          description: '`<service>-<feature>`, the service in lowercase.'
           schema:
             type: string
         - name: server
@@ -4713,44 +4785,118 @@ paths:
           schema:
             type: boolean
             default: false
-          description: Reset feature usage levels after evaluation
-        - name: latest
+          description: Revert a consumption of this feature instead of evaluating it.
+        - name: consumptionId
           in: query
           required: false
           schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+          description: |
+            With `revert=true`: the consumption to revert (`consumptionId` of the evaluation that applied
+            it). Only accepted with `revert=true`.
+        - name: latest
+          in: query
+          required: false
+          deprecated: true
+          schema:
             type: boolean
             default: false
-          description: Use the latest feature configuration
+          description: |
+            Deprecated, with `revert=true` and no `consumptionId`: revert the latest consumption of the last
+            two minutes instead of the oldest one. Use `consumptionId`.
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema:
               type: object
-              properties:
-                expectedConsumption:
-                  type: number
-                  example: 1.5
+              description: |
+                Expected consumption: usage limit id (`<service>-<limit>`) -> amount to add. When given, it
+                must name every limit involved in the evaluation of the feature (zero for a limit that this
+                call does not spend). An empty object (or no body) evaluates without consuming.
+              additionalProperties:
+                type: number
+              example:
+                petclinic-maxPets: 1
       responses:
         '200':
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  allowed:
-                    type: boolean
-                  reason:
-                    type: string
+                oneOf:
+                  - $ref: '#/components/schemas/FeatureEvaluationResult'
+                  - $ref: '#/components/schemas/ConsumptionRevertResult'
+              examples:
+                partialRevert:
+                  summary: A revert that skipped a usage level its service no longer has
+                  value:
+                    consumptionId: 6f1c2a9e-3b7d-4c55-9a0e-2d8f4b1c7e63
+                    reverted:
+                      petclinic-maxPets: 2
+                    skipped:
+                      - petclinic-maxVisits
           description: |
-            Feature evaluation result. A feature of a service that is disabled (dormant in the contract) answers
+            Feature evaluation result (`FeatureEvaluationResult`), or, with `revert=true`, a revert that skipped
+            usage levels which their service, still in the contract, no longer has (`ConsumptionRevertResult`;
+            the other levels were reverted and the consumption is marked reverted).
+
+            A feature of a service that is disabled (dormant in the contract) answers
             `{ eval: false, limit: null, used: null, error: { code: SERVICE_DISABLED, message } }` (or
             `SERVICE_NOT_FOUND` when the organization no longer has the service), like `FLAG_NOT_FOUND` for an
-            unknown feature, and nothing is consumed.
+            unknown feature, and nothing is consumed: no usage level changes and there is no `consumptionId`.
+        '204':
+          description: Reverted, every usage level of the consumption (or nothing to revert)
+        '400':
+          description: Invalid body or query (for example `consumptionId` without `revert=true`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
-          $ref: '#/components/responses/ContractNotFound'
+          description: Contract not found, or (revert) consumption not found or expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '409':
-          $ref: '#/components/responses/DormantService'
+          description: |
+            Nothing was changed, because either:
+            - the contract kept changing while the consumption was being applied; retry (`error` only); or
+            - `revert=true` (with or without `consumptionId`) on a consumption with a usage level of a service
+              that the contract no longer has: it cannot be reverted exactly, nothing is subtracted and it is
+              not marked reverted (`error` only); or
+            - `revert=true` on a feature of a service of the contract that is disabled (`SERVICE_DISABLED`; it is
+              dormant until a pricing with its saasName is uploaded again) or that the organization no longer
+              has (`SERVICE_NOT_FOUND`), with or without `consumptionId`. The consumption is not reverted and
+              stays revertible: once the service is enabled again, the same revert applies.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    required: [error, code, service]
+                    properties:
+                      error:
+                        type: string
+                      code:
+                        type: string
+                        enum: [SERVICE_DISABLED, SERVICE_NOT_FOUND]
+                      service:
+                        type: string
+              examples:
+                contractChanged:
+                  summary: The contract kept changing while consuming
+                  value:
+                    error: 'CONFLICT: The contract changed while the consumption was being applied; retry'
+                serviceDisabled:
+                  summary: Revert on a feature of a disabled service
+                  value:
+                    error: 'Service petclinic is disabled in this organization: its features are not available and its usage levels cannot change until it is enabled again (upload a pricing with saasName petclinic)'
+                    code: SERVICE_DISABLED
+                    service: petclinic
 
   /analytics/api-calls:
     get:
@@ -5960,6 +6106,70 @@ components:
           type: string
         service:
           type: string
+
+    FeatureEvaluationResult:
+      type: object
+      required: [eval, used, limit, error]
+      properties:
+        eval:
+          type: boolean
+          description: Whether the feature is enabled (and, with an expected consumption, consumed).
+        used:
+          type: object
+          nullable: true
+          additionalProperties:
+            oneOf:
+              - type: number
+              - type: boolean
+          description: |
+            Usage level of each limit involved: with an applied consumption, the stored level after it; with
+            a refused one, the level plus the amount it would have reached.
+        limit:
+          type: object
+          nullable: true
+          additionalProperties:
+            oneOf:
+              - type: number
+              - type: boolean
+          description: Limit of each usage level involved, as the contract's subscription sets it.
+        error:
+          type: object
+          nullable: true
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+        consumptionId:
+          type: string
+          description: |
+            Only when this evaluation applied an expected consumption (`atomic-usage-limits`): the id to
+            revert it with `?revert=true&consumptionId=`.
+
+    ConsumptionRevertResult:
+      type: object
+      required: [consumptionId, reverted, skipped]
+      description: |
+        Answer (`200`) of a revert that skipped usage levels which their service, still in the contract, no
+        longer has (for example, after its pricing version was archived with a fallback without that limit). A revert that skipped nothing answers
+        `204` without a body.
+      properties:
+        consumptionId:
+          type: string
+          description: The consumption reverted (with `consumptionId`, the same one; without it, the one picked).
+        reverted:
+          type: object
+          additionalProperties:
+            type: number
+          description: |
+            Usage limit id (`<service>-<limit>`) -> amount recorded, for each level that was reverted (never
+            below zero; a level renewed since the consumption is left as it is).
+        skipped:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: Usage limit ids (`<service>-<limit>`) of the levels skipped, which their service no longer has.
 
   requestBodies:
     SubscriptionCreation:

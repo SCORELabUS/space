@@ -1,3 +1,4 @@
+import UsageConsumption from '../../../repositories/mongoose/models/UsageConsumptionMongoose';
 import { ServiceRelocation, ServiceRelocationStep } from '../../../repositories/mongoose/models/ServiceRelocationMongoose';
 import { Seeder } from 'mongo-seeding';
 import path from 'path';
@@ -31,6 +32,7 @@ export const seedDatabase = async () => {
     await Promise.all([
       ServiceModel.syncIndexes(),
       ContractModel.syncIndexes(),
+      UsageConsumption.syncIndexes(),
       PricingModel.syncIndexes(),
       UserModel.syncIndexes(),
       ServiceRelocation.syncIndexes(), ServiceRelocationStep.syncIndexes(),

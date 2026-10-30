@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import RepositoryBase from '../RepositoryBase';
 import ContractMongoose from './models/ContractMongoose';
 import { ContractToCreate, LeanContract } from '../../types/models/Contract';
@@ -174,7 +175,7 @@ class ContractRepository extends RepositoryBase {
 
     pipeline.push({ $skip: offset === 0 ? (page - 1) * limit : offset });
     pipeline.push({ $limit: Math.min(limit, 100) });
-    pipeline.push({ $unset: 'serviceRelocationOperationId' });
+    pipeline.push({ $unset: ['serviceRelocationOperationId', 'usageRevertReceipts', 'usageConsumptionReceipts'] });
 
     const contracts = await ContractMongoose.aggregate(pipeline);
 
@@ -251,6 +252,101 @@ class ContractRepository extends RepositoryBase {
   }
 
   /**
+   * Take consumptions back: each level is decremented by its amount, never
+   * below zero, in one atomic update that touches nothing else. A level whose
+   * renewal period changed since the consumption (`resetTimeStamp` differs) is
+   * left as it is: the consumption was already reset away with its period.
+   *
+   * Every level must exist (the caller only passes those that do), and so
+   * must every service of `conditions.services` (keys of `contractedServices`)
+   * while no level of `conditions.absent` does; otherwise nothing is written
+   * and false is returned.
+   */
+  async decrementUsageLevels(
+    userId: string,
+    organizationId: string,
+    levels: { path: string; amount: number; resetTimeStamp: Date | null }[],
+    conditions: { services?: string[]; absent?: string[]; receipt?: { id: string; expiresAt: Date; contractId?: string } } = {}
+  ): Promise<boolean> {
+    const services = conditions.services ?? [];
+    const absent = conditions.absent ?? [];
+    if (levels.length === 0 && services.length === 0 && absent.length === 0 && !conditions.receipt) return true;
+    const filter: Record<string, unknown> = byUserId(userId, organizationId);
+    const set: Record<string, unknown> = {};
+
+    // Only while the contract still has these services, and not these levels.
+    for (const service of services) filter[`contractedServices.${service}`] = { $exists: true };
+    for (const path of absent) filter[`usageLevels.${path}`] = { $exists: false };
+    if (levels.length === 0 && !conditions.receipt) return (await ContractMongoose.exists(filter)) !== null;
+
+    for (const { path, amount, resetTimeStamp } of levels) {
+      const consumed = `$usageLevels.${path}.consumed`;
+      filter[`usageLevels.${path}.consumed`] = { $exists: true };
+      set[`usageLevels.${path}.consumed`] = {
+        $cond: [
+          { $eq: [{ $ifNull: [`$usageLevels.${path}.resetTimeStamp`, null] }, resetTimeStamp ?? null] },
+          { $max: [0, { $subtract: [consumed, amount] }] },
+          consumed,
+        ],
+      };
+    }
+
+    const pipeline: any[] = [];
+    if (conditions.receipt) {
+      const { id, expiresAt, contractId } = conditions.receipt;
+      const key = createHash('sha256').update(id).digest('hex');
+      filter[`usageRevertReceipts.${key}`] = { $exists: false };
+      if (contractId) filter._id = contractId;
+      // Bound receipt retention to the consumption retention, without requiring
+      // a replica set or a destructive migration for existing contracts.
+      pipeline.push({ $set: { usageRevertReceipts: { $arrayToObject: { $filter: {
+        input: { $objectToArray: { $ifNull: ['$usageRevertReceipts', {}] } }, as: 'receipt', cond: { $gt: ['$$receipt.v', new Date()] },
+      } } } } });
+      set[`usageRevertReceipts.${key}`] = expiresAt;
+    }
+    pipeline.push({ $set: set });
+    const result = await ContractMongoose.updateOne(filter, pipeline);
+    return result.matchedCount > 0;
+  }
+
+  async hasUsageRevert(userId: string, organizationId: string, consumptionId: string, contractId?: string): Promise<boolean> {
+    const key = createHash('sha256').update(consumptionId).digest('hex');
+    return Boolean(await ContractMongoose.exists({ ...byUserId(userId, organizationId), ...(contractId ? { _id: contractId } : {}), [`usageRevertReceipts.${key}`]: { $exists: true } }));
+  }
+
+  /**
+   * Set some usage levels (`consumed` and, when given, `resetTimeStamp`) and
+   * nothing else, so that consumptions of other levels recorded meanwhile are
+   * kept. With `expectedResetTimeStamps`, a level is only written while its
+   * stored `resetTimeStamp` is still that one (a renewal applied once per
+   * period, whoever gets there first).
+   *
+   * @returns whether the contract matched.
+   */
+  async setUsageLevels(
+    userId: string,
+    organizationId: string,
+    levels: Record<string, { consumed: number; resetTimeStamp?: Date }>,
+    expectedResetTimeStamps: Record<string, Date> = {}
+  ): Promise<boolean> {
+    const filter: Record<string, unknown> = byUserId(userId, organizationId);
+    const set: Record<string, unknown> = {};
+
+    for (const [path, level] of Object.entries(levels)) {
+      filter[`usageLevels.${path}.consumed`] = { $exists: true };
+      set[`usageLevels.${path}.consumed`] = level.consumed;
+      if (level.resetTimeStamp !== undefined) set[`usageLevels.${path}.resetTimeStamp`] = level.resetTimeStamp;
+    }
+    for (const [path, resetTimeStamp] of Object.entries(expectedResetTimeStamps)) {
+      filter[`usageLevels.${path}.resetTimeStamp`] = resetTimeStamp;
+    }
+
+    if (Object.keys(set).length === 0) return true;
+    const result = await ContractMongoose.updateOne(filter, { $set: set });
+    return result.matchedCount > 0;
+  }
+
+  /**
    * Add to several usage levels of one contract in a single atomic update.
    *
    * `$inc` is evaluated by the database against the stored document rather than
@@ -265,30 +361,81 @@ class ContractRepository extends RepositoryBase {
    * field. That check and the increment are one operation, so a limit cannot be
    * validated and then vanish before the write.
    *
+   * Limits are part of the same filter (`options.ceilings`): a level only
+   * matches while `consumed + amount <= ceiling`, so the check and the
+   * increment cannot be separated by another consumption. Of several
+   * concurrent consumptions competing for the last units of a limit, those that
+   * fit are applied and the rest match nothing.
+   *
    * @param increments usage level path (`service.limit`) to amount to add.
+   * @param options.ceilings usage level path to the highest value it may reach
+   *        with this increment (paths without one are not bounded).
+   * @param options.guard extra filter conditions (see `contractVersionGuard`):
+   *        the subscription the limits were computed from must still be the
+   *        stored one.
    * @returns the contract as it is after the increment, or null when the filter
-   *          matched nothing.
+   *          matched nothing (contract or level missing, a ceiling exceeded, or
+   *          the guard no longer holding).
    */
   async incrementUsageLevels(
     userId: string,
     increments: Record<string, number>,
-    organizationId: string
+    organizationId: string,
+    options: {
+      ceilings?: Record<string, number>;
+      guard?: Record<string, unknown>;
+      receipt?: { id: string; expiresAt: Date; contractId?: string; resetTimeStamps?: Record<string, Date | null> };
+    } = {}
   ): Promise<LeanContract | null> {
-    const filter: Record<string, unknown> = byUserId(userId, organizationId);
+    const { $expr: guardExpr, ...guard } = options.guard ?? {};
+    const filter: Record<string, unknown> = { ...guard, ...byUserId(userId, organizationId) };
     const inc: Record<string, number> = {};
+    const bounds: any[] = guardExpr ? [guardExpr] : [];
 
     for (const [path, amount] of Object.entries(increments)) {
       filter[`usageLevels.${path}.consumed`] = { $exists: true };
       inc[`usageLevels.${path}.consumed`] = amount;
+      const ceiling = options.ceilings?.[path];
+      if (ceiling !== undefined) {
+        // Evaluated by the database on the stored value: consumed + amount <= ceiling.
+        bounds.push({ $lte: [{ $add: [`$usageLevels.${path}.consumed`, amount] }, ceiling] });
+      }
+      if (options.receipt?.resetTimeStamps && Object.prototype.hasOwnProperty.call(options.receipt.resetTimeStamps, path)) {
+        // Null matches a non-renewable level (missing or explicit null).
+        filter[`usageLevels.${path}.resetTimeStamp`] = options.receipt.resetTimeStamps[path] ?? null;
+      }
     }
 
-    const contract = await ContractMongoose.findOneAndUpdate(
-      filter,
-      { $inc: inc },
-      { new: true }
-    );
+    if (bounds.length > 0) filter.$expr = { $and: bounds };
 
+    let update: any = { $inc: inc };
+    if (options.receipt) {
+      const { id, expiresAt, contractId } = options.receipt;
+      const key = createHash('sha256').update(id).digest('hex');
+      filter[`usageConsumptionReceipts.${key}`] = { $exists: false };
+      if (contractId) filter._id = contractId;
+      // The private receipt and increment are ONE write. A lost acknowledgement
+      // cannot reapply the same consumption; unrelated expired receipts are pruned.
+      const set = Object.fromEntries(Object.entries(inc).map(([path, amount]) => [path, { $add: [`$${path}`, amount] }]));
+      update = [
+        { $set: { usageConsumptionReceipts: { $arrayToObject: { $filter: {
+          input: { $objectToArray: { $ifNull: ['$usageConsumptionReceipts', {}] } },
+          as: 'receipt', cond: { $gt: ['$$receipt.v', new Date()] },
+        } } } } },
+        { $set: { ...set, [`usageConsumptionReceipts.${key}`]: expiresAt } },
+      ];
+    }
+
+    const contract = await ContractMongoose.findOneAndUpdate(filter, update, { new: true });
     return contract ? toPlainObject<LeanContract>(contract.toJSON()) : null;
+  }
+
+  async hasUsageConsumption(userId: string, organizationId: string, consumptionId: string, contractId?: string): Promise<boolean> {
+    const key = createHash('sha256').update(consumptionId).digest('hex');
+    return Boolean(await ContractMongoose.exists({
+      ...byUserId(userId, organizationId), ...(contractId ? { _id: contractId } : {}),
+      [`usageConsumptionReceipts.${key}`]: { $exists: true },
+    }));
   }
 
   /**

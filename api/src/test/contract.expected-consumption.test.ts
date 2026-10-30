@@ -13,7 +13,8 @@ import container from '../main/config/container';
  * one consumption disappears.
  *
  * The increment is now handed to the database as `$inc`, which is the only
- * place it can be settled.
+ * place it can be settled, and so is the limit: the increment only applies
+ * while every level stays within its limit.
  *
  * These tests work against a stubbed repository and cache so they can assert on
  * the reads and writes themselves, which is where the defect lived. The stub
@@ -60,14 +61,25 @@ function withStubs(contract: any) {
       return copy(state.current);
     }),
 
-    incrementUsageLevels: vi.fn(async (_userId: string, byPath: Record<string, number>) => {
+    incrementUsageLevels: vi.fn(async (
+      _userId: string,
+      byPath: Record<string, number>,
+      _organizationId?: string,
+      options: { ceilings?: Record<string, number> } = {}
+    ) => {
       increments += 1;
       await Promise.resolve();
 
-      // The filter requires every path to exist; a miss matches no document.
-      for (const path of Object.keys(byPath)) {
+      // The filter requires every path to exist and to stay within its
+      // ceiling, evaluated on what is stored; a miss matches no document.
+      for (const [path, amount] of Object.entries(byPath)) {
         const [serviceName, usageLimit] = path.split('.');
-        if (!state.current.usageLevels[serviceName]?.[usageLimit]) {
+        const level = state.current.usageLevels[serviceName]?.[usageLimit];
+        if (!level) {
+          return null;
+        }
+        const ceiling = options.ceilings?.[path];
+        if (ceiling !== undefined && level.consumed + amount > ceiling) {
           return null;
         }
       }
@@ -227,36 +239,53 @@ describe('Applying expected consumption', () => {
     ).rejects.toThrow(/Contract with userId user1 not found/);
   });
 
-  it('keeps the previous value of every limit for reverting', async () => {
-    const stubs = withStubs(aContract());
-    const service = await aService();
-
-    await service._applyExpectedConsumptions('user1', {
-      'petclinic-maxPets': 1,
-      'petclinic-maxVisits': 1,
-    }, 'org1');
-
-    const cachedKeys = stubs.cacheService.set.mock.calls.map((call: any[]) => call[0]);
-    expect(cachedKeys.some((key: string) => key.includes('maxPets'))).toBe(true);
-    expect(cachedKeys.some((key: string) => key.includes('maxVisits'))).toBe(true);
-  });
-
-  it('records this caller’s own starting point, not whatever it read', async () => {
-    // The snapshot kept for reverting is derived from the result of the
-    // increment, so it is this caller's contribution that gets taken back even
-    // when other calls landed in between.
+  it('returns the contract as stored after the increment', async () => {
     const contract = aContract();
     contract.usageLevels.petclinic.maxPets.consumed = 7;
-
     const stubs = withStubs(contract);
     const service = await aService();
 
-    await service._applyExpectedConsumptions('user1', { 'petclinic-maxPets': 3 }, 'org1');
+    const outcome = await service._applyExpectedConsumptions('user1', { 'petclinic-maxPets': 3 }, 'org1');
 
-    const snapshot = (stubs.cacheService.set.mock.calls as any[][]).find(call =>
-      String(call[0]).includes('maxPets')
-    );
-    expect(snapshot?.[1]).toBe(7);
+    expect(outcome.status).toBe('applied');
+    expect(outcome.contract.usageLevels.petclinic.maxPets.consumed).toBe(10);
     expect(stubs.consumed().maxPets.consumed).toBe(10);
+  });
+
+  it('never takes concurrent requests past a limit', async () => {
+    // The limit is part of the increment, evaluated on what is stored, so
+    // requests that all read room for one more cannot all consume it.
+    const stubs = withStubs(aContract());
+    const service = await aService();
+
+    const outcomes = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        service._applyExpectedConsumptions('user1', { 'petclinic-maxPets': 1 }, 'org1', {
+          limits: { 'petclinic-maxPets': 4 },
+        })
+      )
+    );
+
+    expect(stubs.consumed().maxPets.consumed).toBe(4);
+    expect(outcomes.filter((outcome: any) => outcome.status === 'applied')).toHaveLength(4);
+    expect(outcomes.filter((outcome: any) => outcome.status === 'limit')).toHaveLength(6);
+  });
+
+  it('applies none of the limits when one would be exceeded', async () => {
+    const contract = aContract();
+    contract.usageLevels.petclinic.maxPets.consumed = 3;
+    const stubs = withStubs(contract);
+    const service = await aService();
+
+    const outcome = await service._applyExpectedConsumptions(
+      'user1',
+      { 'petclinic-maxPets': 2, 'petclinic-maxVisits': 1 },
+      'org1',
+      { limits: { 'petclinic-maxPets': 4, 'petclinic-maxVisits': 3 } }
+    );
+
+    expect(outcome.status).toBe('limit');
+    expect(stubs.consumed().maxPets.consumed).toBe(3);
+    expect(stubs.consumed().maxVisits.consumed).toBe(0);
   });
 });
