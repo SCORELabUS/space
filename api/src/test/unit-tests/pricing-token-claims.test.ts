@@ -1,4 +1,4 @@
-import { decodeJwt, jwtVerify } from 'jose';
+import { createLocalJWKSet, decodeJwt, jwtVerify } from 'jose';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -25,11 +25,15 @@ describe('Pricing token claims', function () {
     if (issuer === undefined) delete process.env.JWT_ISSUER;
     else process.env.JWT_ISSUER = issuer;
     vi.resetModules();
-    return import('../../main/utils/jwt');
+    return {
+      jwt: await import('../../main/utils/jwt'),
+      // The same module instance jwt.ts signs with.
+      keys: await import('../../main/utils/pricingTokenKeys'),
+    };
   }
 
   async function issue(userId: string, orgId: string | undefined, issuer?: string) {
-    const jwt = await loadJwt(issuer);
+    const { jwt, keys } = await loadJwt(issuer);
     const token = await jwt.generateTokenFromEvalResult(
       userId,
       {} as any,
@@ -38,7 +42,8 @@ describe('Pricing token claims', function () {
       undefined,
       orgId as string
     );
-    return { token, key: jwt.encryptJWTSecret(process.env.JWT_SECRET!) };
+    // Pricing tokens are signed with ES256; verified with the published keys.
+    return { token, key: createLocalJWKSet((await keys.getPricingTokenKeys()).jwks) };
   }
 
   it('namespaces sub by organization and carries userId and organizationId explicitly', async function () {
@@ -57,8 +62,16 @@ describe('Pricing token claims', function () {
     const { token, key } = await issue('42', organizationId);
 
     expect(decodeJwt(token).iss).toBe('space');
-    const { payload } = await jwtVerify(token, key, { algorithms: ['HS256'], issuer: 'space', audience: organizationId });
+    const { payload, protectedHeader } = await jwtVerify(token, key, {
+      algorithms: ['ES256'],
+      issuer: 'space',
+      audience: organizationId,
+      requiredClaims: ['exp', 'iss', 'aud'],
+    });
+    expect(protectedHeader.alg).toBe('ES256');
+    expect(typeof protectedHeader.kid).toBe('string');
     expect(payload.sub).toBe(`urn:space:${organizationId}:42`);
+    expect(payload.organizationId).toBe(payload.aud);
   });
 
   it('takes the issuer from JWT_ISSUER', async function () {
@@ -66,7 +79,7 @@ describe('Pricing token claims', function () {
 
     expect(decodeJwt(token).iss).toBe('https://space.example.com');
     await expect(
-      jwtVerify(token, key, { algorithms: ['HS256'], issuer: 'space', audience: organizationId })
+      jwtVerify(token, key, { algorithms: ['ES256'], issuer: 'space', audience: organizationId })
     ).rejects.toThrow(/iss/);
   });
 
@@ -74,7 +87,7 @@ describe('Pricing token claims', function () {
     const { token, key } = await issue('42', organizationId);
 
     await expect(
-      jwtVerify(token, key, { algorithms: ['HS256'], issuer: 'space', audience: otherOrganizationId })
+      jwtVerify(token, key, { algorithms: ['ES256'], issuer: 'space', audience: otherOrganizationId })
     ).rejects.toThrow(/aud/);
   });
 

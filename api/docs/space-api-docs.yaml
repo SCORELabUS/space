@@ -313,11 +313,43 @@ info:
     - `contract-pricings`: `GET /contracts/{userId}/pricings`.
     - `novation-preview`: `POST /contracts/{userId}/novation/preview`.
     - `token-subscription`: the pricing token carries the `subscription` claim.
+    - `pricing-token-jwks`: pricing tokens are signed with ES256 (`kid` header) and the public keys are published at `GET /.well-known/jwks.json` (see below). Absent while the server runs the deprecated `PRICING_TOKEN_ALG=HS256` mode.
     - `contract-events`: authenticated Socket.IO namespace `/contracts` with contract events.
     - `contract-event-ids`: every event (`/contracts` and `/pricings`) carries `eventId` and `occurredAt` (see the `Events` tag for what they guarantee and what they do not).
     - `sphere-private`: SPHERE-linked services accept a write-only `sphereApiKey` to read private versions (`sphere.hasApiKey`); private versions are never served statically.
     - `contract-userid-per-org`: a `userId` is unique per organization (see above), pricing tokens identify the contract by organization (`sub` = `urn:space:<organizationId>:<percent-encoded userId>`, `userId`, `organizationId`, `aud`, `iss`; see `PricingTokenPayload`), and platform ADMIN users name the organization (`organizationId`) on the direct routes that address contracts by `userId` or `groupId` (`400 ORGANIZATION_ID_REQUIRED` otherwise).
     - `service-disable-dormant`: a disabled service is dormant in contracts and deleting services removes them from every contract (see "Disabling and deleting services").
+
+    ## Verifying pricing tokens
+
+    Pricing tokens are standard compact JWS/JWT, signed with ES256 (ECDSA P-256, SHA-256; JOSE R || S signature).
+    Any maintained JWT library can validate them; no SPACE SDK or shared secret is needed.
+
+    1. Configure a trusted HTTPS JWKS URL: `GET /api/v1/.well-known/jwks.json` (public, no API key;
+       `Cache-Control: public, max-age=300`). Also exposed at the API server root without `/api/v1`.
+       Never follow `jku`, `jwk` or `x5u` from an untrusted token. This is JWKS, not OIDC discovery.
+    2. Require `alg: ES256` and a non-empty `kid` header. Select exactly one matching public JWK with
+       `kty: EC`, `crv: P-256`, `alg: ES256`, `use: sig`; reject unknown/ambiguous keys and other algorithms.
+    3. Verify the signature; require `exp`, `iss` and `aud`. Check expiry and `nbf` when present with bounded
+       clock skew (30 seconds in the .NET example), exact `iss` (`JWT_ISSUER`, default `space`) and expected
+       organization audience. Reading/decoding a token alone does not validate it.
+    4. Bind `organizationId` and `userId` exactly to the authenticated application context. Never obtain the
+       expected organization/user from the token itself; treat `sub` as an opaque URN.
+    5. Cache JWKS for at most 300 seconds. Refresh once on unknown `kid`, with a bounded cooldown; fail closed
+       if fetching or validation fails. Never downgrade to HS256. Retain old public keys, with their original
+       `kid`, until the last old-key token expires plus clock skew and cache lifetime. Removal alone is not
+       immediate revocation: verifiers may cache a key.
+
+    Obtain a token using an organization API key: `POST /features/{userId}/pricing-token` returns
+    `{ "pricingToken": "<compact JWT>" }`. Keep that API key on the trusted backend. A pricing token is an
+    entitlement snapshot, not an API/login credential, and does not record consumption. Its optional
+    `subscription.contractVersion` marks the evaluated contract state. Refresh by requesting another token
+    after reconciling contract changes with SPACE; offline validation cannot prove the contract is still current.
+
+    Full SDK-independent guide, curl requests, payload examples, key rotation and a runnable .NET verifier:
+    [Pricing token verification](https://github.com/SCORELabUS/space/blob/develop/docs/pricing-tokens.md).
+    [.NET example](https://github.com/SCORELabUS/space/tree/develop/docs/examples/pricing-token-dotnet)
+    uses Microsoft IdentityModel, checks `TokenValidationResult.IsValid` and includes interoperability tests.
 
   contact:
     email: agarcia29@us.es
@@ -4820,6 +4852,11 @@ paths:
         Evaluates which features are available for a specific user based on their 
         subscription contract and pricing plan.
 
+        Verify ES256 using the public `GET /api/v1/.well-known/jwks.json` endpoint, a pinned issuer and
+        audience, required expiry, and organization/user binding. See "Verifying pricing tokens" above and
+        [the SDK-independent guide and .NET example](https://github.com/SCORELabUS/space/blob/develop/docs/pricing-tokens.md).
+        The token does not replace `x-api-key` and remains a snapshot until expiry.
+
         **Authentication**: Organization API Key only
 
         **Permission**: Org Key with any scope
@@ -4916,7 +4953,10 @@ paths:
                 properties:
                   pricingToken:
                     type: string
-                    description: JWT (HS256) whose payload is a `PricingTokenPayload`
+                    description: |
+                      JWT whose payload is a `PricingTokenPayload`, signed with ES256; the `kid` header names the key
+                      in `GET /.well-known/jwks.json`. (HS256 without `kid` only on servers in the deprecated
+                      `PRICING_TOKEN_ALG=HS256` mode, which do not advertise `pricing-token-jwks`.)
         '404':
           $ref: '#/components/responses/ContractNotFound'
 
@@ -5324,6 +5364,42 @@ paths:
             text/html:
               schema:
                 type: string
+
+  /.well-known/jwks.json:
+    get:
+      summary: Public keys of the pricing tokens (JWKS)
+      description: |
+        The JSON Web Key Set (RFC 7517) with the public keys that verify pricing tokens: the current signing key
+        first, then previous keys whose tokens may not have expired yet (or the next key, published before it
+        signs). Only public members are ever included. Also served at `/.well-known/jwks.json` on the root of the
+        API server. Empty (`keys: []`) on servers in the deprecated `PRICING_TOKEN_ALG=HS256` mode, unless previous
+        ES256 keys are configured.
+
+        **Authentication**: Public (no API key required)
+      tags:
+        - Features
+      security: []
+      responses:
+        '200':
+          description: JWKS
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=300
+          content:
+            application/jwk-set+json:
+              schema:
+                $ref: '#/components/schemas/PricingTokenJwks'
+        '503':
+          description: The signing keys are not available
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
 
   /healthcheck:
     get:
@@ -5825,6 +5901,34 @@ components:
           organizationId: 507f1f77bcf86cd799439012
           contractVersion: 4-2c26b46b68ffc68f
           services: [acme]
+
+    PricingTokenJwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            required: [kty, crv, x, y, kid, alg, use]
+            properties:
+              kty: { type: string, enum: [EC] }
+              crv: { type: string, enum: [P-256] }
+              x: { type: string, description: base64url x coordinate }
+              y: { type: string, description: base64url y coordinate }
+              kid: { type: string, description: Key ID (RFC 7638 thumbprint unless configured), matches the token `kid` header }
+              alg: { type: string, enum: [ES256] }
+              use: { type: string, enum: [sig] }
+            additionalProperties: false
+      example:
+        keys:
+          - kty: EC
+            crv: P-256
+            x: f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU
+            y: x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0
+            kid: NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs
+            alg: ES256
+            use: sig
 
     PricingTokenPayload:
       type: object

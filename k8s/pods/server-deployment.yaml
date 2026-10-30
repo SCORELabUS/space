@@ -22,6 +22,10 @@ spec:
         envFrom:
           - configMapRef:
               name: server-config
+        env:
+          # Pricing token signing key, shared by every replica (created by deploy.sh).
+          - name: PRICING_TOKEN_PRIVATE_KEY_FILE
+            value: /etc/space/pricing-token/private.pem
         image: space-api-space-server
         imagePullPolicy: IfNotPresent
         resources:
@@ -47,6 +51,9 @@ spec:
           # Files that must not be served without authorisation (pricing files, SPACE_PRIVATE_FILES_DIR).
           - mountPath: /usr/src/server/private
             name: space-private
+          - mountPath: /etc/space/pricing-token
+            name: pricing-token-key
+            readOnly: true
       restartPolicy: Always
       volumes:
         - name: space-statics
@@ -55,3 +62,7 @@ spec:
         - name: space-private
           persistentVolumeClaim:
             claimName: space-private
+        - name: pricing-token-key
+          secret:
+            secretName: space-pricing-token-key
+            defaultMode: 0400

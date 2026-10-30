@@ -149,3 +149,6 @@ api/src/test/data/generated/
 
 #### Global ignores ####
 .DS_Store
+# Built .NET documentation example
+docs/examples/pricing-token-dotnet/bin/
+docs/examples/pricing-token-dotnet/obj/
