@@ -2,6 +2,7 @@ import RepositoryBase from '../RepositoryBase';
 import ContractMongoose from './models/ContractMongoose';
 import { ContractToCreate, LeanContract } from '../../types/models/Contract';
 import { toPlainObject } from '../../utils/mongoose';
+import { novationFields } from '../../utils/contracts/novation';
 
 type ContractMatchPipeline = {
   pipeline: any[];
@@ -184,13 +185,19 @@ class ContractRepository extends RepositoryBase {
     return toPlainObject<LeanContract>(contract.toJSON());
   }
 
+  /**
+   * @param guard extra filter conditions (see `contractVersionGuard`): when the
+   *              stored contract no longer satisfies them nothing is written
+   *              and null is returned.
+   */
   async update(
     userId: string,
     contractData: Partial<ContractToCreate>,
-    organizationId?: string
+    organizationId?: string,
+    guard: Record<string, unknown> = {}
   ): Promise<LeanContract | null> {
     const contract = await ContractMongoose.findOneAndUpdate(
-      byUserId(userId, organizationId),
+      { ...guard, ...byUserId(userId, organizationId) },
       { $set: contractData },
       { new: true }
     );
@@ -325,6 +332,30 @@ class ContractRepository extends RepositoryBase {
     const result = await ContractMongoose.bulkWrite(bulkOps);
 
     return result.modifiedCount;
+  }
+
+  /**
+   * Write the novation fields of several contracts, each only while its stored
+   * version satisfies its guard (see `contractVersionGuard`). An empty guard
+   * applies an unconditional novation. Never upserts or overwrites consumption.
+   *
+   * @returns the userIds whose guard no longer held, so nothing was written.
+   */
+  async bulkUpdateGuarded(
+    entries: { contract: LeanContract; guard: Record<string, unknown> }[]
+  ): Promise<string[]> {
+    const rejected: string[] = [];
+
+    for (const { contract, guard } of entries) {
+      const { userId } = contract.userContact;
+      const result = await ContractMongoose.updateOne(
+        { ...guard, ...byUserId(userId, contract.organizationId) },
+        { $set: novationFields(contract) }
+      );
+      if (result.matchedCount === 0) rejected.push(userId);
+    }
+
+    return rejected;
   }
 
   async prune(organizationId?: string): Promise<number> {

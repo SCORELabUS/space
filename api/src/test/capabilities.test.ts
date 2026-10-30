@@ -13,6 +13,7 @@ import { SPACE_CAPABILITIES } from '../main/utils/capabilities';
 // Each feature adds its token here and in utils/capabilities.ts.
 const EXPECTED = [
   'contract-org-scope',
+  'contract-version',
 ];
 
 const tokens = (response: request.Response) =>

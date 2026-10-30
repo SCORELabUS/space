@@ -3,6 +3,13 @@ import { LeanContract } from "../../types/models/Contract";
 import { escapeContractedServiceVersions } from "./helpers";
 import { convertKeysToLowercase } from "../helpers";
 
+/** Fields owned by a novation; consumption and contact must keep their stored values. */
+export function novationFields(contract: LeanContract): Pick<LeanContract,
+  'contractedServices' | 'subscriptionPlans' | 'subscriptionAddOns' | 'billingPeriod' | 'history'> {
+  const { contractedServices, subscriptionPlans, subscriptionAddOns, billingPeriod, history } = contract;
+  return { contractedServices, subscriptionPlans, subscriptionAddOns, billingPeriod, history };
+}
+
 export function performNovation(contract: LeanContract, newSubscription: any): LeanContract {
   const newContract: LeanContract = {
     ...contract,

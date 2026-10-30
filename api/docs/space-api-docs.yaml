@@ -86,6 +86,7 @@ info:
     silently writing without it. Tokens:
 
     - `contract-org-scope`: `userId` lookups are confined to the caller's organization (see above).
+    - `contract-version`: contracts carry `contractVersion` and an `ETag`; novations accept `If-Match` / `expectedContractVersion` and answer `412 CONTRACT_CHANGED`.
 
   contact:
     email: agarcia29@us.es
@@ -2928,6 +2929,9 @@ paths:
       responses:
         '201':
           description: Contract created
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
@@ -2975,6 +2979,10 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Contract'
+        '412':
+          $ref: '#/components/responses/ContractChanged'
+        '400':
+          description: Missing groupId, or an `If-Match` header or `expectedContractVersion` field (use `expectedContractVersions` for groups)
 
     delete:
       summary: Delete all contracts in organization
@@ -3033,6 +3041,9 @@ paths:
       responses:
         '200':
           description: Contract details
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
@@ -3056,6 +3067,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IfMatchContractVersion'
         - name: organizationId
           in: path
           required: true
@@ -3071,6 +3083,9 @@ paths:
       responses:
         '200':
           description: Contract updated
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
@@ -3079,6 +3094,10 @@ paths:
           description: Forbidden
         '404':
           $ref: '#/components/responses/ContractNotFound'
+        '412':
+          $ref: '#/components/responses/ContractChanged'
+        '400':
+          description: Invalid subscription, or `If-Match` and `expectedContractVersion` differ
 
     delete:
       summary: Delete contract
@@ -3311,6 +3330,9 @@ paths:
       responses:
         '201':
           description: Contract created
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
@@ -3351,6 +3373,10 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Contract'
+        '412':
+          $ref: '#/components/responses/ContractChanged'
+        '400':
+          description: Missing groupId, or an `If-Match` header or `expectedContractVersion` field (use `expectedContractVersions` for groups)
 
     delete:
       summary: Delete all contracts
@@ -3438,6 +3464,9 @@ paths:
       responses:
         '200':
           description: Contract details
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
@@ -3464,6 +3493,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IfMatchContractVersion'
         - name: userId
           in: path
           required: true
@@ -3474,12 +3504,19 @@ paths:
       responses:
         '200':
           description: Contract updated
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Contract'
         '404':
           $ref: '#/components/responses/ContractNotFound'
+        '412':
+          $ref: '#/components/responses/ContractChanged'
+        '400':
+          description: Invalid subscription, or `If-Match` and `expectedContractVersion` differ
 
     delete:
       summary: Delete contract
@@ -3540,6 +3577,9 @@ paths:
       responses:
         '200':
           description: Usage levels reset
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
@@ -3577,6 +3617,9 @@ paths:
       responses:
         '200':
           description: Contact updated
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
@@ -3614,6 +3657,9 @@ paths:
       responses:
         '200':
           description: Billing period updated
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
@@ -4450,6 +4496,54 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SubscriptionSnapshot'
+        contractVersion:
+          $ref: '#/components/schemas/ContractVersion'
+
+    ContractVersion:
+      type: string
+      readOnly: true
+      description: |
+        Opaque version of the contract for optimistic concurrency. It changes with every change of the
+        subscription (contracted pricing versions, plans, add-ons), of the billing period, and with every
+        novation or SPHERE migration, also when a novation returns to an earlier subscription. Recording usage
+        does not change it. Novations write only their subscription, billing period and history fields,
+        preserving concurrent consumption and contact changes with or without a precondition. Group novations
+        never recreate a contract deleted during the operation. Treat the version as an opaque string: compare it for equality and send it back in
+        `If-Match` (or `expectedContractVersion`). Single-contract responses also carry it as
+        `ETag: "<contractVersion>"`, which CORS exposes to browser clients.
+      example: 3-9f86d081884c7d65
+
+    ContractChanged:
+      type: object
+      description: The novation was conditional on a contract version that is no longer current. Nothing was written.
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          enum: [CONTRACT_CHANGED]
+        contractVersion:
+          type: string
+          description: Current version of the contract (single-contract novation).
+        contractVersions:
+          type: object
+          description: |
+            Group novation: current version of every contract whose precondition failed (`null` for userIds
+            of `expectedContractVersions` that are not in the group).
+          additionalProperties:
+            type: string
+            nullable: true
+        novated:
+          type: array
+          description: |
+            Group novation only, rare: every precondition held when checked, but some contracts changed before
+            their own write. Those are listed in `contractVersions` and were not written; the userIds listed
+            here were novated.
+          items:
+            type: string
+      example:
+        error: CONTRACT_CHANGED
+        contractVersion: 4-2c26b46b68ffc68f
 
     UserContact:
       type: object
@@ -4690,6 +4784,21 @@ components:
                 $ref: '#/components/schemas/SubscriptionPlans'
               subscriptionAddOns:
                 $ref: '#/components/schemas/SubscriptionAddons'
+              expectedContractVersion:
+                type: string
+                description: |
+                  `PUT /contracts/{userId}` only. Apply the novation only if the contract still has this
+                  `contractVersion`; otherwise answer `412`. Same as `If-Match`; if both are sent, `If-Match`
+                  must list this version (or be `*`). On `PUT /contracts?groupId=` it answers `400`: use
+                  `expectedContractVersions`.
+              expectedContractVersions:
+                type: object
+                description: |
+                  `PUT /contracts?groupId=` only. userId -> `contractVersion` of every contract of the group.
+                  Apply the novation only if each of them still has that version; otherwise answer `412` with
+                  the current versions and write nothing.
+                additionalProperties:
+                  type: string
           example:
             contractedServices:
               zoom: "2025"
@@ -4764,7 +4873,23 @@ components:
               maxPets: 2
               maxVisits: 5
 
+  headers:
+    ContractETag:
+      description: '`"<contractVersion>"` of the returned contract.'
+      schema:
+        type: string
+      example: '"3-9f86d081884c7d65"'
+
   responses:
+    ContractChanged:
+      description: The contract changed since the given version (`If-Match`/`expectedContractVersion`). Nothing was written.
+      headers:
+        ETag:
+          $ref: '#/components/headers/ContractETag'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ContractChanged'
     ContractNotFound:
       description: |
         No contract with this `userId` exists in the caller's organization (contracts of other
@@ -4790,6 +4915,19 @@ components:
                   $ref: '#/components/schemas/FieldValidationError'
 
   parameters:
+    IfMatchContractVersion:
+      name: If-Match
+      in: header
+      required: false
+      description: |
+        `"<contractVersion>"` the novation is conditional on, or a comma-separated list of them (any one
+        may match). Comparison is strong: weak tags (`W/"..."`) never match. An unquoted value is taken as
+        one tag, and `*` matches any current version. On mismatch the request fails with
+        `412 CONTRACT_CHANGED` and nothing is written. Without it (and without `expectedContractVersion`) the novation is unconditional,
+        as before.
+      schema:
+        type: string
+      example: '"3-9f86d081884c7d65"'
     Username:
       name: username
       in: path

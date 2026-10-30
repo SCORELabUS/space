@@ -9,6 +9,7 @@ import type { NextFunction, Request, Response } from 'express';
  */
 export const SPACE_CAPABILITIES: readonly string[] = Object.freeze([
   'contract-org-scope',
+  'contract-version',
 ]);
 
 export const CAPABILITIES_HEADER = 'X-Space-Capabilities';

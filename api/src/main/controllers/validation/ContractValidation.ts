@@ -156,6 +156,23 @@ const novate = [
     .withMessage('Each add-on quantity must be an integer greater than or equal to 0'),
 ];
 
+const contractVersionPreconditions = [
+  check('expectedContractVersion')
+    .optional()
+    .isString()
+    .withMessage('expectedContractVersion must be a string (the contractVersion of the contract)'),
+  check('expectedContractVersions')
+    .optional()
+    .isObject()
+    .withMessage('expectedContractVersions must be an object of userId -> contractVersion'),
+  check('expectedContractVersions.*')
+    .optional()
+    .isString()
+    .withMessage('Each value in expectedContractVersions must be a string (contractVersion)'),
+];
+
+novate.push(...contractVersionPreconditions);
+
 const incrementUsageLevels = [
   body()
     .custom((value) => {

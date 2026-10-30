@@ -16,7 +16,7 @@ import ServiceService from './ServiceService';
 import { LeanPricing, LeanUsageLimit } from '../types/models/Pricing';
 import { addDays, isAfter } from 'date-fns';
 import { isSubscriptionValid } from '../controllers/validation/ContractValidation';
-import { performNovation } from '../utils/contracts/novation';
+import { novationFields, performNovation } from '../utils/contracts/novation';
 import CacheService from './CacheService';
 import {
   addPeriodToDate,
@@ -29,6 +29,11 @@ import {
   resetEscapeContractedServiceVersions,
 } from '../utils/contracts/helpers';
 import { query } from 'express';
+import {
+  ContractChangedError,
+  computeContractVersion,
+  contractVersionGuard,
+} from '../utils/contracts/version';
 import { LeanUser } from '../types/models/User';
 
 class ContractService {
@@ -243,15 +248,64 @@ class ContractService {
     return contract;
   }
 
-  async novate(userId: string, newSubscription: any, organizationId?: string): Promise<LeanContract> {
-    const contract = await this._findContract(userId, organizationId);
+  /**
+   * @param options.expectedContractVersion when given, the novation only applies
+   *        to this version of the contract (see `computeContractVersion`), or to
+   *        any of them when several are given; `*` stands for whatever version
+   *        is current when the contract is read. The write is conditional on
+   *        what the version covers (subscription, billing period, histories),
+   *        so a novation that lands between the read and the write is not
+   *        overwritten. A mismatch throws `ContractChangedError` and writes
+   *        nothing. Usage levels are not part of the version; the write only
+   *        sets novation fields, preserving concurrent consumption and contact
+   *        changes with or without a precondition.
+   */
+  async novate(
+    userId: string,
+    newSubscription: any,
+    organizationId?: string,
+    options: { expectedContractVersion?: string | string[] } = {}
+  ): Promise<LeanContract> {
+    let contract = await this._findContract(userId, organizationId);
+    let guard: Record<string, unknown> = {};
+    const expected = options.expectedContractVersion;
+
+    if (expected !== undefined) {
+      // Compare against the stored contract, never against a cached copy.
+      const stored = await this.contractRepository.findByUserId(userId, contract.organizationId);
+      if (!stored) {
+        throw new Error(`Contract with userId ${userId} not found`);
+      }
+      const current = computeContractVersion(stored);
+      const accepted = Array.isArray(expected) ? expected : [expected];
+      if (!accepted.includes('*') && !accepted.includes(current)) {
+        throw new ContractChangedError(current);
+      }
+      contract = stored;
+      // Before performNovation, which appends to the history it is given.
+      guard = contractVersionGuard(stored);
+    }
 
     await enforceSpherePolicy(contract.organizationId, newSubscription, contract);
     await isSubscriptionValid(newSubscription, contract.organizationId);
 
     const newContract = performNovation(contract, newSubscription);
 
-    const result = await this.contractRepository.update(userId, newContract, contract.organizationId);
+    const result = await this.contractRepository.update(
+      userId,
+      novationFields(newContract),
+      contract.organizationId,
+      guard
+    );
+
+    if (!result && expected !== undefined) {
+      const latest = await this.contractRepository.findByUserId(userId, contract.organizationId);
+      await this.cacheService.del(`contracts.${userId}`);
+      if (!latest) {
+        throw new Error(`Contract with userId ${userId} not found`);
+      }
+      throw new ContractChangedError(computeContractVersion(latest));
+    }
 
     if (!result) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -259,17 +313,56 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
+    // A consumption may have landed after this write returned. Do not cache
+    // its earlier snapshot over the newer state.
+    await this.cacheService.del(`contracts.${userId}`);
     await this.cacheService.del(`features.${userId}.*`);
 
     return result;
   }
   
-  async novateByGroupId(groupId: string, organizationId: string, newSubscription: any): Promise<LeanContract[]> {
+  /**
+   * @param options.expectedContractVersions userId -> contract version. When
+   *        given it must name every contract of the group with its current
+   *        version; otherwise `ContractChangedError` reports the current version
+   *        of each contract that differs (null for userIds not in the group) and
+   *        nothing is written. Each write is then conditional on that version;
+   *        a contract that changes between the check and its own write is left
+   *        alone and reported, while the rest of the group is novated.
+   */
+  async novateByGroupId(
+    groupId: string,
+    organizationId: string,
+    newSubscription: any,
+    options: { expectedContractVersions?: Record<string, string> } = {}
+  ): Promise<LeanContract[]> {
     const contracts = await this.index({ groupId }, organizationId);
 
     if (!contracts || contracts.length === 0) {
       throw new Error(`INVALID DATA: No contracts found with groupId ${groupId} within organization ${organizationId}`);
+    }
+
+    const expected = options.expectedContractVersions;
+    const guards = new Map<string, Record<string, unknown>>();
+
+    if (expected) {
+      const changed: Record<string, string | null> = {};
+      const inGroup = new Set(contracts.map(contract => contract.userContact.userId));
+      for (const contract of contracts) {
+        const current = computeContractVersion(contract);
+        if (expected[contract.userContact.userId] !== current) {
+          changed[contract.userContact.userId] = current;
+        }
+      }
+      for (const userId of Object.keys(expected)) {
+        if (!inGroup.has(userId)) changed[userId] = null;
+      }
+      if (Object.keys(changed).length > 0) {
+        throw new ContractChangedError(changed);
+      }
+      for (const contract of contracts) {
+        guards.set(contract.userContact.userId, contractVersionGuard(contract));
+      }
     }
 
     const updatedContracts: LeanContract[] = [];
@@ -281,18 +374,51 @@ class ContractService {
       updatedContracts.push(newContract);
     }
 
-    const result = await this.contractRepository.bulkUpdate(updatedContracts);
-
-    if (!result) {
-      throw new Error(`Failed to update contracts for groupId ${groupId} within organization ${organizationId}`);
+    if (expected) {
+      const rejected = await this.contractRepository.bulkUpdateGuarded(
+        updatedContracts.map(contract => ({
+          contract,
+          guard: guards.get(contract.userContact.userId)!,
+        }))
+      );
+      if (rejected.length > 0) {
+        const changed: Record<string, string | null> = {};
+        for (const userId of rejected) {
+          await this.cacheService.del(`contracts.${userId}`);
+          const latest = await this.contractRepository.findByUserId(userId, organizationId);
+          changed[userId] = latest ? computeContractVersion(latest) : null;
+        }
+        for (const contract of updatedContracts) {
+          await this.cacheService.del(`contracts.${contract.userContact.userId}`);
+          await this.cacheService.del(`features.${contract.userContact.userId}.*`);
+        }
+        // Every precondition held when checked, but a contract changed before
+        // its own write. Contracts are written one by one (no multi-document
+        // transaction), so the others were novated: report them.
+        const novated = updatedContracts
+          .map(contract => contract.userContact.userId)
+          .filter(userId => !rejected.includes(userId));
+        throw new ContractChangedError(changed, novated);
+      }
+    } else {
+      const rejected = await this.contractRepository.bulkUpdateGuarded(
+        updatedContracts.map(contract => ({ contract, guard: {} }))
+      );
+      if (rejected.length > 0) {
+        for (const contract of updatedContracts) {
+          await this.cacheService.del(`contracts.${contract.userContact.userId}`);
+          await this.cacheService.del(`features.${contract.userContact.userId}.*`);
+        }
+        throw new Error(`Failed to update contracts for groupId ${groupId} within organization ${organizationId}`);
+      }
     }
 
     const contractsToReturn = await this.index({ groupId }, organizationId);
 
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
-      this.cacheService.set(`contracts.${contract.userContact.userId}`, contract, 3600, true); // Cache for 1 hour
-      this.cacheService.del(`features.${contract.userContact.userId}.*`);
+      await this.cacheService.del(`contracts.${contract.userContact.userId}`);
+      await this.cacheService.del(`features.${contract.userContact.userId}.*`);
     }
 
     return contractsToReturn;
@@ -542,7 +668,9 @@ class ContractService {
       ); // 120 secs = 2 mins
     }
 
-    await this.cacheService.set(`contracts.${userId}`, updatedContract, 3600, true); // Cache for 1 hour
+    // A novation may have changed the subscription since the increment. Avoid
+    // restoring its previous plan from this consumption snapshot.
+    await this.cacheService.del(`contracts.${userId}`);
   }
 
   /**

@@ -7,6 +7,64 @@ import {
   UsageLevelsResetQuery,
 } from '../types/models/Contract';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils';
+import {
+  ContractChangedError,
+  computeContractVersion,
+  parseIfMatch,
+} from '../utils/contracts/version';
+
+/** Add `contractVersion` to a contract response (see `computeContractVersion`). */
+function withVersion<T extends object>(contract: T): T & { contractVersion: string } {
+  return { ...contract, contractVersion: computeContractVersion(contract as any) };
+}
+
+/**
+ * Send one contract with its version, also as `ETag`.
+ *
+ * The tag versions the subscription, for `If-Match` on novation. It is not a
+ * cache validator for the whole representation - usage levels change under the
+ * same version - so `If-None-Match` is not evaluated (Express would otherwise
+ * answer 304 by itself).
+ */
+function sendContract(req: any, res: any, status: number, contract: any) {
+  const body = withVersion(contract);
+  delete req.headers['if-none-match'];
+  delete req.headers['if-modified-since'];
+  res.set('ETag', `"${body.contractVersion}"`);
+  res.status(status).json(body);
+}
+
+function sendContractChanged(res: any, err: ContractChangedError) {
+  if (typeof err.contractVersion === 'string') {
+    res.set('ETag', `"${err.contractVersion}"`);
+    res.status(412).send({ error: 'CONTRACT_CHANGED', contractVersion: err.contractVersion });
+  } else {
+    res.status(412).send({
+      error: 'CONTRACT_CHANGED',
+      contractVersions: err.contractVersion,
+      ...(err.novated ? { novated: err.novated } : {}),
+    });
+  }
+}
+
+/**
+ * The versions a novation is conditional on: the strong tags of `If-Match`
+ * (several may be listed; weak tags never match) or the body field
+ * `expectedContractVersion` (removed from the body). Both may be given only if
+ * the header lists the body's version (or is `*`).
+ */
+function expectedVersionOf(req: any): string[] | undefined {
+  const header = parseIfMatch(req.get?.('If-Match'));
+  const fromBody = req.body?.expectedContractVersion;
+  if (req.body && 'expectedContractVersion' in req.body) delete req.body.expectedContractVersion;
+  if (fromBody !== undefined) {
+    if (header !== undefined && !header.includes(fromBody) && !header.includes('*')) {
+      throw new Error('Invalid precondition: If-Match and expectedContractVersion differ');
+    }
+    return [fromBody];
+  }
+  return header;
+}
 
 class ContractController {
   private readonly contractService: ContractService;
@@ -56,7 +114,7 @@ class ContractController {
       ]);
 
       res.set('X-Total-Count', total.toString());
-      res.json(contracts);
+      res.json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
       if (err.message.toLowerCase().includes('validation of query params')) {
         res.status(400).send({ error: err.message });
@@ -70,7 +128,7 @@ class ContractController {
     try {
       const userId = req.params.userId;
       const contract = await this.contractService.show(userId, this._scope(req));
-      res.json(contract);
+      sendContract(req, res, 200, contract);
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
@@ -104,7 +162,7 @@ class ContractController {
       }
 
       const contract = await this.contractService.create(contractData);
-      res.status(201).json(contract);
+      sendContract(req, res, 201, contract);
     } catch (err: any) {
       if (err.message.toLowerCase().includes('invalid')) {
         res.status(400).send({ error: err.message });
@@ -121,11 +179,18 @@ class ContractController {
   async novate(req: any, res: any) {
     try {
       const userId = req.params.userId;
+      const expectedContractVersion = expectedVersionOf(req);
       const newSubscription: Subscription = req.body;
-      const contract = await this.contractService.novate(userId, newSubscription, this._scope(req));
-      res.status(200).json(contract);
+      const contract = await this.contractService.novate(userId, newSubscription, this._scope(req), {
+        expectedContractVersion,
+      });
+      sendContract(req, res, 200, contract);
     } catch (err: any) {
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err instanceof ContractChangedError) {
+        sendContractChanged(res, err);
+      } else if (err.message.toLowerCase().includes('invalid precondition')) {
+        res.status(400).send({ error: err.message });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('invalid subscription:')) {
         res.status(400).send({ error: err.message });
@@ -143,11 +208,31 @@ class ContractController {
         res.status(400).send({ error: 'Missing groupId query parameter' });
         return;
       }
+      if (req.get('If-Match') !== undefined) {
+        res.status(400).send({
+          error:
+            'Invalid precondition: If-Match cannot name the versions of several contracts; use expectedContractVersions',
+        });
+        return;
+      }
+      if (req.body && 'expectedContractVersion' in req.body) {
+        res.status(400).send({
+          error:
+            'Invalid precondition: expectedContractVersion names the version of one contract; use expectedContractVersions (userId -> contractVersion)',
+        });
+        return;
+      }
+      const expectedContractVersions = req.body?.expectedContractVersions;
+      if (req.body && 'expectedContractVersions' in req.body) delete req.body.expectedContractVersions;
       const newSubscription: Subscription = req.body;
-      const contracts = await this.contractService.novateByGroupId(groupId, organizationId, newSubscription);
-      res.status(200).json(contracts);
+      const contracts = await this.contractService.novateByGroupId(groupId, organizationId, newSubscription, {
+        expectedContractVersions,
+      });
+      res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
-      if (
+      if (err instanceof ContractChangedError) {
+        sendContractChanged(res, err);
+      } else if (
         err.message.toLowerCase().includes('not found') ||
         err.message.toLowerCase().includes('no contracts found')
       ) {
@@ -169,7 +254,7 @@ class ContractController {
         userContact,
         this._scope(req)
       );
-      res.status(200).json(contract);
+      sendContract(req, res, 200, contract);
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
@@ -189,7 +274,7 @@ class ContractController {
         billingPeriod,
         this._scope(req)
       );
-      res.status(200).json(contract);
+      sendContract(req, res, 200, contract);
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
@@ -213,7 +298,7 @@ class ContractController {
       }
 
       const contracts = await this.contractService.novateBillingPeriodByGroupId(groupId, organizationId, billingPeriod);
-      res.status(200).json(contracts);
+      res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
       if (
         err.message.toLowerCase().includes('not found') ||
@@ -239,7 +324,7 @@ class ContractController {
         usageLevelsIncrements,
         this._scope(req)
       );
-      res.status(200).json(novatedContract);
+      sendContract(req, res, 200, novatedContract);
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });

@@ -24,7 +24,7 @@ const corsOptions: cors.CorsOptions = {
     origin: originValidator,
     methods: ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'DELETE'], // Specify allowed methods
     credentials: true, // Allow credentials if needed
-    exposedHeaders: [CAPABILITIES_HEADER], // Readable by browser clients
+    exposedHeaders: [CAPABILITIES_HEADER, 'ETag'], // Readable by browser clients
   }
 
 const loadGlobalMiddlewares = (app: express.Application) => {
