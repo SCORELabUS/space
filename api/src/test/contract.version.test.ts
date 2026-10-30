@@ -2,7 +2,8 @@ import path from 'path';
 import request from 'supertest';
 import { Server } from 'http';
 import { v4 as uuidv4 } from 'uuid';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import container from '../main/config/container';
 import { baseUrl, getApp, shutdownApp } from './utils/testApp';
 import { createTestUser, deleteTestUser } from './utils/users/userTestUtils';
 import {
@@ -90,6 +91,7 @@ describe('Contract version and conditional novation', function () {
   });
 
   afterEach(async function () {
+    vi.restoreAllMocks();
     await ContractMongoose.deleteMany({ organizationId: organization.id });
     await ServiceMongoose.deleteMany({ organizationId: organization.id });
     await deleteTestOrganization(organization.id!);
@@ -160,6 +162,141 @@ describe('Contract version and conditional novation', function () {
 
       expect(again.status).toBe(200);
       expect(again.body.userContact.userId).toBe(userId);
+    });
+  });
+
+  describe('consumption concurrent with novation', function () {
+    const recordWhileWriting = (id: string) => {
+      const repository = container.resolve('contractRepository');
+      let recorded = false;
+      for (const method of ['update', 'bulkUpdate', 'bulkUpdateGuarded'] as const) {
+        const original = repository[method].bind(repository);
+        vi.spyOn(repository, method).mockImplementation(async (...args: any[]) => {
+          if (!recorded) {
+            recorded = true;
+            await ContractMongoose.updateOne(
+              { organizationId: organization.id, 'userContact.userId': id },
+              { $inc: { [`usageLevels.${serviceName}.maxPets.consumed`]: 1 },
+                $set: { 'userContact.email': 'concurrent@example.test' } }
+            );
+          }
+          return original(...args);
+        });
+      }
+    };
+
+    it.each([false, true])('preserves consumption and contact on a single novation (conditional: %s)', async conditional => {
+      const reviewed = await read();
+      const before = await stored();
+      recordWhileWriting(userId);
+
+      const response = await novate(subscription('PLATINUM'), conditional ? reviewed.headers.etag : undefined);
+      const after = await stored();
+      const shown = await read();
+
+      expect(response.status).toBe(200);
+      expect(after.usageLevels[serviceName].maxPets.consumed).toBe(before.usageLevels[serviceName].maxPets.consumed + 1);
+      expect(after.userContact.email).toBe('concurrent@example.test');
+      expect(after.subscriptionPlans[serviceName]).toBe('PLATINUM');
+      expect(after.history).toHaveLength(before.history.length + 1);
+      expect(shown.body.usageLevels[serviceName].maxPets.consumed).toBe(after.usageLevels[serviceName].maxPets.consumed);
+      expect(shown.body.userContact.email).toBe(after.userContact.email);
+    });
+
+    it.each([false, true])('preserves consumption and contact on a group novation (conditional: %s)', async conditional => {
+      const groupId = `group-${uuidv4()}`;
+      const member = (await createContract(groupId)).body;
+      recordWhileWriting(member.userContact.userId);
+
+      const response = await request(app)
+        .put(`${baseUrl}/contracts?groupId=${groupId}`)
+        .set('x-api-key', orgKey)
+        .send({ ...subscription('PLATINUM'), ...(conditional ? {
+          expectedContractVersions: { [member.userContact.userId]: member.contractVersion },
+        } : {}) });
+      const after: any = await ContractMongoose.findOne({ 'userContact.userId': member.userContact.userId }).lean();
+
+      expect(response.status).toBe(200);
+      expect(after.usageLevels[serviceName].maxPets.consumed).toBe(member.usageLevels[serviceName].maxPets.consumed + 1);
+      expect(after.userContact.email).toBe('concurrent@example.test');
+      expect(after.subscriptionPlans[serviceName]).toBe('PLATINUM');
+      expect(after.history).toHaveLength(1);
+      expect(response.body[0].usageLevels[serviceName].maxPets.consumed).toBe(after.usageLevels[serviceName].maxPets.consumed);
+    });
+
+    it('preserves concurrent consumption while keeping the billing period', async () => {
+      const reviewed = await read();
+      const before = await stored();
+      recordWhileWriting(userId);
+
+      const response = await novate({ ...subscription('PLATINUM'), keepBillingPeriod: true }, reviewed.headers.etag);
+      const after = await stored();
+
+      expect(response.status).toBe(200);
+      expect(after.billingPeriod.startDate).toEqual(before.billingPeriod.startDate);
+      expect(after.billingPeriod.endDate).toEqual(before.billingPeriod.endDate);
+      expect(after.usageLevels[serviceName].maxPets.consumed).toBe(before.usageLevels[serviceName].maxPets.consumed + 1);
+    });
+
+    it('invalidates a novation snapshot when consumption lands after its database write', async () => {
+      const repository = container.resolve('contractRepository');
+      const original = repository.update.bind(repository);
+      vi.spyOn(repository, 'update').mockImplementationOnce(async (...args: any[]) => {
+        const result = await original(...args);
+        await ContractMongoose.updateOne(
+          { organizationId: organization.id, 'userContact.userId': userId },
+          { $inc: { [`usageLevels.${serviceName}.maxPets.consumed`]: 1 } }
+        );
+        return result;
+      });
+      const before = await stored();
+
+      expect((await novate(subscription('PLATINUM'))).status).toBe(200);
+      const shown = await read();
+      expect(shown.body.usageLevels[serviceName].maxPets.consumed).toBe(before.usageLevels[serviceName].maxPets.consumed + 1);
+    });
+
+    it('does not recreate a group member deleted between the read and an unconditional write', async () => {
+      const groupId = `group-${uuidv4()}`;
+      const member = (await createContract(groupId)).body;
+      const repository = container.resolve('contractRepository');
+      let deleted = false;
+      for (const method of ['bulkUpdate', 'bulkUpdateGuarded'] as const) {
+        const original = repository[method].bind(repository);
+        vi.spyOn(repository, method).mockImplementation(async (...args: any[]) => {
+          if (!deleted) {
+            deleted = true;
+            await ContractMongoose.deleteOne({ 'userContact.userId': member.userContact.userId });
+          }
+          return original(...args);
+        });
+      }
+
+      const response = await request(app)
+        .put(`${baseUrl}/contracts?groupId=${groupId}`)
+        .set('x-api-key', orgKey)
+        .send(subscription('PLATINUM'));
+
+      expect(response.status).not.toBe(200);
+      expect(await ContractMongoose.exists({ 'userContact.userId': member.userContact.userId })).toBeNull();
+    });
+
+    it('does not restore the previous plan from a consumption snapshot after novation', async () => {
+      const reviewed = await read();
+      const repository = container.resolve('contractRepository');
+      const original = repository.incrementUsageLevels.bind(repository);
+      vi.spyOn(repository, 'incrementUsageLevels').mockImplementationOnce(async (...args: any[]) => {
+        const result = await original(...args);
+        expect((await novate(subscription('PLATINUM'), reviewed.headers.etag)).status).toBe(200);
+        return result;
+      });
+
+      await container.resolve('contractService')._applyExpectedConsumptions(
+        userId, { [`${serviceName}-maxPets`]: 1 }, organization.id
+      );
+      const shown = await read();
+      expect(shown.body.subscriptionPlans[serviceName]).toBe('PLATINUM');
+      expect(shown.body.usageLevels[serviceName].maxPets.consumed).toBe(1);
     });
   });
 

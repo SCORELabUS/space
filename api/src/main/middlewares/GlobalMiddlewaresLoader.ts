@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import { analyticsTrackerMiddleware } from './AnalyticsMiddleware';
 import { authenticateApiKeyMiddleware } from './AuthMiddleware';
 import { CAPABILITIES_HEADER, capabilitiesMiddleware } from '../utils/capabilities';
+import { isProtectedStaticPath } from '../services/pricingFiles';
 
 interface OriginValidatorCallback {
   (err: Error | null, allow?: boolean): void;
@@ -54,6 +55,17 @@ const loadGlobalMiddlewares = (app: express.Application) => {
       crossOriginResourcePolicy: false // allows loading of files from /public
     }
   ));
+  // Pricing files are never served statically: they are stored outside public/
+  // and read through the authorised GET .../pricings/{version}?format=yaml. As a
+  // second line of defence, nothing under /static/pricings (or /private) is
+  // served, however the path is spelled; existing and missing files get the
+  // same 404, so the answer does not reveal which files exist.
+  app.use((req, res, next) => {
+    if (isProtectedStaticPath(req.path)) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    next();
+  });
   app.use(express.static('public'));
   
   // Populate request with user info based on API key

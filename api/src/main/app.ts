@@ -13,7 +13,9 @@ import { seedDatabase } from './database/seeders/mongo/seeder';
 import loadGlobalMiddlewares from './middlewares/GlobalMiddlewaresLoader';
 import routes from './routes/index';
 import { seedDefaultAdmin } from './database/seeders/common/userSeeder';
+import { initializeServiceRelocationJournal } from './database/migrations/serviceRelocationJournal';
 import { runContractUserIdMigration } from './database/migrations/contractUserIdPerOrganization';
+import { movePricingFilesOutOfPublic } from './database/migrations/movePricingFilesOutOfPublic';
 
 const green = '\x1b[32m';
 const blue = '\x1b[36m';
@@ -36,8 +38,24 @@ const initializeApp = async (seedDatabase: boolean = true) => {
   const redisClient = await initRedis();
   // Redis is shared locally; CacheService scopes cleanup to SPACE's prefix.
   container.resolve('cacheService').setRedisClient(redisClient);
+  // Pricing files used to live under public/, which is served without
+  // authentication. Move any left there (idempotent; see the migration).
+  await movePricingFiles();
   // await postInitializeDatabase(app)
   return app;
+};
+
+const movePricingFiles = async () => {
+  try {
+    const report = await movePricingFilesOutOfPublic();
+    if (report.rewritten || report.moved || report.conflicts || report.missing) {
+      console.log('Pricing files moved out of public/:', JSON.stringify(report));
+    }
+  } catch (error) {
+    // Not fatal: nothing under /static/pricings is served either way, and
+    // authorised reads fall back to the old location until the next start.
+    console.error('Pricing files could not be moved out of public/:', (error as Error).message);
+  }
 };
 
 const initializeServer = async (
@@ -109,6 +127,7 @@ const initializeDatabase = async (seedDatabaseFlag: boolean = true) => {
         connection = await initMongoose();
         // Idempotent; see the migration for what it changes.
         await runContractUserIdMigration();
+        await initializeServiceRelocationJournal();
         if (['development'].includes(process.env.ENVIRONMENT ?? '')) {
           if (seedDatabaseFlag && process.env.SEED_ON_STARTUP === 'true') {
             await seedDatabase();

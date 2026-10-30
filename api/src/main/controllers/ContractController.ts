@@ -1,3 +1,4 @@
+import { ServiceRelocationPendingError } from '../services/serviceRelocationState';
 import container from '../config/container';
 import ContractService, { NovationOptions } from '../services/ContractService';
 import {
@@ -200,6 +201,7 @@ class ContractController {
       res.set('X-Total-Count', total.toString());
       res.json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('validation of query params')) {
         res.status(400).send({ error: err.message });
@@ -215,6 +217,7 @@ class ContractController {
       const contract = await this.contractService.show(userId, this._scope(req));
       sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
@@ -237,6 +240,7 @@ class ContractController {
       res.set('ETag', `"${contractVersion}"`);
       res.json({ services, contractVersion });
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
@@ -273,6 +277,7 @@ class ContractController {
       const contract = await this.contractService.create(contractData, { rejectPrivate });
       sendContract(req, res, 201, contract);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err instanceof SubscriptionValidationError) {
         sendInvalidSubscription(res, err);
       } else if (err.message.toLowerCase().includes('invalid')) {
@@ -299,6 +304,7 @@ class ContractController {
       });
       sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err instanceof SubscriptionValidationError) {
         sendInvalidSubscription(res, err, true);
@@ -325,6 +331,7 @@ class ContractController {
       const preview = await this.contractService.previewNovation(req.params.userId, req.body, this._scope(req), options);
       res.status(200).json(preview);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
@@ -368,6 +375,7 @@ class ContractController {
       });
       res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err instanceof SubscriptionValidationError) {
         sendInvalidSubscription(res, err, true);
@@ -397,6 +405,7 @@ class ContractController {
       );
       sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
@@ -418,6 +427,7 @@ class ContractController {
       );
       sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
@@ -443,6 +453,7 @@ class ContractController {
       const contracts = await this.contractService.novateBillingPeriodByGroupId(groupId, organizationId, billingPeriod);
       res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (
         err.message.toLowerCase().includes('not found') ||
@@ -470,6 +481,7 @@ class ContractController {
       );
       sendContract(req, res, 200, novatedContract);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err instanceof DormantServiceError) {
         res.status(409).send({ error: err.message, code: err.code, service: err.service });
@@ -491,6 +503,7 @@ class ContractController {
       const result: number = await this.contractService.prune(organizationId, req.user);
       res.status(204).json({ message: `Deleted ${result} contracts successfully` });
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
@@ -508,6 +521,7 @@ class ContractController {
       await this.contractService.destroy(userId, this._scope(req));
       res.status(204).json({ message: `Deleted contract with userId ${userId} successfully` });
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });

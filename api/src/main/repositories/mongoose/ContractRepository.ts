@@ -6,6 +6,7 @@ import { contractVersionGuard } from '../../utils/contracts/version';
 
 /** Escape a string for use as a literal inside a regular expression. */
 const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+import { novationFields } from '../../utils/contracts/novation';
 
 type ContractMatchPipeline = {
   pipeline: any[];
@@ -173,6 +174,7 @@ class ContractRepository extends RepositoryBase {
 
     pipeline.push({ $skip: offset === 0 ? (page - 1) * limit : offset });
     pipeline.push({ $limit: Math.min(limit, 100) });
+    pipeline.push({ $unset: 'serviceRelocationOperationId' });
 
     const contracts = await ContractMongoose.aggregate(pipeline);
 
@@ -183,6 +185,18 @@ class ContractRepository extends RepositoryBase {
     const { pipeline } = buildMatchPipeline(queryFilters);
     const result = await ContractMongoose.aggregate([...pipeline, { $count: 'total' }]);
     return result[0]?.total ?? 0;
+  }
+
+  /** Internal move preflight: every binding is needed, without listing pagination. */
+  async findAllByService(serviceName: string, organizationId: string): Promise<LeanContract[]> {
+    if (!organizationId) throw new Error('An organization is required to list service contracts');
+    const { pipeline } = buildMatchPipeline({ filters: { services: [serviceName] }, organizationId });
+    const contracts = await ContractMongoose.aggregate(pipeline);
+    return contracts.map(contract => toPlainObject<LeanContract>(contract));
+  }
+
+  async findForRelocation(id: string): Promise<any> {
+    return ContractMongoose.findById(id).select('+serviceRelocationOperationId').lean();
   }
 
   async findByUserId(userId: string, organizationId: string): Promise<LeanContract | null> {
@@ -316,8 +330,9 @@ class ContractRepository extends RepositoryBase {
   }
 
   /**
-   * Write several contracts, each only while its stored version still
-   * satisfies its guard (see `contractVersionGuard`). Never upserts.
+   * Write the novation fields of several contracts, each only while its stored
+   * version satisfies its guard (see `contractVersionGuard`). An empty guard
+   * applies an unconditional novation. Never upserts or overwrites consumption.
    *
    * @returns the userIds whose guard no longer held, so nothing was written.
    */
@@ -330,7 +345,7 @@ class ContractRepository extends RepositoryBase {
       const { userId } = contract.userContact;
       const result = await ContractMongoose.updateOne(
         { ...guard, ...byUserId(userId, contract.organizationId) },
-        { $set: contract }
+        { $set: novationFields(contract) }
       );
       if (result.matchedCount === 0) rejected.push(userId);
     }
@@ -389,7 +404,7 @@ class ContractRepository extends RepositoryBase {
    * @returns the contract after the write, `contract` itself when it names
    *          none of the services, or null when the guard no longer held.
    */
-  async removeServicesFromContract(contract: LeanContract, serviceNames: string[]): Promise<LeanContract | null> {
+  async removeServicesFromContract(contract: LeanContract, serviceNames: string[], operationId?: string): Promise<LeanContract | null> {
     const names = new Set(serviceNames.map(name => name.toLowerCase()));
     const plain = (value: any): Record<string, any> =>
       value instanceof Map ? Object.fromEntries(value) : value ?? {};
@@ -427,6 +442,7 @@ class ContractRepository extends RepositoryBase {
       };
     }
 
+    if (operationId) update.$set = { ...(update.$set ?? {}), serviceRelocationOperationId: operationId };
     const written = await ContractMongoose.findOneAndUpdate(
       { ...contractVersionGuard(contract), ...byUserId(contract.userContact.userId, contract.organizationId) },
       update,
@@ -487,7 +503,8 @@ class ContractRepository extends RepositoryBase {
   async renameOrMoveServiceInContract(
     contract: LeanContract,
     serviceName: string,
-    change: { name?: string; organizationId?: string }
+    change: { name?: string; organizationId?: string },
+    operationId?: string
   ): Promise<LeanContract | null> {
     const from = serviceName.toLowerCase();
     const $set: Record<string, unknown> = {};
@@ -505,6 +522,7 @@ class ContractRepository extends RepositoryBase {
       }
     }
     if (change.organizationId) $set.organizationId = change.organizationId;
+    if (operationId) $set.serviceRelocationOperationId = { $literal: operationId };
     if (Object.keys($set).length === 0) return contract;
 
     try {
