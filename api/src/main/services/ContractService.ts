@@ -38,6 +38,17 @@ import {
   contractVersionGuard,
 } from '../utils/contracts/version';
 import { LeanUser } from '../types/models/User';
+import { pricingYamlUrl } from '../utils/services/helpers';
+
+/** One entry of GET /contracts/{userId}/pricings. */
+export interface ContractPricing {
+  version: string;
+  status: 'active' | 'archived';
+  yamlUrl: string;
+  newContractsVersion: string | null;
+  plan?: string;
+  addOns: Record<string, number>;
+}
 
 /** Options shared by the novation routes (see S8 in the API docs). */
 export interface NovationOptions {
@@ -171,6 +182,49 @@ class ContractService {
     queryParams.organizationId = organizationId;
 
     return this.contractRepository.countByFilters(queryParams);
+  }
+
+  /**
+   * The pricing versions of a contract (GET /contracts/{userId}/pricings): per
+   * contracted service, its version (unescaped), whether it is still active,
+   * the version new contracts get (null if it cannot be determined) and the
+   * subscribed plan and add-ons. `routeOrganizationId` only selects the kind of
+   * `yamlUrl` (organization-scoped or direct).
+   */
+  async pricings(
+    userId: string,
+    organizationId?: string,
+    routeOrganizationId?: string
+  ): Promise<{ contract: LeanContract; services: Record<string, ContractPricing> }> {
+    const contract = await this.show(userId, organizationId);
+    const services: Record<string, ContractPricing> = {};
+
+    for (const [serviceName, version] of Object.entries(contract.contractedServices)) {
+      const status = await this.serviceService.pricingVersionStatus(serviceName, version, contract.organizationId);
+      let storedName = serviceName;
+      let newContractsVersion: string | null = null;
+      try {
+        const forNewContracts = await this.serviceService.newContractsPricing(serviceName, contract.organizationId);
+        storedName = forNewContracts.serviceName;
+        newContractsVersion = forNewContracts.version;
+      } catch (error) {
+        // Unknown service or no active version: newContractsVersion stays null.
+        // Anything else (database or cache failure) is not hidden as "unknown".
+        if (!(error as Error).message.toLowerCase().includes('not found')) throw error;
+      }
+
+      services[serviceName] = {
+        version,
+        // A version that is neither active nor archived (e.g. SPHERE history) is no longer offered.
+        status: status === 'active' ? 'active' : 'archived',
+        yamlUrl: pricingYamlUrl(routeOrganizationId, storedName, version),
+        newContractsVersion,
+        plan: contract.subscriptionPlans?.[serviceName],
+        addOns: contract.subscriptionAddOns?.[serviceName] ?? {},
+      };
+    }
+
+    return { contract, services };
   }
 
   async show(userId: string, organizationId?: string): Promise<LeanContract> {
