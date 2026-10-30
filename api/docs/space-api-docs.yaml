@@ -409,8 +409,10 @@ tags:
         write, so their `contractVersion` may already be that of a later change.
       - *Not every change is announced.* Consumption, usage level resets and user contact changes emit nothing
         (they are not part of `contractVersion`). Renaming a service emits `CONTRACT_NOVATED` for affected
-        contracts. Moving a service to another organization emits `CONTRACT_DELETED` in the source organization
-        and `CONTRACT_CREATED` in the destination; relocation recovery can repeat those notification attempts.
+        contracts. When moving a service also moves a contract to the destination organization, it emits
+        `CONTRACT_DELETED` in the source and `CONTRACT_CREATED` in the destination. A contract that stays in the
+        source organization with its other services receives `CONTRACT_NOVATED` after removing the moved service.
+        Relocation recovery can repeat those notification attempts.
 
       **Consuming them.**
       - Drop duplicates by `eventId`: remember the ids seen in a short window (a few minutes, or the last few
@@ -5781,8 +5783,10 @@ components:
           type: string
           format: date-time
           description: |
-            When the change was stored (ISO 8601, UTC, milliseconds), by the clock of the API instance that stored
-            it. Capability `contract-event-ids`.
+            ISO 8601 in UTC with milliseconds. Uses the API instance's clock when the write returned if that
+            timestamp is retained; otherwise defaults to the notification attempt time, including recovery or
+            retries where the original timestamp is unavailable. Not an authoritative ordering or commit
+            timestamp; instance clocks may differ. Capability `contract-event-ids`.
         details:
           type: object
           required: [userId, organizationId, contractVersion, services]

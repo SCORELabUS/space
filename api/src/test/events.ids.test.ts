@@ -243,11 +243,22 @@ describe('Event ids', function () {
     const contract = await createContract();
     const userId = contract.userContact.userId;
     const cacheService: any = container.resolve('cacheService');
-    const set = cacheService.set.bind(cacheService);
-    // The cached copy is written after the novation is stored and before the event is emitted.
-    vi.spyOn(cacheService, 'set').mockImplementation(async (...args: any[]) => {
-      if (args[0] === contractCacheKey(organization.id!, userId)) await new Promise(resolve => setTimeout(resolve, 400));
-      return set(...args);
+    const repository: any = container.resolve('contractRepository');
+    const update = repository.update.bind(repository);
+    const del = cacheService.del.bind(cacheService);
+    let delayNextInvalidation = false;
+    vi.spyOn(repository, 'update').mockImplementation(async (...args: any[]) => {
+      const result = await update(...args);
+      if (args[0] === userId && args[2] === organization.id && result) delayNextInvalidation = true;
+      return result;
+    });
+    // Arm the delay only after the write returns: earlier invalidations must not count.
+    vi.spyOn(cacheService, 'del').mockImplementation(async (...args: any[]) => {
+      if (delayNextInvalidation && args[0] === contractCacheKey(organization.id!, userId)) {
+        delayNextInvalidation = false;
+        await new Promise(resolve => setTimeout(resolve, 400));
+      }
+      return del(...args);
     });
 
     const before = Date.now();
