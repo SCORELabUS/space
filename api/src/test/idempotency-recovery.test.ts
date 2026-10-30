@@ -114,7 +114,7 @@ describe('Idempotency crash recovery', () => {
     expect((await consume(undefined, 2)).status).toBe(200);
     expect(await consumed()).toBe(2);
     const key = uuidv4(); interruptAfterApply();
-    const call = () => keyed('put', `/contracts/${userId}/usageLevels?reset=true`, key);
+    const call = () => keyed('put', `/contracts/${userId}/usageLevels?reset=true&renewableOnly=false`, key);
     failed(await call()); expect(await consumed()).toBe(0);
     const original: any = await Contract.findOne({ organizationId: organization.id, 'userContact.userId': userId })
       .select('+idempotencyReceipt').lean();
