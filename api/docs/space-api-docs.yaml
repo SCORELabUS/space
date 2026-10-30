@@ -34,7 +34,10 @@ info:
     - **Accessible Scopes**: 
       - `ALL`: Full access to organization resources and management operations
       - `MANAGEMENT`: Full access to organization resources and limited management operations
-      - `EVALUATION`: Read-only access to services/pricings and feature evaluation
+      - `EVALUATION`: Read-only access to services/pricings, plus feature evaluation: `POST /features/{userId}`,
+        `POST /features/{userId}/{featureId}` (including the expected consumption it records and `?revert=true`)
+        and `POST /features/{userId}/pricing-token`. It cannot write contracts, usage levels
+        (`PUT /contracts/{userId}/usageLevels`), services or pricings.
     - **Access Pattern**: Can access `/services/**`, `/contracts/**`, `/features/**` routes
     - **Example Use Cases**: 
       - Programmatically manage services and pricings
@@ -1586,7 +1589,8 @@ paths:
         **Scopes**:
         - `ALL`: Unrestricted access to all organization operations
         - `MANAGEMENT`: Create, update, delete operations (read access included)
-        - `EVALUATION`: Read-only access to services/pricings + feature evaluation
+        - `EVALUATION`: Read-only access to services/pricings + feature evaluation (including the expected
+          consumption of a single-feature evaluation and its revert) and pricing tokens
 
       tags:
         - Organizations
@@ -3814,7 +3818,10 @@ paths:
 
         **Authentication**: Organization API Key only
 
-        **Permission**: Org Key with any scope
+        **Permission**: Org Key with any scope (ALL/MANAGEMENT/EVALUATION). Recording the expected
+        consumption and reverting it (`?revert=true`) are part of the evaluation and allowed for every
+        scope; setting or resetting usage levels directly (`PUT /contracts/{userId}/usageLevels`)
+        requires ALL or MANAGEMENT.
 
       tags:
         - Features
