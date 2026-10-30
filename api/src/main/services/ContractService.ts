@@ -40,12 +40,19 @@ class ContractService {
     this.contractRepository = container.resolve('contractRepository');
     this.serviceService = container.resolve('serviceService');
     this.cacheService = container.resolve('cacheService');
+    // Position of the caller's organization among the arguments of the methods
+    // that address a contract by userId (see `_findContract`).
+    const scopeArgument: Record<string, number> = {
+      novate: 2, renew: 1, destroy: 1, novateUserContact: 2, novateBillingPeriod: 2,
+      resetUsageLevels: 3, _revertExpectedConsumption: 3,
+    };
     // Serialize binding mutations with synchronization. Consumption uses conditional atomic writes separately.
     for (const method of ['create', 'novate', 'novateByGroupId', 'renew', 'destroy', 'novateUserContact', 'novateBillingPeriod', 'novateBillingPeriodByGroupId', 'resetUsageLevels', '_revertExpectedConsumption'] as const) {
       const original = (this[method] as (...args: any[]) => Promise<any>).bind(this);
       (this as any)[method] = async (...args: any[]) => {
+        const scope = args[scopeArgument[method]];
         const contract: any = method === 'create' || method.endsWith('ByGroupId') ? null :
-          await ContractModel.findOne({ 'userContact.userId': args[0] }).lean();
+          await ContractModel.findOne({ 'userContact.userId': args[0], ...(scope ? { organizationId: scope } : {}) }).lean();
         const org = method === 'create' ? args[0]?.organizationId : method.endsWith('ByGroupId') ? args[1] : contract?.organizationId;
         if (!org || !await ServiceModel.exists({ organizationId: org, source: 'sphere' })) return original(...args);
         return withOrganizationLock(org, async assertOwned => {
@@ -60,6 +67,32 @@ class ContractService {
       };
     }
 
+  }
+
+  /**
+   * Look a contract up by `userId`, confined to `organizationId` when given.
+   *
+   * Contracts are cached under `contracts.<userId>` whatever their organization,
+   * so a cached contract is checked against the organization as well: a hit
+   * from another organization is a miss. Outside the organization the contract
+   * does not exist, and the error says exactly what it says for an unknown
+   * `userId`, so that a caller cannot tell the two apart.
+   */
+  async _findContract(userId: string, organizationId?: string): Promise<LeanContract> {
+    let contract: LeanContract | null = await this.cacheService.get(`contracts.${userId}`);
+
+    if (!contract) {
+      contract = await this.contractRepository.findByUserId(userId);
+      if (contract) {
+        await this.cacheService.set(`contracts.${userId}`, contract, 3600, true); // Cache for 1 hour
+      }
+    }
+
+    if (!contract || (organizationId && contract.organizationId !== organizationId)) {
+      throw new Error(`Contract with userId ${userId} not found`);
+    }
+
+    return contract;
   }
 
   async index(queryParams: any, organizationId?: string): Promise<LeanContract[]> {
@@ -98,17 +131,8 @@ class ContractService {
     return this.contractRepository.countByFilters(queryParams);
   }
 
-  async show(userId: string): Promise<LeanContract> {
-    let contract = await this.cacheService.get(`contracts.${userId}`);
-
-    if (!contract) {
-      contract = await this.contractRepository.findByUserId(userId);
-      await this.cacheService.set(`contracts.${userId}`, contract, 3600, true); // Cache for 1 hour
-    }
-
-    if (!contract) {
-      throw new Error(`Contract with userId ${userId} not found`);
-    }
+  async show(userId: string, organizationId?: string): Promise<LeanContract> {
+    const contract = await this._findContract(userId, organizationId);
 
     contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
 
@@ -219,23 +243,15 @@ class ContractService {
     return contract;
   }
 
-  async novate(userId: string, newSubscription: any): Promise<LeanContract> {
-    let contract = await this.cacheService.get(`contracts.${userId}`);
-
-    if (!contract) {
-      contract = await this.contractRepository.findByUserId(userId);
-    }
-
-    if (!contract) {
-      throw new Error(`Contract with userId ${userId} not found`);
-    }
+  async novate(userId: string, newSubscription: any, organizationId?: string): Promise<LeanContract> {
+    const contract = await this._findContract(userId, organizationId);
 
     await enforceSpherePolicy(contract.organizationId, newSubscription, contract);
     await isSubscriptionValid(newSubscription, contract.organizationId);
 
     const newContract = performNovation(contract, newSubscription);
 
-    const result = await this.contractRepository.update(userId, newContract);
+    const result = await this.contractRepository.update(userId, newContract, contract.organizationId);
 
     if (!result) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -282,16 +298,8 @@ class ContractService {
     return contractsToReturn;
   }
 
-  async renew(userId: string): Promise<LeanContract> {
-    let contract = await this.cacheService.get(`contracts.${userId}`);
-
-    if (!contract) {
-      contract = await this.contractRepository.findByUserId(userId);
-    }
-
-    if (!contract) {
-      throw new Error(`Contract with userId ${userId} not found`);
-    }
+  async renew(userId: string, organizationId?: string): Promise<LeanContract> {
+    const contract = await this._findContract(userId, organizationId);
 
     if (!contract.billingPeriod.autoRenew) {
       throw new Error(
@@ -305,7 +313,7 @@ class ContractService {
     );
     contract.billingPeriod.endDate = newEndDate;
 
-    const result = await this.contractRepository.update(userId, contract);
+    const result = await this.contractRepository.update(userId, contract, contract.organizationId);
 
     if (!result) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -321,24 +329,17 @@ class ContractService {
 
   async novateUserContact(
     userId: string,
-    userContact: Omit<UserContact, 'userId'>
+    userContact: Omit<UserContact, 'userId'>,
+    organizationId?: string
   ): Promise<LeanContract> {
-    let contract = await this.cacheService.get(`contracts.${userId}`);
-
-    if (!contract) {
-      contract = await this.contractRepository.findByUserId(userId);
-    }
-
-    if (!contract) {
-      throw new Error(`Contract with userId ${userId} not found`);
-    }
+    const contract = await this._findContract(userId, organizationId);
 
     contract.userContact = {
       ...contract.userContact,
       ...userContact,
     };
 
-    const result = await this.contractRepository.update(userId, contract);
+    const result = await this.contractRepository.update(userId, contract, contract.organizationId);
 
     if (!result) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -354,17 +355,10 @@ class ContractService {
 
   async novateBillingPeriod(
     userId: string,
-    newBillingPeriod: { endDate: Date; autoRenew: boolean; renewalDays: number }
+    newBillingPeriod: { endDate: Date; autoRenew: boolean; renewalDays: number },
+    organizationId?: string
   ): Promise<LeanContract> {
-    let contract = await this.cacheService.get(`contracts.${userId}`);
-
-    if (!contract) {
-      contract = await this.contractRepository.findByUserId(userId);
-    }
-
-    if (!contract) {
-      throw new Error(`Contract with userId ${userId} not found`);
-    }
+    const contract = await this._findContract(userId, organizationId);
 
     if (new Date(newBillingPeriod.endDate) < new Date(contract.billingPeriod.startDate)) {
       throw new Error('End date cannot be before the start date');
@@ -375,7 +369,7 @@ class ContractService {
       ...newBillingPeriod,
     };
 
-    const result = await this.contractRepository.update(userId, contract);
+    const result = await this.contractRepository.update(userId, contract, contract.organizationId);
 
     if (!result) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -433,17 +427,10 @@ class ContractService {
   async resetUsageLevels(
     userId: string,
     queryParams: UsageLevelsResetQuery,
-    usageLevelsIncrements?: Record<string, Record<string, number>>
+    usageLevelsIncrements?: Record<string, Record<string, number>>,
+    organizationId?: string
   ): Promise<LeanContract> {
-    let contract = await this.cacheService.get(`contracts.${userId}`);
-
-    if (!contract) {
-      contract = await this.contractRepository.findByUserId(userId);
-    }
-
-    if (!contract) {
-      throw new Error(`Contract with userId ${userId} not found`);
-    }
+    const contract = await this._findContract(userId, organizationId);
 
     if (queryParams.usageLimit) {
       await this._resetUsageLimitUsageLevels(
@@ -466,7 +453,7 @@ class ContractService {
       throw new Error(`Invalid query params: ${JSON.stringify(queryParams)}`);
     }
 
-    const updatedContract = await this.contractRepository.update(userId, contract);
+    const updatedContract = await this.contractRepository.update(userId, contract, contract.organizationId);
 
     if (!updatedContract) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -485,9 +472,10 @@ class ContractService {
   async _applyExpectedConsumption(
     userId: string,
     usageLimitId: string,
-    expectedConsumption: number
+    expectedConsumption: number,
+    organizationId?: string
   ): Promise<void> {
-    await this._applyExpectedConsumptions(userId, { [usageLimitId]: expectedConsumption });
+    await this._applyExpectedConsumptions(userId, { [usageLimitId]: expectedConsumption }, organizationId);
   }
 
   /**
@@ -507,7 +495,8 @@ class ContractService {
    */
   async _applyExpectedConsumptions(
     userId: string,
-    expectedConsumptions: Record<string, number>
+    expectedConsumptions: Record<string, number>,
+    organizationId?: string
   ): Promise<void> {
     const usageLimitIds = Object.keys(expectedConsumptions);
     if (usageLimitIds.length === 0) {
@@ -526,13 +515,17 @@ class ContractService {
       increments[`${serviceName}.${usageLimit}`] = amount;
     }
 
-    const updatedContract = await this.contractRepository.incrementUsageLevels(userId, increments);
+    const updatedContract = await this.contractRepository.incrementUsageLevels(
+      userId,
+      increments,
+      organizationId
+    );
 
     if (!updatedContract) {
       // The update requires the contract and every named usage level to exist,
       // so it matched nothing. Which of the two is missing only matters for the
       // message, and is worth a read to get right.
-      await this._explainMissingUsageLevels(userId, targets);
+      await this._explainMissingUsageLevels(userId, targets, organizationId);
     }
 
     const appliedAt = new Date().getTime();
@@ -557,9 +550,10 @@ class ContractService {
    */
   private async _explainMissingUsageLevels(
     userId: string,
-    targets: { serviceName: string; usageLimit: string }[]
+    targets: { serviceName: string; usageLimit: string }[],
+    organizationId?: string
   ): Promise<never> {
-    const contract = await this.contractRepository.findByUserId(userId);
+    const contract = await this.contractRepository.findByUserId(userId, organizationId);
 
     if (!contract) {
       throw new Error(`Contract with userId ${userId} not found`);
@@ -581,17 +575,10 @@ class ContractService {
   async _revertExpectedConsumption(
     userId: string,
     featureId: string,
-    latest: boolean = false
+    latest: boolean = false,
+    organizationId?: string
   ): Promise<void> {
-    let contract = await this.cacheService.get(`contracts.${userId}`);
-
-    if (!contract) {
-      contract = await this.contractRepository.findByUserId(userId);
-    }
-
-    if (!contract) {
-      throw new Error(`Contract with userId ${userId} not found`);
-    }
+    const contract = await this._findContract(userId, organizationId);
 
     const serviceName: string = featureId.split('-')[0].toLowerCase();
     const featureName: string = featureId.split('-')[1];
@@ -629,7 +616,7 @@ class ContractService {
       }
     }
 
-    const updatedContract = await this.contractRepository.update(userId, contract);
+    const updatedContract = await this.contractRepository.update(userId, contract, contract.organizationId);
 
     if (!updatedContract) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -664,18 +651,10 @@ class ContractService {
     return removed;
   }
 
-  async destroy(userId: string): Promise<void> {
-    let contract = await this.cacheService.get(`contracts.${userId}`);
+  async destroy(userId: string, organizationId?: string): Promise<void> {
+    const contract = await this._findContract(userId, organizationId);
 
-    if (!contract) {
-      contract = await this.contractRepository.findByUserId(userId);
-    }
-
-    if (!contract) {
-      throw new Error(`Contract with userId ${userId} not found`);
-    }
-
-    await this.contractRepository.destroy(userId);
+    await this.contractRepository.destroy(userId, contract.organizationId);
 
     this.cacheService.del(`contracts.${userId}`);
   }
@@ -830,7 +809,8 @@ class ContractService {
 
     const updatedContract = await this.contractRepository.update(
       contract.userContact.userId,
-      contractToUpdate
+      contractToUpdate,
+      contract.organizationId
     );
 
     if (!updatedContract) {

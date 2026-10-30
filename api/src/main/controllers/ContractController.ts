@@ -13,6 +13,7 @@ class ContractController {
 
   constructor() {
     this.contractService = container.resolve('contractService');
+    this._scope = this._scope.bind(this);
     this.index = this.index.bind(this);
     this.show = this.show.bind(this);
     this.create = this.create.bind(this);
@@ -24,6 +25,18 @@ class ContractController {
     this.resetUsageLevels = this.resetUsageLevels.bind(this);
     this.prune = this.prune.bind(this);
     this.destroy = this.destroy.bind(this);
+  }
+
+  /**
+   * Organization a request may address contracts in.
+   *
+   * Organization API keys are confined to their own organization, and the
+   * organization-scoped routes to the organization in the path (membership is
+   * checked by `memberRole`). Only a platform ADMIN using the direct routes is
+   * not confined, as before.
+   */
+  _scope(req: any): string | undefined {
+    return req.org?.id ?? req.params.organizationId;
   }
 
   async index(req: any, res: any) {
@@ -56,7 +69,7 @@ class ContractController {
   async show(req: any, res: any) {
     try {
       const userId = req.params.userId;
-      const contract = await this.contractService.show(userId);
+      const contract = await this.contractService.show(userId, this._scope(req));
       res.json(contract);
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
@@ -109,7 +122,7 @@ class ContractController {
     try {
       const userId = req.params.userId;
       const newSubscription: Subscription = req.body;
-      const contract = await this.contractService.novate(userId, newSubscription);
+      const contract = await this.contractService.novate(userId, newSubscription, this._scope(req));
       res.status(200).json(contract);
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
@@ -151,7 +164,11 @@ class ContractController {
     try {
       const userId = req.params.userId;
       const userContact = req.body;
-      const contract = await this.contractService.novateUserContact(userId, userContact);
+      const contract = await this.contractService.novateUserContact(
+        userId,
+        userContact,
+        this._scope(req)
+      );
       res.status(200).json(contract);
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
@@ -167,7 +184,11 @@ class ContractController {
       const userId = req.params.userId;
       const billingPeriod = req.body;
 
-      const contract = await this.contractService.novateBillingPeriod(userId, billingPeriod);
+      const contract = await this.contractService.novateBillingPeriod(
+        userId,
+        billingPeriod,
+        this._scope(req)
+      );
       res.status(200).json(contract);
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
@@ -215,7 +236,8 @@ class ContractController {
       const novatedContract = await this.contractService.resetUsageLevels(
         userId,
         queryParams,
-        usageLevelsIncrements
+        usageLevelsIncrements,
+        this._scope(req)
       );
       res.status(200).json(novatedContract);
     } catch (err: any) {
@@ -249,7 +271,7 @@ class ContractController {
   async destroy(req: any, res: any) {
     try {
       const userId = req.params.userId;
-      await this.contractService.destroy(userId);
+      await this.contractService.destroy(userId, this._scope(req));
       res.status(204).json({ message: `Deleted contract with userId ${userId} successfully` });
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {

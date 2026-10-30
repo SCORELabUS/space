@@ -62,6 +62,28 @@ info:
     - **Org Key (scope)**: Requires Organization API Key with specified scope
     - **Org Members (role)**: Requires User API key. If the key does not have ADMIN role, the user must be a member of the organization and have –at least– the specified role.
 
+    ## Organization isolation of contracts
+
+    Contracts are addressed by `userId`, which is chosen by the host application. Every route that takes a
+    `userId` (`/contracts/{userId}/**`, `/organizations/{organizationId}/contracts/{userId}`,
+    `/features/{userId}/**`) only finds contracts of the caller's organization: the organization of the
+    organization API key, or the `organizationId` of the route for user API keys (also for platform ADMIN
+    users). A contract of another organization is reported as `404`, exactly like a `userId` that does not
+    exist. Only a platform ADMIN user calling the direct `/contracts/{userId}` routes is not confined.
+
+    Known limitation: `userId` is still unique across the whole server, not per organization. Creating a
+    contract (`POST /contracts`) with a `userId` that a contract of another organization already uses
+    answers `409`, so two organizations cannot use the same `userId` yet.
+
+    ## Capabilities
+
+    Every response (errors and CORS preflights included) carries `X-Space-Capabilities`, a comma-separated
+    list of the optional API features this server implements. It is exposed to browsers through CORS.
+    Clients should check a token before relying on the guarantee it stands for, and fail instead of
+    silently writing without it. Tokens:
+
+    - `contract-org-scope`: `userId` lookups are confined to the caller's organization (see above).
+
   contact:
     email: agarcia29@us.es
     name: SPACE Support
@@ -3012,7 +3034,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Contract'
         '404':
-          description: Contract not found
+          $ref: '#/components/responses/ContractNotFound'
 
     put:
       summary: Update contract (novate)
@@ -3051,6 +3073,8 @@ paths:
                 $ref: '#/components/schemas/Contract'
         '403':
           description: Forbidden
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
     delete:
       summary: Delete contract
@@ -3083,6 +3107,8 @@ paths:
           description: Contract deleted
         '403':
           description: Forbidden
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /contracts:
     get:
@@ -3412,6 +3438,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Contract'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
     put:
       summary: Update contract
@@ -3446,6 +3474,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Contract'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
     delete:
       summary: Delete contract
@@ -3473,6 +3503,8 @@ paths:
       responses:
         '204':
           description: Contract deleted
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /contracts/{userId}/usageLevels:
     put:
@@ -3508,6 +3540,8 @@ paths:
             application/json:
               schema:
                 type: object
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /contracts/{userId}/userContact:
     put:
@@ -3543,6 +3577,8 @@ paths:
             application/json:
               schema:
                 type: object
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /contracts/{userId}/billingPeriod:
     put:
@@ -3578,6 +3614,8 @@ paths:
             application/json:
               schema:
                 type: object
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /features:
     get:
@@ -3722,6 +3760,8 @@ paths:
                     type: array
                     items:
                       type: object
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /features/{userId}/pricing-token:
     post:
@@ -3762,6 +3802,8 @@ paths:
                   token:
                     type: string
                     description: JWT token with pricing information
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /features/{userId}/{featureId}:
     post:
@@ -3832,6 +3874,8 @@ paths:
                     type: boolean
                   reason:
                     type: string
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /analytics/api-calls:
     get:
@@ -4686,6 +4730,18 @@ components:
               maxVisits: 5
 
   responses:
+    ContractNotFound:
+      description: |
+        No contract with this `userId` exists in the caller's organization (contracts of other
+        organizations are reported the same way).
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Contract with userId 01c4a3cb-0bd5-4d4f-bc1a-0d5bb3d1f6a3 not found
     UnprocessableEntity:
       description: Request sent could not be processed properly
       content:

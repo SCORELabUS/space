@@ -36,7 +36,12 @@ async function evaluateFeature(
   pricingContext: PricingContext,
   subscriptionContext: SubscriptionContext,
   evaluationContext: EvaluationContext,
-  options: { simple: boolean; expectedConsumption?: Record<string, number>; userId?: string } = {
+  options: {
+    simple: boolean;
+    expectedConsumption?: Record<string, number>;
+    userId?: string;
+    organizationId?: string;
+  } = {
     simple: true,
   }
 ): Promise<boolean | FeatureEvaluationResult> {
@@ -75,7 +80,11 @@ async function evaluateFeature(
           consumptions[limit] = expectedConsumption[limit];
         }
 
-        await contractService._applyExpectedConsumptions(options.userId, consumptions);
+        await contractService._applyExpectedConsumptions(
+          options.userId,
+          consumptions,
+          options.organizationId
+        );
       }
     }
   }
