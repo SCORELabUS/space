@@ -19,6 +19,7 @@ const EXPECTED = [
   'pricing-yaml',
   'new-contracts-version',
   'contract-pricings',
+  'novation-preview',
 ];
 
 const tokens = (response: request.Response) =>
