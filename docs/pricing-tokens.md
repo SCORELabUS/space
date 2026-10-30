@@ -97,11 +97,18 @@ Configure the JWKS URL of your SPACE yourself and **pin the algorithm**. Never t
 ### Node.js / browser (`jose`)
 
 ```js
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createRemoteJWKSet, decodeProtectedHeader, jwtVerify } from 'jose';
 
-const SPACE_JWKS = createRemoteJWKSet(new URL('https://space.example.com/api/v1/.well-known/jwks.json'));
+const SPACE_JWKS = createRemoteJWKSet(
+  new URL('https://space.example.com/api/v1/.well-known/jwks.json'),
+  { cacheMaxAge: 300_000, cooldownDuration: 30_000 },
+);
 
 export async function verifyPricingToken(token, myOrganizationId, expectedUserId) {
+  const header = decodeProtectedHeader(token); // still untrusted
+  if (header.alg !== 'ES256' || typeof header.kid !== 'string' || !header.kid.trim()) {
+    throw new Error('Expected ES256 with a kid');
+  }
   const { payload } = await jwtVerify(token, SPACE_JWKS, {
     algorithms: ['ES256'],
     issuer: 'space', // JWT_ISSUER of your SPACE (default "space")
