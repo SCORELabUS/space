@@ -205,6 +205,20 @@ describe('Pricing version for new contracts', function () {
       expect(shown.body.defaultVersion).toBe('0.9');
     });
 
+    it('updates only the exact service when a prefix sibling was inserted first', async function () {
+      const sibling = await ServiceMongoose.findOne({ name: storedName, organizationId: organization.id }).lean();
+      const exactName = storedName.slice(0, 4);
+      await ServiceMongoose.collection.insertOne({
+        ...sibling!, _id: new mongoose.Types.ObjectId(), name: exactName,
+      });
+      const response = await setDefault('0.9', exactName);
+      expect(response.status).toBe(200);
+      const exact = await ServiceMongoose.findOne({ name: exactName, organizationId: organization.id }).lean();
+      const untouched = await ServiceMongoose.findOne({ name: storedName, organizationId: organization.id }).lean();
+      expect(exact?.defaultVersion).toBe('0.9');
+      expect(untouched?.defaultVersion).toBeUndefined();
+    });
+
     it('rejects versions that are not active', async function () {
       await archivePetclinicVersion(app, allKey, storedName, '0.9');
 

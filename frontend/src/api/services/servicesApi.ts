@@ -4,6 +4,33 @@ import { isAfter } from 'date-fns';
 
 const DEFAULT_TIMEOUT = 5000;
 
+const servicePath = (organizationId: string, serviceName: string) =>
+  `/organizations/${encodeURIComponent(organizationId)}/services/${encodeURIComponent(serviceName)}`;
+
+export interface NewContractsPricing {
+  version: string;
+  source: 'default' | 'latest-active' | 'sphere-policy';
+  yamlUrl: string;
+}
+
+export async function getService(apiKey: string, organizationId: string, serviceName: string, signal?: AbortSignal): Promise<RetrievedService> {
+  return (await axios.get(servicePath(organizationId, serviceName), {
+    headers: { 'x-api-key': apiKey }, timeout: DEFAULT_TIMEOUT, signal,
+  })).data;
+}
+
+export async function getNewContractsPricing(apiKey: string, organizationId: string, serviceName: string, signal?: AbortSignal): Promise<NewContractsPricing> {
+  return (await axios.get(`${servicePath(organizationId, serviceName)}/pricings/new-contracts`, {
+    headers: { 'x-api-key': apiKey }, timeout: DEFAULT_TIMEOUT, signal,
+  })).data;
+}
+
+export async function setDefaultVersion(apiKey: string, organizationId: string, serviceName: string, defaultVersion: string | null): Promise<RetrievedService> {
+  return (await axios.put(servicePath(organizationId, serviceName), { defaultVersion }, {
+    headers: { 'x-api-key': apiKey }, timeout: DEFAULT_TIMEOUT,
+  })).data;
+}
+
 export async function getServices(
   apiKey: string,
   organizationId: string,

@@ -1,11 +1,13 @@
 export interface Service {
   name: string;
+  defaultVersion?: string;
   activePricings: Record<string, Pricing>;
   archivedPricings: Record<string, Pricing>;
 }
 
 export interface RetrievedService {
   name: string;
+  defaultVersion?: string;
   activePricings: Record<string, PricingEntry>;
   archivedPricings: Record<string, PricingEntry>;
 }
