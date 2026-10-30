@@ -209,7 +209,8 @@ describe('Services API Test Suite', function () {
   });
 
   describe('PUT /services/{serviceName}', function () {
-    let contractsToCleanup: Set<string> = new Set();
+    // userId -> organization that holds the contract at the end of the test.
+    let contractsToCleanup: Map<string, string> = new Map();
 
     afterEach(async function () {
       // Reset service name if it was changed
@@ -220,8 +221,8 @@ describe('Services API Test Suite', function () {
         .catch(() => {}); // Ignore errors if service was deleted
 
       // Cleanup contracts
-      for (const userId of contractsToCleanup) {
-        await deleteTestContract(userId, app);
+      for (const [userId, organizationId] of contractsToCleanup) {
+        await deleteTestContract(userId, organizationId, app);
       }
       contractsToCleanup.clear();
     });
@@ -269,7 +270,7 @@ describe('Services API Test Suite', function () {
 
       expect(createResponse.status).toEqual(201);
       const contractBefore = createResponse.body as LeanContract;
-      contractsToCleanup.add(contractBefore.userContact.userId);
+      contractsToCleanup.set(contractBefore.userContact.userId, contractBefore.organizationId);
       
       // Verify contract has the service
       expect(contractBefore.contractedServices).toHaveProperty(testService.name.toLowerCase());
@@ -284,7 +285,7 @@ describe('Services API Test Suite', function () {
       expect(updateResponse.body.name).toEqual(newServiceName);
 
       // Verify contract was updated with new service name
-      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, app);
+      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, contractBefore.organizationId, app);
       expect(contractAfter.contractedServices).toHaveProperty(newServiceName.toLowerCase());
       expect(contractAfter.contractedServices).not.toHaveProperty(testService.name.toLowerCase());
       expect(contractAfter.subscriptionPlans).toHaveProperty(newServiceName.toLowerCase());
@@ -303,8 +304,8 @@ describe('Services API Test Suite', function () {
       expect(serviceBeforeUpdate.organizationId).toEqual(testOrganization.id);
 
       const responseUpdate = await request(app)
-        .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', testApiKey)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target
         .send({ organizationId: newOrganization.id });
 
       expect(responseUpdate.status).toEqual(200);
@@ -340,21 +341,22 @@ describe('Services API Test Suite', function () {
 
       expect(createResponse.status).toEqual(201);
       const contractBefore = createResponse.body as LeanContract;
-      contractsToCleanup.add(contractBefore.userContact.userId);
+      contractsToCleanup.set(contractBefore.userContact.userId, contractBefore.organizationId);
       expect(Object.keys(contractBefore.contractedServices).length).toEqual(1);
       expect(contractBefore.organizationId).toEqual(testOrganization.id);
 
       // Move service to new organization
       const updateResponse = await request(app)
-        .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', testApiKey)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target
         .send({ organizationId: newOrganization.id });
 
       expect(updateResponse.status).toEqual(200);
       expect(updateResponse.body.organizationId).toEqual(newOrganization.id);
 
       // Verify contract was moved to new organization
-      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, app);
+      contractsToCleanup.set(contractBefore.userContact.userId, newOrganization.id!);
+      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, newOrganization.id!, app);
       expect(contractAfter.organizationId).toEqual(newOrganization.id);
       expect(contractAfter.contractedServices).toHaveProperty(testService.name.toLowerCase());
 
@@ -386,7 +388,7 @@ describe('Services API Test Suite', function () {
 
       expect(createResponse.status).toEqual(201);
       const contractBefore = createResponse.body as LeanContract;
-      contractsToCleanup.add(contractBefore.userContact.userId);
+      contractsToCleanup.set(contractBefore.userContact.userId, contractBefore.organizationId);
       expect(Object.keys(contractBefore.contractedServices).length).toEqual(2);
       expect(contractBefore.organizationId).toEqual(testOrganization.id);
       const orgBefore = contractBefore.organizationId;
@@ -394,15 +396,15 @@ describe('Services API Test Suite', function () {
       // Move service to new organization
       const newOrganization = await createTestOrganization(ownerUser.username);
       const updateResponse = await request(app)
-        .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', testApiKey)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target
         .send({ organizationId: newOrganization.id });
 
       expect(updateResponse.status).toEqual(200);
       expect(updateResponse.body.organizationId).toEqual(newOrganization.id);
 
       // Verify contract STILL in original organization but service was removed
-      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, app);
+      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, orgBefore, app);
       expect(contractAfter.organizationId).toEqual(orgBefore);
       expect(contractAfter.contractedServices).not.toHaveProperty(testService.name.toLowerCase());
       expect(contractAfter.contractedServices).toHaveProperty(additionalService.name.toLowerCase());
@@ -435,8 +437,8 @@ describe('Services API Test Suite', function () {
       await addApiKeyToOrganization(newOrganization.id!, { key: newOrgApiKey, scope: 'ALL' });
 
       const responseUpdate = await request(app)
-        .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', testApiKey)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target
         .send({ name: newName, organizationId: newOrganization.id });
 
       expect(responseUpdate.status).toEqual(200);
@@ -473,7 +475,7 @@ describe('Services API Test Suite', function () {
 
       expect(singleContractResponse.status).toEqual(201);
       const singleContractBefore = singleContractResponse.body as LeanContract;
-      contractsToCleanup.add(singleContractBefore.userContact.userId);
+      contractsToCleanup.set(singleContractBefore.userContact.userId, singleContractBefore.organizationId);
 
       // Contract with multiple services
       const multiContractData = await generateContract(
@@ -493,19 +495,21 @@ describe('Services API Test Suite', function () {
 
       expect(multiContractResponse.status).toEqual(201);
       const multiContractBefore = multiContractResponse.body as LeanContract;
-      contractsToCleanup.add(multiContractBefore.userContact.userId);
+      contractsToCleanup.set(multiContractBefore.userContact.userId, multiContractBefore.organizationId);
 
       const updateResponse = await request(app)
-        .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
-        .set('x-api-key', testApiKey)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey) // a move needs OWNER or ADMIN here and OWNER, ADMIN or MANAGER in the target
         .send({ name: newName, organizationId: newOrganization.id });
 
       expect(updateResponse.status).toEqual(200);
       expect(updateResponse.body.name).toEqual(newName);
       expect(updateResponse.body.organizationId).toEqual(newOrganization.id);
 
+      contractsToCleanup.set(singleContractBefore.userContact.userId, newOrganization.id!);
       const singleContractAfter = await getContractByUserId(
         singleContractBefore.userContact.userId,
+        newOrganization.id!,
         app
       );
       expect(singleContractAfter.organizationId).toEqual(newOrganization.id);
@@ -516,6 +520,7 @@ describe('Services API Test Suite', function () {
 
       const multiContractAfter = await getContractByUserId(
         multiContractBefore.userContact.userId,
+        multiContractBefore.organizationId,
         app
       );
       expect(multiContractAfter.organizationId).toEqual(testOrganization.id);
@@ -556,18 +561,33 @@ describe('Services API Test Suite', function () {
       await deleteTestService(secondService.name, testOrganization.id!);
     });
 
-    it('Should return 4XX when trying to move service to non-existent organization', async function () {
+    it('Should return 403 when trying to move service to non-existent organization', async function () {
       const fakeOrgId = '507f1f77bcf86cd799439012';
+
+      const responseUpdate = await request(app)
+        .put(`${baseUrl}/organizations/${testOrganization.id}/services/${testService.name.toLowerCase()}`)
+        .set('x-api-key', ownerUser.apiKey)
+        .send({ organizationId: fakeOrgId });
+
+      // The same answer as for an organization the caller has no rights in.
+      expect(responseUpdate.status).toEqual(403);
+      expect(responseUpdate.body.error).toBeDefined();
+      expect(responseUpdate.body.error.toLowerCase()).not.toContain('not found');
+    });
+
+    it('Should return 403 when an organization API key moves a service to another organization', async function () {
+      const newOrganization = await createTestOrganization(ownerUser.username);
 
       const responseUpdate = await request(app)
         .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
         .set('x-api-key', testApiKey)
-        .send({ organizationId: fakeOrgId });
+        .send({ organizationId: newOrganization.id });
 
-      expect(responseUpdate.status).toBeGreaterThanOrEqual(400);
-      expect(responseUpdate.status).toBeLessThan(500);
-      expect(responseUpdate.body.error).toBeDefined();
-      expect(responseUpdate.body.error.toLowerCase()).toContain('not found');
+      expect(responseUpdate.status).toEqual(403);
+      const service = await getService(testOrganization.id!, testService.name, app);
+      expect(service.organizationId).toEqual(testOrganization.id);
+
+      await deleteTestOrganization(newOrganization.id!);
     });
 
     it('Should return 404 when trying to update non-existent service', async function () {
@@ -750,7 +770,7 @@ describe('Services API Test Suite', function () {
       .reply(200, newPricingVersion);
 
       const response = await request(app)
-        .post(`${baseUrl}/services/${testService}/pricings`)
+        .post(`${baseUrl}/services/${testService.name}/pricings`)
         .set('x-api-key', testApiKey)
         .send({
           pricing:
@@ -765,7 +785,7 @@ describe('Services API Test Suite', function () {
   describe('GET /services/{serviceName}/pricings/{pricingVersion}', function () {
     it('Should return 200: Given existent service name and pricing version', async function () {  
       const response = await request(app)
-        .get(`${baseUrl}/services/${testService}/pricings/${testService.activePricings.keys().next().value}`)
+        .get(`${baseUrl}/services/${testService.name}/pricings/${testService.activePricings.keys().next().value}`)
         .set('x-api-key', testApiKey);
       expect(response.status).toEqual(200);
       expect(response.body.features).toBeDefined();
@@ -780,7 +800,7 @@ describe('Services API Test Suite', function () {
 
     it('Should return 200: Given existent service name in upper case and pricing version', async function () {
       const response = await request(app)
-        .get(`${baseUrl}/services/${testService}/pricings/${testService.activePricings.keys().next().value}`)
+        .get(`${baseUrl}/services/${testService.name.toUpperCase()}/pricings/${testService.activePricings.keys().next().value}`)
         .set('x-api-key', testApiKey);
       expect(response.status).toEqual(200);
       expect(response.body.features).toBeDefined();
@@ -820,7 +840,7 @@ describe('Services API Test Suite', function () {
       const fallbackPlan = getFirstPlanFromPricing(pricingToArchiveContent);
       
       const responseUpdate = await request(app)
-        .put(`${baseUrl}/services/${testService}/pricings/${versionToArchive}`)
+        .put(`${baseUrl}/services/${testService.name}/pricings/${versionToArchive}`)
         .set('x-api-key', testApiKey)
         .send({
           subscriptionPlan: fallbackPlan,
@@ -842,7 +862,7 @@ describe('Services API Test Suite', function () {
       
       const responseUpdate = await request(app)
         .put(
-          `${baseUrl}/services/${testService}/pricings/${versionToArchive}?availability=archived`
+          `${baseUrl}/services/${testService.name}/pricings/${versionToArchive}?availability=archived`
         )
         .set('x-api-key', testApiKey)
         .send({
@@ -862,7 +882,7 @@ describe('Services API Test Suite', function () {
       const archivedVersion = await addArchivedPricingToService(testOrganization.id!, testService.name);
 
       const responseUpdate = await request(app)
-        .put(`${baseUrl}/services/${testService}/pricings/${archivedVersion}?availability=active`)
+        .put(`${baseUrl}/services/${testService.name}/pricings/${archivedVersion}?availability=active`)
         .set('x-api-key', testApiKey);
       expect(responseUpdate.status).toEqual(200);
       expect(responseUpdate.body.activePricings).toBeDefined();
@@ -889,7 +909,7 @@ describe('Services API Test Suite', function () {
 
         const responseUpdate = await request(app)
           .put(
-            `${baseUrl}/services/${testService}/pricings/${versionToArchive}?availability=archived`
+            `${baseUrl}/services/${testService.name}/pricings/${versionToArchive}?availability=archived`
           )
           .set('x-api-key', testApiKey)
           .send({
@@ -945,7 +965,7 @@ describe('Services API Test Suite', function () {
       
       const responseUpdate = await request(app)
         .put(
-          `${baseUrl}/services/${testService}/pricings/${versionToArchive}?availability=invalidValue`
+          `${baseUrl}/services/${testService.name}/pricings/${versionToArchive}?availability=invalidValue`
         )
         .set('x-api-key', testApiKey)
         .send({
@@ -1020,7 +1040,7 @@ describe('Services API Test Suite', function () {
       // Necesary to delete
       await archivePricingFromService(testOrganization.id!, testService.name, versionToDelete, app);
       await request(app)
-        .delete(`${baseUrl}/services/${testService}/pricings/${versionToDelete}`)
+        .delete(`${baseUrl}/services/${testService.name}/pricings/${versionToDelete}`)
         .set('x-api-key', testApiKey)
         .expect(204);
     });

@@ -1,4 +1,4 @@
-import { UsageLevel } from '../../types/models/Contract';
+import { LeanContract, UsageLevel } from '../../types/models/Contract';
 import { LeanPricing } from '../../types/models/Pricing';
 import { addPeriodToDate, escapeVersion, resetEscapeVersion } from '../helpers';
 
@@ -59,4 +59,24 @@ function resetEscapeContractedServiceVersions(escapedServices: Record<string, st
   return contractedServices;
 }
 
-export {generateUsageLevels, escapeContractedServiceVersions, resetEscapeContractedServiceVersions}
+/**
+ * A copy of the contract without some services (names compared
+ * case-insensitively) in `contractedServices`, `subscriptionPlans`,
+ * `subscriptionAddOns` and `usageLevels`: what feature evaluation works with
+ * when services of the contract are dormant. The contract is not changed.
+ */
+function withoutServices(contract: LeanContract, serviceNames: string[]): LeanContract {
+  const excluded = new Set(serviceNames.map(name => name.toLowerCase()));
+  if (excluded.size === 0) return contract;
+  const keep = <T>(record: Record<string, T> | undefined): Record<string, T> =>
+    Object.fromEntries(Object.entries(record ?? {}).filter(([key]) => !excluded.has(key.toLowerCase())));
+  return {
+    ...contract,
+    contractedServices: keep(contract.contractedServices),
+    subscriptionPlans: keep(contract.subscriptionPlans),
+    subscriptionAddOns: keep(contract.subscriptionAddOns),
+    usageLevels: keep(contract.usageLevels),
+  };
+}
+
+export {generateUsageLevels, escapeContractedServiceVersions, resetEscapeContractedServiceVersions, withoutServices}

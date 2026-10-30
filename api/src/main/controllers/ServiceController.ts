@@ -1,9 +1,13 @@
+import { ServiceRelocationPendingError } from '../services/serviceRelocationState';
 import container from '../config/container.js';
-import ServiceService from '../services/ServiceService.js';
+import { createHash } from 'node:crypto';
+import ServiceService, { PricingYamlUnavailableError, PricingYamlUpstreamError } from '../services/ServiceService.js';
+import { SphereCredentialError } from '../services/sphere/credentials.js';
+import { SphereAuthError, SphereResourceUnavailableError } from '../services/sphere/errors.js';
 import { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository.js';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import { FallBackSubscription } from '../types/models/Contract.js';
-import { resetEscapePricingVersion } from '../utils/services/helpers.js';
+import { pricingYamlUrl, resetEscapePricingVersion } from '../utils/services/helpers.js';
 
 class ServiceController {
   private readonly serviceService: ServiceService;
@@ -14,6 +18,7 @@ class ServiceController {
     this.indexPricings = this.indexPricings.bind(this);
     this.show = this.show.bind(this);
     this.showPricing = this.showPricing.bind(this);
+    this.showNewContractsPricing = this.showNewContractsPricing.bind(this);
     this.showPublicPricingUrl = this.showPublicPricingUrl.bind(this);
     this.create = this.create.bind(this);
     this.update = this.update.bind(this);
@@ -37,7 +42,8 @@ class ServiceController {
 
       res.json(services);
     } catch (err: any) {
-      res.status(500).send({ error: err.message });
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      res.status(err.message === 'Invalid disabled filter' ? 400 : 500).send({ error: err.message });
     }
   }
 
@@ -66,6 +72,7 @@ class ServiceController {
 
       return res.json(pricings);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -87,6 +94,7 @@ class ServiceController {
 
       return res.json(service);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -105,12 +113,88 @@ class ServiceController {
         return res.status(400).send({ error: 'Organization ID is required. You can either provide an organization scoped API key or use the /organizations/*/services/** paths' });
       }
 
+      const format = req.query.format ?? 'json';
+      if (format !== 'json' && format !== 'yaml') {
+        return res.status(400).send({ error: 'Invalid format: use "json" (default) or "yaml"' });
+      }
+
+      if (format === 'yaml') {
+        return await this._sendPricingYaml(req, res, serviceName, pricingVersion, organizationId);
+      }
+
       const pricing = await this.serviceService.showPricing(serviceName, pricingVersion, organizationId);
 
       resetEscapePricingVersion(pricing);
 
       return res.json(pricing);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (err instanceof PricingYamlUnavailableError) {
+        res.status(404).send({ error: 'PRICING_YAML_UNAVAILABLE', message: err.message });
+      } else if (err.message.toLowerCase().includes('not found')) {
+        res.status(404).send({ error: err.message });
+      } else {
+        res.status(500).send({ error: err.message });
+      }
+    }
+  }
+
+  /**
+   * The Pricing2Yaml file of a version: `application/yaml`, a strong ETag
+   * (sha256 of the body), `X-Pricing-Syntax-Version`, and 304 for a matching
+   * `If-None-Match`.
+   */
+  async _sendPricingYaml(req: any, res: any, serviceName: string, pricingVersion: string, organizationId: string) {
+    try {
+      const { body, syntaxVersion } = await this.serviceService.showPricingYaml(
+        serviceName,
+        pricingVersion,
+        organizationId
+      );
+      const etag = `"${createHash('sha256').update(body).digest('hex')}"`;
+
+      res.set('ETag', etag);
+      res.set('Cache-Control', 'private, no-cache');
+      if (syntaxVersion) res.set('X-Pricing-Syntax-Version', syntaxVersion);
+
+      const ifNoneMatch: string | undefined = req.get('If-None-Match');
+      const tags = (ifNoneMatch ?? '').split(',').map(tag => tag.trim().replace(/^W\//, ''));
+      if (ifNoneMatch && (tags.includes(etag) || tags.includes('*'))) {
+        return res.status(304).end();
+      }
+
+      res.status(200).type('application/yaml; charset=utf-8').send(body);
+    } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (err instanceof PricingYamlUnavailableError) {
+        res.status(404).send({ error: 'PRICING_YAML_UNAVAILABLE', message: err.message });
+      } else if (err instanceof PricingYamlUpstreamError) {
+        res.status(502).send({ error: 'SPHERE_UNAVAILABLE', message: err.message });
+      } else if (err.message.toLowerCase().includes('not found')) {
+        res.status(404).send({ error: err.message });
+      } else {
+        res.status(500).send({ error: err.message });
+      }
+    }
+  }
+
+  /** GET .../pricings/new-contracts: `{ version, yamlUrl, source }`. */
+  async showNewContractsPricing(req: any, res: any) {
+    try {
+      const organizationId = req.org ? req.org.id : req.params.organizationId;
+
+      if (!organizationId) {
+        return res.status(400).send({ error: 'Organization ID is required. You can either provide an organization scoped API key or use the /organizations/*/services/** paths' });
+      }
+
+      const { version, source, serviceName } = await this.serviceService.newContractsPricing(
+        req.params.serviceName,
+        organizationId
+      );
+
+      res.json({ version, yamlUrl: pricingYamlUrl(req.params.organizationId, serviceName, version), source });
+    } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -132,17 +216,20 @@ class ServiceController {
         });
       }
 
-      const pricingPath = await this.serviceService.showPublicPricingUrl(
-        serviceName,
-        pricingVersion,
-        organizationId
-      );
+      // Fails when the version has no stored file.
+      await this.serviceService.showPublicPricingUrl(serviceName, pricingVersion, organizationId);
+
+      // Pricing files are no longer public: the URL is the authorised pricing
+      // route, which needs the same credentials as this request.
+      const pricingPath = `${req.path.replace(/\/public-url\/?$/, '')}?format=yaml`;
 
       return res.json({
         path: pricingPath,
         url: `${req.protocol}://${req.get('host')}${pricingPath}`,
+        requiresAuthentication: true,
       });
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -162,8 +249,27 @@ class ServiceController {
 
       if (req.body.source === 'sphere') {
         if (receivedFile || req.body.pricing) return res.status(400).json({ error: 'Invalid mixed pricing sources' });
-        const linked = await container.resolve('sphereSyncService').create(req.body, organizationId);
-        return res.status(201).json(linked);
+        try {
+          const linked = await container.resolve('sphereSyncService').create(req.body, organizationId);
+          return res.status(201).json(linked);
+        } catch (error: any) {
+          if (error instanceof SphereCredentialError) {
+            return res.status(400).json({
+              code: 'SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE',
+              error: 'SPHERE credentials cannot be used or saved right now. Ask your SPACE administrator to check credential storage.',
+            });
+          }
+          if (error instanceof SphereAuthError || error instanceof SphereResourceUnavailableError) {
+            const suppliedKey = typeof req.body.sphereApiKey === 'string' && req.body.sphereApiKey.length > 0;
+            return res.status(400).json({
+              code: suppliedKey ? 'SPHERE_KEY_REJECTED' : 'SPHERE_ACCESS_REQUIRED',
+              error: suppliedKey
+                ? 'This SPHERE API key cannot access the pricing. Check the link and the key permissions, then try again.'
+                : 'This pricing may be private or unavailable. Provide a SPHERE API key with access to continue.',
+            });
+          }
+          throw error;
+        }
       }
       let service;
 
@@ -178,7 +284,10 @@ class ServiceController {
       }
       res.status(201).json(service);
     } catch (err: any) {
-      if (
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (err.message.startsWith('CONFLICT')) {
+        res.status(409).send({ error: err.message });
+      } else if (
         err.message.toLowerCase().includes('parsing') ||
         err.message.toLowerCase().includes('already exists') ||
         err.message.toLowerCase().includes('invalid')
@@ -221,7 +330,10 @@ class ServiceController {
 
       res.status(201).json(service);
     } catch (err: any) {
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (err.message.startsWith('CONFLICT')) {
+        res.status(409).send({ error: err.message });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('exists')) {
         res.status(400).send({ error: err.message });
@@ -247,6 +359,7 @@ class ServiceController {
 
       res.json(service);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('invalid data')) {
         return res.status(400).send({ error: err.message });
       }
@@ -293,6 +406,7 @@ class ServiceController {
         res.json(service);
       }
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('last active pricing')) {
@@ -307,7 +421,7 @@ class ServiceController {
 
   async prune(req: any, res: any) {
     try {
-      let organizationId = req.org ? req.org.id : req.params.organizationId;
+      const organizationId = req.org ? req.org.id : req.params.organizationId;
       if (!organizationId && req.user && req.user.role !== "ADMIN"){
         return res.status(400).send({ error: 'Organization ID is required. You can either provide an organization scoped API key or use the /organizations/*/services/** paths' });
       }
@@ -316,14 +430,18 @@ class ServiceController {
         return res.status(403).send({ error: 'Forbidden: You do not have permission to prune services' });
       }
 
-      if (req.user && req.user.role === "ADMIN"){
-        organizationId = undefined;        
-      }
+      // A platform ADMIN prunes every organization on the direct route only;
+      // on /organizations/{organizationId}/services, that organization.
 
       const result = await this.serviceService.prune(organizationId);
-      res.json({ message: `Pruned ${result} services` });
+      res.json({ message: `Pruned ${result ?? 0} services` });
     } catch (err: any) {
-      res.status(500).send({ error: err.message });
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (err.message.startsWith('CONFLICT')) {
+        res.status(409).send({ error: err.message });
+      } else {
+        res.status(500).send({ error: err.message });
+      }
     }
   }
 
@@ -344,6 +462,7 @@ class ServiceController {
         res.status(404).send({ error: 'Service not found' });
       }
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -370,6 +489,7 @@ class ServiceController {
         res.status(404).send({ error: 'Pricing not found' });
       }
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (
         err.message.toLowerCase().includes('not found') ||
         err.message.toLowerCase().includes('invalid')
@@ -388,7 +508,9 @@ class ServiceController {
   _transformIndexQueryParams(
     indexQueryParams: Record<string, string | number>
   ): ServiceQueryFilters {
+    if (indexQueryParams.disabled !== undefined && (typeof indexQueryParams.disabled !== 'string' || !['true', 'false'].includes(indexQueryParams.disabled))) throw new Error('Invalid disabled filter');
     const transformedData: ServiceQueryFilters = {
+      disabled: indexQueryParams.disabled === 'true',
       name: indexQueryParams.name as string,
       page: parseInt(indexQueryParams['page'] as string) || 1,
       offset: parseInt(indexQueryParams['offset'] as string) || 0,

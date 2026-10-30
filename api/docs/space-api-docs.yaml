@@ -34,7 +34,10 @@ info:
     - **Accessible Scopes**: 
       - `ALL`: Full access to organization resources and management operations
       - `MANAGEMENT`: Full access to organization resources and limited management operations
-      - `EVALUATION`: Read-only access to services/pricings and feature evaluation
+      - `EVALUATION`: Read-only access to services/pricings, plus feature evaluation: `POST /features/{userId}`,
+        `POST /features/{userId}/{featureId}` (including the expected consumption it records and `?revert=true`)
+        and `POST /features/{userId}/pricing-token`. It cannot write contracts, usage levels
+        (`PUT /contracts/{userId}/usageLevels`), services or pricings.
     - **Access Pattern**: Can access `/services/**`, `/contracts/**`, `/features/**` routes
     - **Example Use Cases**: 
       - Programmatically manage services and pricings
@@ -61,6 +64,260 @@ info:
     - **User Key (USER)**: Requires User API Key with USER role (or ADMIN)
     - **Org Key (scope)**: Requires Organization API Key with specified scope
     - **Org Members (role)**: Requires User API key. If the key does not have ADMIN role, the user must be a member of the organization and have –at least– the specified role.
+
+    ## Usage limits and consumption
+
+    `POST /features/{userId}/{featureId}` with an expected consumption (body: usage limit id -> amount, for
+    every limit of the feature) evaluates the feature and, when it is enabled, consumes. The limit is
+    enforced by the write itself: each usage level is incremented only while `consumed + amount` stays
+    within its limit, the limit of the contract's current subscription with its add-ons, for every limit of
+    the feature at once, and only while that subscription is still the stored one. Concurrent requests can
+    therefore never take a level past its limit: those that do not fit are answered exactly like an
+    evaluation over the limit (`eval: false`, `used` = level + amount, `limit`, `error: null`) and consume
+    nothing. Only positive amounts are bounded; a limit that is not a finite number (boolean, missing,
+    unlimited) bounds nothing.
+
+    Every applied consumption has a `consumptionId` in the response. `?revert=true&consumptionId=<id>`
+    reverts exactly that consumption: its amounts are subtracted once (repeating the revert does nothing),
+    never below zero, without touching anything else, so consumptions and changes recorded since are kept.
+    A level renewed since the consumption is left as it is. Ids are kept for
+    `CONSUMPTION_RETENTION_SECONDS` (default 24 hours) and are confined to the organization, `userId` and
+    feature; an unknown or expired id answers `404`. `?revert=true` without an id (optionally
+    `&latest=true`) is deprecated: it reverts the oldest (latest) consumption of the feature made in the
+    last two minutes, in the same way; it used to restore a cached snapshot of the level, which also undid
+    everything recorded after it.
+
+    Consumption intent is persisted before its atomic increment. Private, expiring receipts are written in
+    the same contract update as the increment or refund; interrupted acknowledgements can be recovered
+    without compensating against a newer billing period or subtracting twice. Cache failures never reopen
+    an applied refund. The original contract identity is checked, so recreating the same userId does not
+    make old records refundable against a new contract. The deprecated two-minute lookup also excludes
+    expired records, even before MongoDB TTL cleanup removes them.
+
+    Consumption records follow their service: renaming a service, or moving it to another organization,
+    rewrites the records of the contracts it rewrites (the service name, and the organization of the
+    contracts that move with it), so a revert by `consumptionId` keeps subtracting exactly what was consumed,
+    addressed with the new feature id (`<new service>-<feature>`) from the organization the contract is in
+    now. These record updates participate in the recoverable relocation steps, so a retry after a partial
+    relocation completes them without repeating contract mutations. Records of a contract that stays and loses the moved service, and of deleted services (prune,
+    destroy: exact name, case-insensitively, in that organization only), are deleted (`404`).
+
+    Each usage level of a consumption is reverted on the service it belongs to:
+    - when the contract no longer has that service (a rename or move that raced with the consumption, or the
+      service was removed from the contract), the consumption cannot be reverted exactly: the revert answers
+      `409`, subtracts nothing and does not mark the consumption reverted, even if its other levels are
+      there;
+    - when the service is still in the contract but no longer has that usage level (for example, its pricing
+      version was archived with a fallback that has no such limit, which regenerates the service's usage
+      levels), there is nothing to give back for it: the level is skipped and the other
+      levels are reverted as above, in one update. The revert then answers `200` with
+      `{ consumptionId, reverted: { <service>-<limit>: amount }, skipped: [<service>-<limit>] }`
+      (`ConsumptionRevertResult`) instead of `204`, and the consumption is reverted (repeating it answers
+      `204`).
+
+    A feature of a disabled service (dormant, see "Disabling and deleting services") consumes nothing, and a
+    revert of one of its consumptions, by id or not, answers `409 SERVICE_DISABLED` and changes nothing; the
+    consumption can be reverted exactly once the service is enabled again, within the retention period.
+
+    Renewable usage levels are renewed once per period: `consumed` goes back to 0 and `resetTimeStamp`
+    moves forward by whole periods.
+
+    ## Idempotency-Key
+
+    Writes that must not be applied twice when a client retries them accept an `Idempotency-Key` header
+    (1 to 255 characters): single-feature evaluations that consume or revert (`POST
+    /features/{userId}/{featureId}`), usage level changes (`PUT /contracts/{userId}/usageLevels`), contract
+    creation (`POST /contracts`, `POST /organizations/{organizationId}/contracts`) and novations (`PUT
+    /contracts/{userId}`, `PUT /organizations/{organizationId}/contracts/{userId}`, `PUT /contracts?groupId=`,
+    `PUT /organizations/{organizationId}/contracts?groupId=`). Reads never look at it.
+
+    - The key is scoped to the organization of the request (the organization API key's, or the route's for
+      user API keys; a platform ADMIN on a direct route without `organizationId` has keys of their own).
+      Two organizations may use the same key independently.
+    - It is bound to the request it was first used for: method, route, path parameters, query, JSON body
+      and `If-Match`. The same key with the same request replays the stored status, body and `ETag` with
+      `Idempotent-Replayed: true`, and applies nothing. The same key with another request answers
+      `409 IDEMPOTENCY_CONFLICT` and applies nothing.
+    - Concurrent requests with the same key: exactly one runs; the others wait for it briefly and replay
+      its response, or answer `409 IDEMPOTENCY_IN_PROGRESS` with `Retry-After` while it is still running.
+    - Every response below 500 is stored (except `401`, `403`, `408`, `429`), so a retry gets the answer of
+      the first attempt; for example a novation that succeeded with `If-Match` is replayed as `200` even
+      though the version it named is no longer current. A `5xx` is not replayed as a final response:
+      retry the same key. Before any accepted effect, an unused reservation may be released. Once a
+      domain plan is prepared, it is retained and resumed; a retry does not restart its business writes.
+    - A renewable 60-second worker lease uses MongoDB time. Expired workers cannot apply another
+      contract mutation or complete/release a successor's reservation. Takeover retains the original
+      operation, fingerprint, prepared plan and per-contract checkpoints.
+    - Every contract mutation stores its private receipt and actual public result atomically. Results
+      are checkpointed in the request journal before the contract receipt is acknowledged; completed
+      receipts keep a bounded marker rather than retaining a history of contract snapshots.
+    - Completed keys are kept for `IDEMPOTENCY_KEY_TTL_SECONDS` (default 24 hours), starting at completion;
+      after that the same key starts a new request. Unfinished prepared operations do not expire by TTL:
+      deleting their journal could duplicate a previously applied effect.
+    - Availability is checked again before a still-unapplied effect: a service paused in the meantime
+      cannot receive new consumption or counter changes. Replaying an already applied operation still
+      returns its historical result. Consumption expiry and receipt pruning use the same database clock.
+    - Prepared novations and counter resets also keep internal version/period guards. If a later change
+      makes an unapplied step unsafe, it returns `409 IDEMPOTENCY_STATE_CHANGED` with current contract
+      versions and, for a group, `novated` members already applied. Re-read current state before issuing
+      a corrected operation with a new key. Explicit If-Match failures retain `412 CONTRACT_CHANGED`.
+    - An abandoned persisted receipt can be checkpointed without executing its remaining plan, allowing
+      a later operation to proceed. Contract deletion checkpoints pending applied receipts before removing
+      their proof, so retrying an old creation cannot recreate a contract the user deleted.
+    - Group novations freeze the original member list and prepared changes. Recovery resumes each
+      contract, preserving concurrent usage and contact changes; it is not a multi-contract transaction.
+      Cache invalidation and event delivery are recovered after persistence; events may be attempted again.
+    - If ownership or durable response storage cannot be confirmed, SPACE answers `503` instead of sending
+      an unrecorded success. Retry with the same key. Responses larger than 4 MiB are not reported as a
+      durable success; a prepared operation remains available for recovery.
+
+    How hosts should use it: generate a new random key (a UUID) for each operation, before the first
+    attempt, and keep it with the operation (for example in the job or outbox row that issues the call).
+    Send the same key on every retry of that operation (timeouts, connection errors, `5xx`, `409
+    IDEMPOTENCY_IN_PROGRESS` after `Retry-After`) and never for a different operation. After a `4xx` that
+    you correct (a different body or `If-Match`), send the corrected request with a new key. Check the
+    `idempotency-key` capability before relying on it: an older SPACE ignores the header.
+
+    ## Organization isolation of contracts
+
+    Contracts are addressed by `userId`, which is chosen by the host application. Every route that takes a
+    `userId` (`/contracts/{userId}/**`, `/organizations/{organizationId}/contracts/{userId}`,
+    `/features/{userId}/**`) only finds contracts of the caller's organization: the organization of the
+    organization API key, or the `organizationId` of the route for user API keys (also for platform ADMIN
+    users). A contract of another organization is reported as `404`, exactly like a `userId` that does not
+    exist. Only a platform ADMIN user calling the direct `/contracts/{userId}` routes is not confined (see
+    below).
+
+    ## userId unique per organization
+
+    A `userId` is unique within an organization, not across the server: two organizations may each have a
+    contract for user `42` (unique index `{ organizationId, userContact.userId }`). `POST /contracts` answers
+    `409` only for a `userId` the caller's own organization already uses; a `userId` of another organization
+    neither conflicts nor is revealed. Moving a service to another organization (`PUT /services/{serviceName}`
+    with `organizationId`) answers `409` when a contract it would move has a `userId` the target organization
+    already uses, and changes nothing.
+
+    Contract events and pricing tokens identify the contract by organization and `userId`: events carry
+    `details.organizationId` and only reach that organization; in pricing tokens `sub` is the URN
+    `urn:space:<organizationId>:<percent-encoded userId>`, the `userId` and `organizationId` claims carry both
+    parts, `aud` is the organization and `iss` names the SPACE server (see `PricingTokenPayload`). Verifiers
+    should check `iss` and `aud` (the organization they serve) and read the user from `userId`; clients must
+    not parse `sub`.
+
+    Platform ADMIN users on the direct routes that address contracts by `userId` or `groupId`
+    (`/contracts/{userId}/**`, `PUT /contracts?groupId=`, `PUT /contracts/billingPeriod?groupId=`) must
+    always name the organization, with the `organizationId` query parameter or through the
+    organization-scoped routes (`/organizations/{organizationId}/contracts/...`). Without it they get `400`
+    with `code: ORGANIZATION_ID_REQUIRED`, before anything is read, locked or written, even when only one
+    organization has that `userId`. `GET` and `DELETE /contracts` accept `organizationId` to list or prune one
+    organization and, without it, cover every organization. Any other caller already has an organization:
+    `organizationId` may repeat it, and anything else answers `403`.
+
+    ## Disabling and deleting services
+
+    **Disabling** a service (`DELETE /services/{serviceName}`, `DELETE /organizations/{organizationId}/services/{serviceName}`)
+    is reversible: its pricings are archived, `SERVICE_DISABLED` is announced on `/pricings`, and uploading a pricing with
+    the same `saasName` enables it again (the versions it had stay archived; uploading one of them activates it again,
+    see "Uploading a version the service has archived"). Contracts are not changed: the service is
+    *dormant* in the contracts that have it, and every reader of a contract treats it so:
+    - Evaluation of all features (`POST /features/{userId}`) and the pricing token leave its features out, as for any
+      feature the subscription does not have; the other services of the contract evaluate normally. The token lists it
+      in the `dormantServices` claim; its `subscription` claim is still the contract.
+    - Evaluation of one of its features (`POST /features/{userId}/{featureId}`) answers `200` with `eval: false` and
+      `error.code: SERVICE_DISABLED`, like `FLAG_NOT_FOUND` for an unknown feature. Nothing is consumed: an expected
+      consumption gets the same answer (no `consumptionId`), and `?revert=true` answers `409 SERVICE_DISABLED`, with or
+      without `consumptionId`: the consumption is not reverted, and the same revert applies once the service is enabled
+      again (while its id is retained).
+    - `PUT /contracts/{userId}/usageLevels` answers `409 SERVICE_DISABLED` for increments of its usage levels; resets leave them as they are (and so does the automatic renewal of renewable levels).
+    - `GET /contracts/{userId}/pricings` marks it with `serviceStatus: disabled`.
+    - Novations may keep it exactly as it is (same version, plan and add-ons; listed in the preview's `dormantServices`),
+      but not subscribe to it or change it (`VERSION_NOT_FOUND`, as for an unknown service). New contracts cannot use it.
+    - Cached evaluations and pricing tokens of the organization are dropped when it is disabled. Pricing tokens already
+      handed out stay valid until they expire.
+    When the service is enabled again, the contracts work as before, with their subscription and usage levels.
+
+    **Deleting** services (`DELETE /services`, `DELETE /organizations/{organizationId}/services`) is irreversible: they
+    are removed from every contract of the organization (`contractedServices`, `subscriptionPlans`,
+    `subscriptionAddOns`, `usageLevels`; names compared case-insensitively). The previous subscription is recorded in
+    the contract history and each changed contract gets a `CONTRACT_NOVATED` event. A contract left without services is
+    kept (user contact and history included): its billing period ends at that moment and it no longer renews, so it can
+    be novated to other services or deleted with `DELETE /contracts/{userId}`. Each contract is written only if it did
+    not change since it was read (a concurrent novation is never overwritten; the removal is retried). The contracts
+    are updated before the services are deleted, so a failure (`500`, or `409` when a contract keeps changing) deletes
+    nothing and the request can be repeated. The stored pricings of the deleted services (and their Pricing2Yaml files)
+    are deleted with them, so the same pricing can be uploaded again afterwards. Exactly the services that were read
+    are deleted: a service created while the request runs stays, with its pricings.
+
+    Disabling and deleting only ever affect the services of the organization of the request. Service names are
+    matched exactly (case-insensitively; characters such as `.`, `(` or `+` are literal), so `zoom` never affects
+    `zoom-pro`, and another organization's service with the same name, its pricings and its contracts are never
+    touched.
+
+    ## Renaming and moving services
+
+    `PUT /services/{serviceName}` (and the organization-scoped route) with `name` and/or `organizationId` updates
+    every contract of the organization that has the service (all of them, names compared case-insensitively):
+    - **Rename**: the service is renamed in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
+      `usageLevels` (consumption included). `contractVersion` changes (it covers the service names), so each contract
+      gets a `CONTRACT_NOVATED` event, and its cached evaluations and pricing token are dropped (feature ids carry the
+      service name).
+    - **Move** to another organization: contracts that only have this service move with it. The organization they
+      leave gets `CONTRACT_DELETED` (they are no longer found there) and the new one gets `CONTRACT_CREATED` (its
+      consumers did not know them); `contractVersion` does not change unless the service is also renamed. Contracts
+      with other services stay and lose this one, as when it is deleted (history recorded, `CONTRACT_NOVATED`).
+    - The pricings of the service follow it (`GET .../services/{newName}/pricings` in its organization).
+
+    **Who may move a service.** A move takes the service and its contracts out of one organization and into another,
+    so the caller must be allowed to do that in both: a user with the OWNER or ADMIN role in the organization the
+    service is in (for it, a move is like deleting the service) and the OWNER, ADMIN or MANAGER role in the target
+    organization (the roles that may create services there), on
+    `PUT /organizations/{organizationId}/services/{serviceName}`, or a platform ADMIN. Organization API keys cannot move services (`403`): a key belongs to one organization. A
+    target organization that does not exist gets the same `403` as one the caller has no rights in. This is checked
+    before anything is read or written for the move. Renaming and `defaultVersion` keep their permissions.
+    Everything that can refuse the request is checked first, and a `409` changes nothing: the name is taken by
+    another service (enabled or disabled) of the organization the service would be in, a contract already has a
+    service with the new name, or a contract that would move has a `userId` the target organization already uses.
+    Each contract is written only if it did not change since it was read (a concurrent novation or consumption is
+    never overwritten; the contract is read again and retried). Contracts are written before the service, so after
+    a failure the request can be repeated; contracts created with the old name while the request runs are updated
+    after the service is.
+
+    ## Uploading a version the service has archived
+
+    A pricing version is not replaced once contracts may use it. Uploading a version that the service has archived
+    (`POST .../services/{serviceName}/pricings`, or `POST .../services` for a disabled service, which enables it
+    again) compares the upload with the stored version, by content (what SPACE stores of a pricing: version, currency,
+    `createdAt`, features, usage limits, plans and add-ons; layout, comments and key order do not matter):
+    - **Same content**: the archived version is active again, the same stored pricing as before, so contracts on it
+      work as they did (for a disabled service: with their subscription and usage levels). A disabled service is
+      enabled with it as its only active version; its other versions stay archived. `PRICING_ACTIVED` is announced.
+    - **Other content**, or stored content that cannot be read: `409`, and nothing is changed (the stored Pricing2Yaml
+      file neither). Upload it as another version.
+    Uploading a version that is active is refused with `400`, as before.
+
+    ## Capabilities
+
+    Every response (errors and CORS preflights included) carries `X-Space-Capabilities`, a comma-separated
+    list of the optional API features this server implements. It is exposed to browsers through CORS.
+    Clients should check a token before relying on the guarantee it stands for, and fail instead of
+    silently writing without it. Tokens:
+
+    - `contract-org-scope`: `userId` lookups are confined to the caller's organization (see above).
+    - `contract-version`: contracts carry `contractVersion` and an `ETag`; novations accept `If-Match` / `expectedContractVersion` and answer `412 CONTRACT_CHANGED`.
+    - `atomic-usage-limits`: consumption never exceeds a usage limit under concurrency, applied consumptions carry `consumptionId`, and `?revert=true&consumptionId=` reverts exactly one consumption (see "Usage limits and consumption").
+    - `keep-billing-period`: `keepBillingPeriod` on novations, and subscriptions validated strictly against the pricing (`400` with `errors`; archived versions rejected for new contracts and version changes).
+    - `reject-private`: the opt-in `rejectPrivate` option (query or body) of contract creation and novations, which rejects private plans and add-ons.
+    - `pricing-yaml`: `GET .../pricings/{version}?format=yaml` returns the stored Pricing2Yaml file.
+    - `new-contracts-version`: `GET .../pricings/new-contracts` and the optional service `defaultVersion`.
+    - `idempotency-key`: the `Idempotency-Key` header on consumptions, usage level changes, contract creation and novations (see "Idempotency-Key").
+    - `contract-pricings`: `GET /contracts/{userId}/pricings`.
+    - `novation-preview`: `POST /contracts/{userId}/novation/preview`.
+    - `token-subscription`: the pricing token carries the `subscription` claim.
+    - `contract-events`: authenticated Socket.IO namespace `/contracts` with contract events.
+    - `contract-event-ids`: every event (`/contracts` and `/pricings`) carries `eventId` and `occurredAt` (see the `Events` tag for what they guarantee and what they do not).
+    - `sphere-private`: SPHERE-linked services accept a write-only `sphereApiKey` to read private versions (`sphere.hasApiKey`); private versions are never served statically.
+    - `contract-userid-per-org`: a `userId` is unique per organization (see above), pricing tokens identify the contract by organization (`sub` = `urn:space:<organizationId>:<percent-encoded userId>`, `userId`, `organizationId`, `aud`, `iss`; see `PricingTokenPayload`), and platform ADMIN users name the organization (`organizationId`) on the direct routes that address contracts by `userId` or `groupId` (`400 ORGANIZATION_ID_REQUIRED` otherwise).
+    - `service-disable-dormant`: a disabled service is dormant in contracts and deleting services removes them from every contract (see "Disabling and deleting services").
 
   contact:
     email: agarcia29@us.es
@@ -98,7 +355,77 @@ tags:
   - name: Cache
     description: Cache management (User ADMIN only)
   - name: Events
-    description: WebSocket event management (Public)
+    description: |
+      WebSocket events (Socket.IO, path `/events`, transport `websocket`).
+
+      - Namespace `/pricings` (public): `message` events `{ code: PRICING_CREATED | PRICING_ARCHIVED |
+        PRICING_ACTIVED | SERVICE_DISABLED, eventId, occurredAt, details: { serviceName, pricingVersion? } }`.
+      - Namespace `/contracts` (authenticated): handshake `auth: { apiKey }` or an `x-api-key` header. Organization
+        API keys of any scope receive the events of their organization; user API keys must also send
+        `auth.organizationId` of an organization they own or belong to (ADMIN users: any organization). Only events
+        of that organization are delivered, as `message` events
+        `{ code: CONTRACT_CREATED | CONTRACT_NOVATED | CONTRACT_DELETED | CONTRACT_RENEWED, eventId, occurredAt,
+        details: { userId, organizationId, contractVersion, services } }` (schema `ContractEvent`) (`contractVersion` is `null` for
+        `CONTRACT_DELETED`; `services` are the contracted services). Events are emitted after the change is stored,
+        including novations by group (also the contracts a partly rejected guarded group novation did write),
+        billing period changes (`CONTRACT_NOVATED`, since they change `contractVersion`), SPHERE synchronization,
+        archiving a pricing version, and deleting all contracts of the organization (one `CONTRACT_DELETED` per
+        contract). A novation preview emits nothing. A rejected handshake fails with `connect_error`; when the
+        credential could not be checked (database unavailable) the message says so instead of reporting an
+        invalid key, and the client may retry.
+
+        Authorization is checked at the handshake and again before each private event is delivered. Removing or
+        rotating a key, removing a membership, deleting a user or losing ADMIN authority disconnects affected
+        subscriptions. Authority changes are propagated between API instances through the Redis adapter; a missed
+        notification cannot authorize a later event because each receiving instance checks its local connections.
+        If authority cannot be checked, delivery is refused and the subscription disconnects. Authorized
+        subscriptions to other organizations remain connected. Clients may reconnect with a valid credential.
+
+      **Event identity** (capability `contract-event-ids`). Every event of both namespaces also carries, next to
+      `code` and `details` (unchanged):
+      - `eventId`: a UUIDv7 that identifies the event. Every copy of one event (every connection, on every
+        instance) has the same `eventId`, and two events never share one. Compare it for equality only: it sorts
+        roughly by emission time, which is not the order in which the changes were stored.
+      - `occurredAt`: ISO 8601 in UTC with milliseconds (`2026-10-27T10:00:00.123Z`). Emitters that retain the
+        write timestamp use the API instance's clock when the write returned. Otherwise it defaults to the time of
+        the notification attempt, including recovery or retries where the original timestamp is unavailable.
+        Clocks of different instances may differ; this is not an authoritative ordering or commit timestamp.
+
+      **Delivery guarantees.** Events are notifications that something changed, not a log of the changes:
+      - *At most once per connection, no replay.* An event goes to the connections open when it is emitted.
+        Nothing is stored or replayed (Socket.IO connection state recovery is not enabled), so a consumer that is
+        disconnected or reconnecting misses what happens meanwhile; so does every connection of an instance that
+        has lost its Redis subscription. An instance that stops after storing a change and before emitting its
+        event can lose that notification. Recovery of a durable relocation or idempotent operation may attempt
+        another notification for the same change, with a distinct `eventId`; delivery is not exactly once.
+      - *Several API instances* (Socket.IO Redis adapter, enabled by `REDIS_URL`): the emitting instance sends the
+        event to its own connections and publishes it once to Redis, and every other instance sends it to its own
+        connections. Each connection gets one copy. A consumer with several connections (several replicas, or a new
+        connection opened before the old one closed) gets one copy per connection, all with the same `eventId`.
+        Events relayed through Redis may arrive later than local ones (for example while the publisher reconnects).
+      - *No ordering.* Events of concurrent requests may be emitted in another order than their changes were
+        stored, and `contractVersion` is an opaque hash, not a counter. For group novations, SPHERE synchronization
+        and the contracts a partly rejected guarded group novation wrote, `details` are read again after the
+        write, so their `contractVersion` may already be that of a later change.
+      - *Not every change is announced.* Consumption, usage level resets and user contact changes emit nothing
+        (they are not part of `contractVersion`). Renaming a service emits `CONTRACT_NOVATED` for affected
+        contracts. When moving a service also moves a contract to the destination organization, it emits
+        `CONTRACT_DELETED` in the source and `CONTRACT_CREATED` in the destination. A contract that stays in the
+        source organization with its other services receives `CONTRACT_NOVATED` after removing the moved service.
+        Relocation recovery can repeat those notification attempts.
+
+      **Consuming them.**
+      - Drop duplicates by `eventId`: remember the ids seen in a short window (a few minutes, or the last few
+        thousand ids) and ignore repeats. Copies of one event are emitted together. This only deduplicates copies
+        of that event: recovery or idempotency retries may announce the same change under a new `eventId`.
+      - Treat a contract event as a hint to re-read the contract, not as its state: `GET /contracts/{userId}`
+        returns the current contract and `contractVersion` (unchanged from what you hold: nothing to do; `404`:
+        deleted). A duplicate, late or out-of-order event then costs one read and changes nothing.
+      - Resynchronize after every (re)connection, and periodically if missing a change matters: re-read the
+        contracts you hold, or page through `GET /contracts` (at most 100 per page) comparing `contractVersion`;
+        contracts that are no longer listed were deleted. There is no "changed since" query: contracts do not
+        store when they were last modified.
+
   - name: Healthcheck
     description: Service health verification (Public)
 
@@ -107,7 +434,7 @@ paths:
     post:
       security:
         - ApiKeyAuth: []
-      summary: Preview a public SPHERE permanent link
+      summary: Preview a SPHERE pricing and validate access
       requestBody:
         content:
           application/json:
@@ -122,6 +449,19 @@ paths:
                   enum: [all_last, new_last, all_pick, new_pick]
                 selectedVersionId:
                   type: string
+                serviceName:
+                  type: string
+                  description: >-
+                    Optional existing linked service in the authenticated organization. The permanent link must
+                    match its stored pricing identity. If sphereApiKey is omitted, the server uses its stored
+                    credential without returning it to the caller.
+                sphereApiKey:
+                  type: string
+                  nullable: true
+                  writeOnly: true
+                  description: >-
+                    Optional SPHERE API key used for this preview only, never stored. With it SPHERE also lists
+                    permitted private versions. Null previews anonymous access, even when serviceName has a saved key.
       responses:
         "200":
           description: Successful response
@@ -130,7 +470,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/SphereManifest'
         "400":
-          description: Invalid source or configuration
+          description: Invalid configuration, restricted or unavailable SPHERE pricing, rejected key or unavailable credential storage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  code:
+                    type: string
+                    enum: [SPHERE_ACCESS_REQUIRED, SPHERE_KEY_REJECTED, SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE]
+                    description: >-
+                      Present for access/key/storage failures. ACCESS_REQUIRED does not prove a resource is private:
+                      SPHERE also hides missing resources with 404. Network and upstream 500 failures do not use an access code.
         "404":
           description: Resource not available
         "202":
@@ -187,6 +539,18 @@ paths:
                   enum: [all_last, new_last, all_pick, new_pick]
                 selectedVersionId:
                   type: string
+                pollIntervalMinutes:
+                  type: integer
+                  enum: [1, 5, 15]
+                sphereApiKey:
+                  type: string
+                  nullable: true
+                  writeOnly: true
+                  description: >-
+                    SPHERE API key (`sk-...`) to read private versions. Write-only: stored encrypted (AES-256-GCM,
+                    key from `SPHERE_KEY_ENCRYPTION_KEY`) and never returned; responses show
+                    `configuration.hasApiKey`. Omit to keep the stored key, `null` removes it. Rejected with 400
+                    when `SPHERE_KEY_ENCRYPTION_KEY` is not set or SPHERE refuses the key.
       responses:
         "200":
           description: Successful response
@@ -242,11 +606,39 @@ paths:
           description: Synchronization queued
         "409":
           description: Synchronization is applying or configuration conflicts
+  /services/{serviceName}/synchronization/resume:
+    post:
+      security:
+        - ApiKeyAuth: []
+      summary: Reactivate a linked service and resume synchronization, preserving contracts
+      parameters:
+        - in: path
+          name: serviceName
+          required: true
+          schema:
+            type: string
+      description: >-
+        Reactivates the existing SPHERE service without changing its permanent link, credential, policy,
+        contracted versions, usage or billing dates. Queues synchronization under the existing new/all policy.
+        Requires the same organization management authority as synchronization. Repeated activation is safe.
+      responses:
+        "202":
+          description: Service reactivated and synchronization queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereSyncState'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
+        "409":
+          description: Synchronization is applying or configuration conflicts
   /organizations/{organizationId}/services/sphere/preview:
     post:
       security:
         - ApiKeyAuth: []
-      summary: Preview a public SPHERE permanent link
+      summary: Preview a SPHERE pricing and validate access
       parameters:
         - in: path
           name: organizationId
@@ -267,6 +659,19 @@ paths:
                   enum: [all_last, new_last, all_pick, new_pick]
                 selectedVersionId:
                   type: string
+                serviceName:
+                  type: string
+                  description: >-
+                    Optional existing linked service in the authenticated organization. The permanent link must
+                    match its stored pricing identity. If sphereApiKey is omitted, the server uses its stored
+                    credential without returning it to the caller.
+                sphereApiKey:
+                  type: string
+                  nullable: true
+                  writeOnly: true
+                  description: >-
+                    Optional SPHERE API key used for this preview only, never stored. With it SPHERE also lists
+                    permitted private versions. Null previews anonymous access, even when serviceName has a saved key.
       responses:
         "200":
           description: Successful response
@@ -275,7 +680,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/SphereManifest'
         "400":
-          description: Invalid source or configuration
+          description: Invalid configuration, restricted or unavailable SPHERE pricing, rejected key or unavailable credential storage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  code:
+                    type: string
+                    enum: [SPHERE_ACCESS_REQUIRED, SPHERE_KEY_REJECTED, SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE]
+                    description: >-
+                      Present for access/key/storage failures. ACCESS_REQUIRED does not prove a resource is private:
+                      SPHERE also hides missing resources with 404. Network and upstream 500 failures do not use an access code.
         "404":
           description: Resource not available
         "202":
@@ -342,6 +759,18 @@ paths:
                   enum: [all_last, new_last, all_pick, new_pick]
                 selectedVersionId:
                   type: string
+                pollIntervalMinutes:
+                  type: integer
+                  enum: [1, 5, 15]
+                sphereApiKey:
+                  type: string
+                  nullable: true
+                  writeOnly: true
+                  description: >-
+                    SPHERE API key (`sk-...`) to read private versions. Write-only: stored encrypted (AES-256-GCM,
+                    key from `SPHERE_KEY_ENCRYPTION_KEY`) and never returned; responses show
+                    `configuration.hasApiKey`. Omit to keep the stored key, `null` removes it. Rejected with 400
+                    when `SPHERE_KEY_ENCRYPTION_KEY` is not set or SPHERE refuses the key.
       responses:
         "200":
           description: Successful response
@@ -400,6 +829,39 @@ paths:
           description: Resource not available
         "202":
           description: Synchronization queued
+        "409":
+          description: Synchronization is applying or configuration conflicts
+  /organizations/{organizationId}/services/{serviceName}/synchronization/resume:
+    post:
+      security:
+        - ApiKeyAuth: []
+      summary: Reactivate a linked service and resume synchronization, preserving contracts
+      parameters:
+        - in: path
+          name: organizationId
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: serviceName
+          required: true
+          schema:
+            type: string
+      description: >-
+        Reactivates the existing SPHERE service without changing its permanent link, credential, policy,
+        contracted versions, usage or billing dates. Queues synchronization under the existing new/all policy.
+        Requires the same organization management authority as synchronization. Repeated activation is safe.
+      responses:
+        "202":
+          description: Service reactivated and synchronization queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereSyncState'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
         "409":
           description: Synchronization is applying or configuration conflicts
   /users/authenticate:
@@ -1564,7 +2026,8 @@ paths:
         **Scopes**:
         - `ALL`: Unrestricted access to all organization operations
         - `MANAGEMENT`: Create, update, delete operations (read access included)
-        - `EVALUATION`: Read-only access to services/pricings + feature evaluation
+        - `EVALUATION`: Read-only access to services/pricings + feature evaluation (including the expected
+          consumption of a single-feature evaluation and its revert) and pricing tokens
 
       tags:
         - Organizations
@@ -1662,6 +2125,10 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - in: query
+          name: disabled
+          description: Select disabled services instead of active services (default false).
+          schema: { type: boolean, default: false }
         - name: organizationId
           in: path
           required: true
@@ -1685,6 +2152,9 @@ paths:
       summary: Create service in organization
       description: |
         Creates a new service in the organization.
+
+        Uploading a pricing whose `saasName` is a disabled service of the organization enables it again; with a
+        version it has archived, see "Uploading a version the service has archived".
 
         **Authentication**: User API Key
 
@@ -1742,11 +2212,17 @@ paths:
           description: Forbidden - insufficient permissions
         '404':
           description: Organization not found
+        '409':
+          description: |
+            The service has this version archived with other content (or its stored content cannot be read); nothing
+            was changed. See "Uploading a version the service has archived".
 
     delete:
       summary: Delete all services in organization
       description: |
-        Deletes all services and associated pricings in the organization (irreversible operation).
+        Deletes all services (enabled and disabled) and associated pricings in the organization (irreversible
+        operation), after removing them from every contract of the organization (see "Disabling and deleting
+        services"). A platform ADMIN user deletes the services of this organization only.
 
         **Authentication**: User API Key
 
@@ -1765,12 +2241,16 @@ paths:
           schema:
             type: string
       responses:
-        '204':
-          description: All services deleted successfully
+        '200':
+          description: All services deleted (`{ message }`)
         '403':
           description: Forbidden - insufficient permissions
         '404':
           description: Organization not found
+        '409':
+          description: A contract kept changing while the services were removed from it; nothing was deleted, retry
+        '500':
+          description: The contracts could not be updated; nothing was deleted, retry
 
   /organizations/{organizationId}/services/{serviceName}:
     get:
@@ -1817,17 +2297,32 @@ paths:
       description: |
         Updates service metadata (name, organization).
 
+        Renames and moves persist private recovery progress. After an interruption, retry the exact original
+        update body through the original organization and service name, even if metadata already moved.
+        Atomic contract markers prevent repeated history; pending cache invalidations and event emission
+        attempts are replayed. Other binding/service changes in affected organizations return 409
+        SERVICE_RELOCATION_PENDING until recovery finishes. Destination authority must still be valid
+        on every retry. Events remain best-effort.
+
         **Authentication**: User API Key
 
         **Permission**: 
-        - USER user: OWNER/ADMIN/MANAGER role required
-        - ADMIN user: can update services in any organization
+        - USER user: OWNER/ADMIN/MANAGER role required to rename it or set `defaultVersion`. Moving it to another
+          organization (`organizationId`) requires the OWNER or ADMIN role in this organization **and** the OWNER,
+          ADMIN or MANAGER role in the target organization; otherwise `403`, also when the target organization does not exist (see "Renaming and moving
+          services").
+        - ADMIN user: can update services in any organization, and move them to any organization (`400` when it does
+          not exist)
 
-        **Cascading Operations**:
-        - Renaming a service propagates the change by updating the corresponding `contractedServices` references in all associated contracts.
+        **Cascading Operations** (every contract of the organization; see "Renaming and moving services"):
+        - Renaming a service renames it in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
+          `usageLevels` of every contract that has it (`CONTRACT_NOVATED`).
         - Updating `organizationId` triggers one of the following behaviors:
-            - If contracts include **only the updated service**, each contract’s `organizationId`` is updated to reflect the new organization.
-            - If contracts include **multiple contracted services**, the updated service is removed from them.
+            - If contracts include **only the updated service**, they move to the new organization
+              (`CONTRACT_DELETED` in the organization they leave, `CONTRACT_CREATED` in the new one).
+            - If contracts include **multiple contracted services**, the updated service is removed from them
+              (`CONTRACT_NOVATED`; the previous subscription is recorded in their history).
+        - The pricings of the service follow it.
 
       tags:
         - Services
@@ -1855,6 +2350,15 @@ paths:
                   type: string
                 organizationId:
                   type: string
+                defaultVersion:
+                  type: string
+                  nullable: true
+                  description: |
+                    Manual services only: pricing version assigned to new contracts that omit one (see
+                    `GET .../pricings/new-contracts`). Must be an active version; `null` removes it. It is removed
+                    automatically when that version is archived. SPHERE-linked services answer `400`: their
+                    synchronization policy decides.
+                  example: "2025"
       responses:
         '200':
           description: Service updated
@@ -1863,18 +2367,30 @@ paths:
               schema:
                 $ref: '#/components/schemas/Service'
         '400':
-          description: Invalid update data (e.g., organization not found)
+          description: Invalid update data (for a platform ADMIN, also a target organization that does not exist)
         '403':
-          description: Forbidden
+          description: |
+            Forbidden. For a move (`organizationId`): the caller is an organization API key, or does not have the
+            OWNER or ADMIN role in the service's organization and the OWNER, ADMIN or MANAGER role in the target, or
+            the target organization does not exist (the same answer, so
+            that it does not reveal which organization ids exist). Nothing was changed.
         '404':
           description: Service not found
         '409':
-          description: Service name already exists
+          description: |
+            Nothing was changed: the name is taken by another service, enabled or disabled, of the organization the
+            service would be in; a contract would end up with two subscriptions under the new name; or a contract
+            that would move has a `userId` the target organization already uses. Also when a contract kept changing
+            while it was being updated (repeat the request).
 
     delete:
       summary: Disable service
       description: |
-        Disables a service. Cannot be permanently deleted; use disable to mark unavailable.
+        Disables a service (reversible): its pricings are archived and `SERVICE_DISABLED` is announced. Uploading a
+        pricing with the same `saasName` enables it again. Contracts are not changed: the service is dormant in them
+        (its features are not available, the rest of each contract works normally) until it is enabled again; see
+        "Disabling and deleting services". To delete services for good, and remove them from contracts, use
+        `DELETE /services`.
 
         **Authentication**: User API Key
 
@@ -1951,6 +2467,8 @@ paths:
       description: |
         Uploads and adds a new pricing version to the service.
 
+        With a version the service has archived, see "Uploading a version the service has archived".
+
         **Authentication**: User API Key
 
         **Permission**: 
@@ -2001,19 +2519,63 @@ paths:
           description: Forbidden
         '404':
           description: Service not found
+        '409':
+          description: |
+            The service has this version archived with other content (or its stored content cannot be read); nothing
+            was changed. See "Uploading a version the service has archived".
 
-  /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}:
+  /organizations/{organizationId}/services/{serviceName}/pricings/new-contracts:
     get:
-      summary: Get pricing version details
+      summary: Pricing version for new contracts
       description: |
-        Retrieves complete details about a specific pricing version including 
-        plans, add-ons, and availability.
+        The pricing version SPACE assigns to new contracts of the service, which signed-out visitors of a pricing
+        page should see. `POST /contracts` uses it for services it subscribes without a `contractedServices` entry.
+        The service name is matched exactly (case-insensitive).
+
+        This route takes precedence over `GET .../pricings/{pricingVersion}`: a pricing version literally named
+        `new-contracts` cannot be read through that route (neither as JSON nor with `format=yaml`). Avoid that
+        version name.
 
         **Authentication**: User API Key
 
-        **Permission**: 
-        - USER user: organization member with any role
-        - ADMIN user: can view any pricing version from any service in any organization
+        **Permission**: organization member with any role (OWNER/ADMIN/MANAGER/EVALUATOR), or ADMIN user
+
+      tags:
+        - Services
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Version for new contracts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NewContractsPricing'
+        '404':
+          description: Service not found in the organization, or it has no active version
+
+  /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}/public-url:
+    get:
+      summary: Get the download URL of a pricing file
+      description: |
+        Returns the URL from which the Pricing2Yaml file of a version can be
+        downloaded. Despite the name of this endpoint, that URL is **not
+        public**: it is the authorised `GET /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}?format=yaml`
+        and needs the same credentials as this request (`x-api-key`).
+        Pricing files are not served as static files.
+
+        **Authentication**: User API Key (member of the organization; same roles as the pricing route)
 
       tags:
         - Services
@@ -2035,16 +2597,120 @@ paths:
           required: true
           schema:
             type: string
+      responses:
+        '200':
+          description: Download URL of the pricing file
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+                    description: Relative URL of the authorised download route.
+                    example: /api/v1/services/zoom/pricings/2025?format=yaml
+                  url:
+                    type: string
+                    format: uri
+                    description: Absolute URL of the authorised download route.
+                  requiresAuthentication:
+                    type: boolean
+                    description: Always true. Send `x-api-key` when downloading.
+        '404':
+          description: Service or pricing version not found
+
+  /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}:
+    get:
+      summary: Get pricing version details
+      description: |
+        Retrieves complete details about a specific pricing version including 
+        plans, add-ons, and availability.
+
+        **Authentication**: User API Key
+
+        **Permission**: 
+        - USER user: organization member with any role
+        - ADMIN user: can view any pricing version from any service in any organization
+
+      tags:
+        - Services
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PricingFormat'
+        - $ref: '#/components/parameters/IfNoneMatchPricingYaml'
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pricingVersion
+          in: path
+          required: true
+          schema:
+            type: string
           example: "1.0.0"
       responses:
         '200':
-          description: Pricing version details
+          description: |
+            Pricing details (JSON), or with `format=yaml` the stored Pricing2Yaml file of the version, byte for
+            byte.
+          headers:
+            ETag:
+              description: '`format=yaml` only: `"<sha256 hex of the body>"`.'
+              schema:
+                type: string
+            X-Pricing-Syntax-Version:
+              description: '`format=yaml` only: `syntaxVersion` of the file, exactly as written (an unquoted `3.0` is `3.0`). Exposed to browsers through CORS, like `ETag`.'
+              schema:
+                type: string
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Pricing'
+            application/yaml:
+              schema:
+                type: string
+                description: Pricing2Yaml document
         '404':
-          description: Pricing version not found
+          description: |
+            Pricing not found. With `format=yaml`, `{"error": "PRICING_YAML_UNAVAILABLE"}` when the version exists
+            but its file cannot be provided (no stored copy and, for SPHERE-linked services, SPHERE no longer
+            lists the version).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: PRICING_YAML_UNAVAILABLE
+                  message:
+                    type: string
+        '502':
+          description: |
+            `format=yaml`, SPHERE-linked services only: `{"error": "SPHERE_UNAVAILABLE"}` when a historical
+            version had to be fetched from SPHERE and SPHERE could not be reached, failed, or returned content
+            that does not match its manifest. Temporary; retry later.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: SPHERE_UNAVAILABLE
+                  message:
+                    type: string
+        '304':
+          description: '`format=yaml` only: the file matches `If-None-Match`.'
+        '400':
+          description: Invalid `format` (use `json` or `yaml`).
 
     put:
       summary: Update pricing availability
@@ -2158,12 +2824,16 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - in: query
+          name: disabled
+          description: Select disabled services instead of active services (default false).
+          schema: { type: boolean, default: false }
         - name: name
           in: query
           required: false
           schema:
             type: string
-          description: Case-insensitive partial match on service name (regex "contains").
+          description: Case-insensitive partial match on service name ("contains"); the text is matched literally, not as a regular expression.
         - name: page
           in: query
           required: false
@@ -2215,6 +2885,9 @@ paths:
       description: |
         Creates a new service in the organization.
 
+        Uploading a pricing whose `saasName` is a disabled service of the organization enables it again; with a
+        version it has archived, see "Uploading a version the service has archived".
+
         **Authentication**: Organization API Key
 
         **Permission**: 
@@ -2257,11 +2930,17 @@ paths:
                 $ref: '#/components/schemas/Service'
         '403':
           description: Forbidden
+        '409':
+          description: |
+            The service has this version archived with other content (or its stored content cannot be read); nothing
+            was changed. See "Uploading a version the service has archived".
 
     delete:
       summary: Delete all services
       description: |
-        Deletes all services and associated pricings in the organization (irreversible operation).
+        Deletes all services (enabled and disabled) and associated pricings in the organization (irreversible
+        operation), after removing them from every contract of the organization (see "Disabling and deleting
+        services").
 
         **Authentication**: Organization API Key | User API Key
 
@@ -2275,10 +2954,14 @@ paths:
       security:
         - ApiKeyAuth: []
       responses:
-        '204':
-          description: All services deleted
+        '200':
+          description: All services deleted (`{ message }`)
         '403':
           description: Forbidden
+        '409':
+          description: A contract kept changing while the services were removed from it; nothing was deleted, retry
+        '500':
+          description: The contracts could not be updated; nothing was deleted, retry
 
   /services/{serviceName}:
     get:
@@ -2315,17 +2998,33 @@ paths:
       description: |
         Updates service metadata (name, organization).
 
+        Renames and moves persist private recovery progress. After an interruption, retry the exact original
+        update body through the original organization and service name, even if metadata already moved.
+        Atomic contract markers prevent repeated history; pending cache invalidations and event emission
+        attempts are replayed. Other binding/service changes in affected organizations return 409
+        SERVICE_RELOCATION_PENDING until recovery finishes. Destination authority must still be valid
+        on every retry. Events remain best-effort.
+
         **Authentication**: Organization API Key
 
         **Permission**: 
-          - ALL scope: can update service name and organization.
-          - MANAGEMENT scope: can update service name and organization
+          - ALL scope: can update the service name and `defaultVersion`.
+          - MANAGEMENT scope: can update the service name and `defaultVersion`.
+          - Moving the service to another organization (`organizationId` other than the key's organization) is
+            refused with `403` for every scope: an organization API key belongs to one organization. Use
+            `PUT /organizations/{organizationId}/services/{serviceName}` with a user API key that has the OWNER or
+            ADMIN role in this organization and the OWNER, ADMIN or MANAGER role in the target (see "Renaming and
+            moving services").
 
-        **Cascading Operations**:
-        - Renaming a service propagates the change by updating the corresponding `contractedServices` references in all associated contracts.
+        **Cascading Operations** (every contract of the organization; see "Renaming and moving services"):
+        - Renaming a service renames it in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
+          `usageLevels` of every contract that has it (`CONTRACT_NOVATED`).
         - Updating `organizationId` triggers one of the following behaviors:
-            - If contracts include **only the updated service**, each contract’s `organizationId` is updated to reflect the new organization.
-            - If contracts include **multiple contracted services**, the updated service is removed from them.
+            - If contracts include **only the updated service**, they move to the new organization
+              (`CONTRACT_DELETED` in the organization they leave, `CONTRACT_CREATED` in the new one).
+            - If contracts include **multiple contracted services**, the updated service is removed from them
+              (`CONTRACT_NOVATED`; the previous subscription is recorded in their history).
+        - The pricings of the service follow it.
 
       tags:
         - Services
@@ -2348,6 +3047,15 @@ paths:
                   type: string
                 organizationId:
                   type: string
+                defaultVersion:
+                  type: string
+                  nullable: true
+                  description: |
+                    Manual services only: pricing version assigned to new contracts that omit one (see
+                    `GET .../pricings/new-contracts`). Must be an active version; `null` removes it. It is removed
+                    automatically when that version is archived. SPHERE-linked services answer `400`: their
+                    synchronization policy decides.
+                  example: "2025"
       responses:
         '200':
           description: Service updated
@@ -2355,13 +3063,31 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Service'
+        '400':
+          description: Invalid update data (for a platform ADMIN, also a target organization that does not exist)
         '403':
-          description: Forbidden
+          description: |
+            Forbidden. For a move (`organizationId`): the caller is an organization API key, or does not have the
+            OWNER or ADMIN role in the service's organization and the OWNER, ADMIN or MANAGER role in the target, or
+            the target organization does not exist (the same answer, so
+            that it does not reveal which organization ids exist). Nothing was changed.
+        '404':
+          description: Service not found
+        '409':
+          description: |
+            Nothing was changed: the name is taken by another service, enabled or disabled, of the organization the
+            service would be in; a contract would end up with two subscriptions under the new name; or a contract
+            that would move has a `userId` the target organization already uses. Also when a contract kept changing
+            while it was being updated (repeat the request).
 
     delete:
       summary: Disable service
       description: |
-        Disables a service. Cannot be permanently deleted; use disable to mark unavailable.
+        Disables a service (reversible): its pricings are archived and `SERVICE_DISABLED` is announced. Uploading a
+        pricing with the same `saasName` enables it again. Contracts are not changed: the service is dormant in them
+        (its features are not available, the rest of each contract works normally) until it is enabled again; see
+        "Disabling and deleting services". To delete services for good, and remove them from contracts, use
+        `DELETE /services`.
 
         **Authentication**: Organization API Key
 
@@ -2421,6 +3147,8 @@ paths:
       description: |
         Uploads and adds a new pricing version to the service.
 
+        With a version the service has archived, see "Uploading a version the service has archived".
+
         **Constraints**:
         - Pricing `saasName` and `serviceName` must be the same
 
@@ -2459,17 +3187,58 @@ paths:
                 $ref: '#/components/schemas/Pricing'
         '403':
           description: Forbidden
+        '409':
+          description: |
+            The service has this version archived with other content (or its stored content cannot be read); nothing
+            was changed. See "Uploading a version the service has archived".
 
-  /services/{serviceName}/pricings/{pricingVersion}:
+  /services/{serviceName}/pricings/new-contracts:
     get:
-      summary: Get pricing
+      summary: Pricing version for new contracts
       description: |
-        Retrieves complete details about a specific pricing version including 
-        plans, add-ons, and availability.
+        The pricing version SPACE assigns to new contracts of the service, which signed-out visitors of a pricing
+        page should see. `POST /contracts` uses it for services it subscribes without a `contractedServices` entry.
+        The service name is matched exactly (case-insensitive).
+
+        This route takes precedence over `GET .../pricings/{pricingVersion}`: a pricing version literally named
+        `new-contracts` cannot be read through that route (neither as JSON nor with `format=yaml`). Avoid that
+        version name.
 
         **Authentication**: Organization API Key
 
         **Permission**: Org Key with any scope
+
+      tags:
+        - Services
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Version for new contracts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NewContractsPricing'
+        '404':
+          description: Service not found in the organization, or it has no active version
+
+  /services/{serviceName}/pricings/{pricingVersion}/public-url:
+    get:
+      summary: Get the download URL of a pricing file
+      description: |
+        Returns the URL from which the Pricing2Yaml file of a version can be
+        downloaded. Despite the name of this endpoint, that URL is **not
+        public**: it is the authorised `GET /services/{serviceName}/pricings/{pricingVersion}?format=yaml`
+        and needs the same credentials as this request (`x-api-key`).
+        Pricing files are not served as static files.
+
+        **Authentication**: Organization API Key (any scope)
 
       tags:
         - Services
@@ -2488,13 +3257,110 @@ paths:
             type: string
       responses:
         '200':
-          description: Pricing details
+          description: Download URL of the pricing file
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+                    description: Relative URL of the authorised download route.
+                    example: /api/v1/services/zoom/pricings/2025?format=yaml
+                  url:
+                    type: string
+                    format: uri
+                    description: Absolute URL of the authorised download route.
+                  requiresAuthentication:
+                    type: boolean
+                    description: Always true. Send `x-api-key` when downloading.
+        '404':
+          description: Service or pricing version not found
+
+  /services/{serviceName}/pricings/{pricingVersion}:
+    get:
+      summary: Get pricing
+      description: |
+        Retrieves complete details about a specific pricing version including 
+        plans, add-ons, and availability.
+
+        **Authentication**: Organization API Key
+
+        **Permission**: Org Key with any scope
+
+      tags:
+        - Services
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PricingFormat'
+        - $ref: '#/components/parameters/IfNoneMatchPricingYaml'
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pricingVersion
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: |
+            Pricing details (JSON), or with `format=yaml` the stored Pricing2Yaml file of the version, byte for
+            byte.
+          headers:
+            ETag:
+              description: '`format=yaml` only: `"<sha256 hex of the body>"`.'
+              schema:
+                type: string
+            X-Pricing-Syntax-Version:
+              description: '`format=yaml` only: `syntaxVersion` of the file, exactly as written (an unquoted `3.0` is `3.0`). Exposed to browsers through CORS, like `ETag`.'
+              schema:
+                type: string
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Pricing'
+            application/yaml:
+              schema:
+                type: string
+                description: Pricing2Yaml document
         '404':
-          description: Pricing not found
+          description: |
+            Pricing not found. With `format=yaml`, `{"error": "PRICING_YAML_UNAVAILABLE"}` when the version exists
+            but its file cannot be provided (no stored copy and, for SPHERE-linked services, SPHERE no longer
+            lists the version).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: PRICING_YAML_UNAVAILABLE
+                  message:
+                    type: string
+        '502':
+          description: |
+            `format=yaml`, SPHERE-linked services only: `{"error": "SPHERE_UNAVAILABLE"}` when a historical
+            version had to be fetched from SPHERE and SPHERE could not be reached, failed, or returned content
+            that does not match its manifest. Temporary; retry later.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: SPHERE_UNAVAILABLE
+                  message:
+                    type: string
+        '304':
+          description: '`format=yaml` only: the file matches `If-None-Match`.'
+        '400':
+          description: Invalid `format` (use `json` or `yaml`).
 
     put:
       summary: Update pricing availability
@@ -2750,22 +3616,43 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - name: organizationId
           in: path
           required: true
           schema:
             type: string
+        - $ref: '#/components/parameters/RejectPrivate'
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCreation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '201':
           description: Contract created
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Contract'
         '403':
           description: Forbidden
+        '400':
+          $ref: '#/components/responses/InvalidSubscription'
+        '409':
+          description: |
+            The caller's organization already has a contract for this `userId` (a `userId` of another
+            organization does not conflict), or `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was used for a different request; `IDEMPOTENCY_IN_PROGRESS` (with `Retry-After`): a request with this key is still running.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/IdempotencyProblem'
+                  - $ref: '#/components/schemas/Error'
 
     put:
       summary: Update contracts by group ID
@@ -2786,6 +3673,9 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
         - name: userId
           in: path
           required: true
@@ -2799,14 +3689,34 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           description: Contracts updated
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/Contract'
+        '412':
+          $ref: '#/components/responses/ContractChanged'
+        '400':
+          description: |
+            Missing groupId; an `If-Match` header or an `expectedContractVersion` field (use
+            `expectedContractVersions` for groups); or an invalid subscription (body `InvalidSubscription`,
+            with `errors[].code`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidSubscription'
+        '404':
+          description: Contract (or group) not found, or every subscription problem is a missing plan, add-on or version (`InvalidSubscription`)
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
 
     delete:
       summary: Delete all contracts in organization
@@ -2865,12 +3775,15 @@ paths:
       responses:
         '200':
           description: Contract details
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Contract'
         '404':
-          description: Contract not found
+          $ref: '#/components/responses/ContractNotFound'
 
     put:
       summary: Update contract (novate)
@@ -2888,6 +3801,10 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
+        - $ref: '#/components/parameters/IfMatchContractVersion'
         - name: organizationId
           in: path
           required: true
@@ -2901,14 +3818,35 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           description: Contract updated
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Contract'
         '403':
           description: Forbidden
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '412':
+          $ref: '#/components/responses/ContractChanged'
+        '400':
+          description: |
+            Invalid subscription (body `InvalidSubscription`, with `errors[].code`), or a malformed precondition
+            (see `If-Match` / `expectedContractVersion(s)`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidSubscription'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
 
     delete:
       summary: Delete contract
@@ -2941,6 +3879,99 @@ paths:
           description: Contract deleted
         '403':
           description: Forbidden
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+
+  /organizations/{organizationId}/contracts/{userId}/novation/preview:
+    post:
+      summary: Preview a novation (dry run)
+      description: |
+        Runs exactly what `PUT /contracts/{userId}` would run with the same body and options - resolution of the
+        pricing versions (omitted services keep the contract's version or get the version for new contracts),
+        SPHERE policies, subscription validation (with the codes of `InvalidSubscription`) and the billing period
+        (`keepBillingPeriod`) - and writes nothing. An invalid configuration still answers `200`, with
+        `valid: false` and `errors`. Limits below the current consumption are reported as `usageWarnings` (they do
+        not make the novation invalid). Feature/limit diffs and prices are not computed by SPACE.
+
+        Send `contractVersion` back in `If-Match` when applying the change.
+
+        **Authentication**: User API Key
+
+        **Permission**: organization member with role OWNER, ADMIN or MANAGER, or ADMIN user (as for the novation)
+
+      tags:
+        - Contracts
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
+      responses:
+        '200':
+          description: What the novation would do
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NovationPreview'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '409':
+          description: A SPHERE synchronization is being applied; retry shortly
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /organizations/{organizationId}/contracts/{userId}/pricings:
+    get:
+      summary: Pricing versions of a contract
+      description: |
+        For each contracted service: the pricing version of the contract, whether it is still active, where to get
+        its Pricing2Yaml file, the version new contracts get (see `GET .../pricings/new-contracts`) and the
+        subscribed plan and add-ons; plus the `contractVersion` to send back in `If-Match` when novating.
+        Organization scoping as for `GET /contracts/{userId}`.
+
+        **Authentication**: User API Key
+
+        **Permission**: organization member with any role (OWNER/ADMIN/MANAGER/EVALUATOR), or ADMIN user
+
+      tags:
+        - Contracts
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pricing versions of the contract
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContractPricings'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /contracts:
     get:
@@ -2971,6 +4002,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
         - name: username
           in: query
           required: false
@@ -3134,15 +4166,37 @@ paths:
         - Contracts
       security:
         - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RejectPrivate'
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCreation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '201':
           description: Contract created
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Contract'
+        '400':
+          $ref: '#/components/responses/InvalidSubscription'
+        '409':
+          description: |
+            The caller's organization already has a contract for this `userId` (a `userId` of another
+            organization does not conflict), or `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was used for a different request; `IDEMPOTENCY_IN_PROGRESS` (with `Retry-After`): a request with this key is still running.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/IdempotencyProblem'
+                  - $ref: '#/components/schemas/Error'
     
     put:
       summary: Update contracts by group ID
@@ -3152,7 +4206,7 @@ paths:
         **Authentication**: User API Key (ADMIN) | Organization API Key
 
         **User Permission**: 
-        - ADMIN user: can update contracts in any organization
+        - ADMIN user: can update contracts in any organization (naming it with `organizationId`)
 
         **Organization Permission**:
         - ALL scope: can update contracts in the organization
@@ -3163,6 +4217,10 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminContractOrganizationId'
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
         - name: groupId
           in: query
           required: true
@@ -3171,14 +4229,37 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           description: Contracts updated
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/Contract'
+        '412':
+          $ref: '#/components/responses/ContractChanged'
+        '400':
+          description: |
+            Missing groupId; an `If-Match` header or an `expectedContractVersion` field (use
+            `expectedContractVersions` for groups); an invalid subscription (body `InvalidSubscription`,
+            with `errors[].code`); or a platform ADMIN without `organizationId` (`code:
+            ORGANIZATION_ID_REQUIRED`, see `OrganizationIdRequired`).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/InvalidSubscription'
+                  - $ref: '#/components/schemas/OrganizationIdRequiredError'
+        '404':
+          description: Contract (or group) not found, or every subscription problem is a missing plan, add-on or version (`InvalidSubscription`)
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
 
     delete:
       summary: Delete all contracts
@@ -3197,6 +4278,8 @@ paths:
         - Contracts
       security:
         - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ContractOrganizationId'
       responses:
         '204':
           description: All contracts deleted
@@ -3210,7 +4293,7 @@ paths:
         **Authentication**: User API Key (ADMIN) | Organization API Key
 
         **User Permission**: 
-        - ADMIN user: can update billing period in any organization
+        - ADMIN user: can update billing period in any organization (naming it with `organizationId`)
 
         **Organization Permission**:
         - ALL scope: can update billing period in the organization
@@ -3221,6 +4304,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/AdminContractOrganizationId'
         - name: groupId
           in: query
           required: true
@@ -3237,6 +4321,8 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Contract'
+        '400':
+          $ref: '#/components/responses/OrganizationIdRequired'
 
   /contracts/{userId}:
     get:
@@ -3247,7 +4333,7 @@ paths:
         **Authentication**: User API Key (ADMIN) | Organization API Key
 
         **User Permission**: 
-        - ADMIN user: can view contracts in any organization
+        - ADMIN user: can view contracts in any organization (naming it with `organizationId`)
 
         **Organization Permission**:
         - ALL scope: can view contracts in the organization
@@ -3258,6 +4344,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/AdminContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3266,10 +4353,17 @@ paths:
       responses:
         '200':
           description: Contract details
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Contract'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '400':
+          $ref: '#/components/responses/OrganizationIdRequired'
 
     put:
       summary: Update contract
@@ -3279,7 +4373,7 @@ paths:
         **Authentication**: User API Key (ADMIN) | Organization API Key
 
         **User Permission**: 
-        - ADMIN user: can update contracts in any organization
+        - ADMIN user: can update contracts in any organization (naming it with `organizationId`)
 
         **Organization Permission**:
         - ALL scope: can update contracts in the organization
@@ -3290,6 +4384,11 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminContractOrganizationId'
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
+        - $ref: '#/components/parameters/IfMatchContractVersion'
         - name: userId
           in: path
           required: true
@@ -3298,12 +4397,36 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           description: Contract updated
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Contract'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '412':
+          $ref: '#/components/responses/ContractChanged'
+        '400':
+          description: |
+            Invalid subscription (body `InvalidSubscription`, with `errors[].code`), a malformed precondition
+            (see `If-Match` / `expectedContractVersion(s)`), or a platform ADMIN without `organizationId`
+            (`code: ORGANIZATION_ID_REQUIRED`, see `OrganizationIdRequired`).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/InvalidSubscription'
+                  - $ref: '#/components/schemas/OrganizationIdRequiredError'
+        '409':
+          $ref: '#/components/responses/IdempotencyConflict'
 
     delete:
       summary: Delete contract
@@ -3313,7 +4436,7 @@ paths:
         **Authentication**: User API Key (ADMIN) | Organization API Key
 
         **User Permission**: 
-        - ADMIN user: can delete contracts in any organization
+        - ADMIN user: can delete contracts in any organization (naming it with `organizationId`)
 
         **Organization Permission**:
         - ALL scope: can delete contracts in the organization
@@ -3323,6 +4446,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/AdminContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3331,17 +4455,110 @@ paths:
       responses:
         '204':
           description: Contract deleted
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '400':
+          $ref: '#/components/responses/OrganizationIdRequired'
+
+  /contracts/{userId}/novation/preview:
+    post:
+      summary: Preview a novation (dry run)
+      description: |
+        Runs exactly what `PUT /contracts/{userId}` would run with the same body and options - resolution of the
+        pricing versions (omitted services keep the contract's version or get the version for new contracts),
+        SPHERE policies, subscription validation (with the codes of `InvalidSubscription`) and the billing period
+        (`keepBillingPeriod`) - and writes nothing. An invalid configuration still answers `200`, with
+        `valid: false` and `errors`. Limits below the current consumption are reported as `usageWarnings` (they do
+        not make the novation invalid). Feature/limit diffs and prices are not computed by SPACE.
+
+        Send `contractVersion` back in `If-Match` when applying the change.
+
+        **Authentication**: User API Key (ADMIN) | Organization API Key
+
+        **Organization Permission**: ALL or MANAGEMENT scope (as for `PUT /contracts/{userId}`)
+
+      tags:
+        - Contracts
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/AdminContractOrganizationId'
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
+      responses:
+        '200':
+          description: What the novation would do
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NovationPreview'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '400':
+          $ref: '#/components/responses/OrganizationIdRequired'
+        '409':
+          description: A SPHERE synchronization is being applied (retry shortly).
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /contracts/{userId}/pricings:
+    get:
+      summary: Pricing versions of a contract
+      description: |
+        For each contracted service: the pricing version of the contract, whether it is still active, where to get
+        its Pricing2Yaml file, the version new contracts get (see `GET .../pricings/new-contracts`) and the
+        subscribed plan and add-ons; plus the `contractVersion` to send back in `If-Match` when novating.
+        Organization scoping as for `GET /contracts/{userId}`.
+
+        **Authentication**: User API Key (ADMIN) | Organization API Key
+
+        **Organization Permission**: ALL or MANAGEMENT scope (same as `GET /contracts/{userId}`)
+
+      tags:
+        - Contracts
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/AdminContractOrganizationId'
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pricing versions of the contract
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContractPricings'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '400':
+          $ref: '#/components/responses/OrganizationIdRequired'
 
   /contracts/{userId}/usageLevels:
     put:
       summary: Reset usage levels
       description: |
-        Resets usage level counters for a contract.
+        Resets usage level counters for a contract (`reset=true`, `usageLimit=`), or adds the amounts of the
+        body to them. Only the levels concerned are written (increments atomically), so consumptions recorded
+        meanwhile on other levels are kept. Increments are not bounded by the limits.
 
         **Authentication**: User API Key (ADMIN) | Organization API Key
 
         **User Permission**: 
-        - ADMIN user: can reset usage levels in any organization
+        - ADMIN user: can reset usage levels in any organization (naming it with `organizationId`)
 
         **Organization Permission**:
         - ALL scope: can reset usage levels in the organization
@@ -3352,6 +4569,8 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/AdminContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3360,12 +4579,63 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionUsageLevelsUpdate'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           description: Usage levels reset
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
                 type: object
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '400':
+          $ref: '#/components/responses/OrganizationIdRequired'
+        '409':
+          description: |
+            Nothing was changed. `code` is `SERVICE_DISABLED` / `SERVICE_NOT_FOUND` when the body increments a
+            usage level of a service that is dormant in the contract (see "Disabling and deleting services"), or
+            when `usageLimit` only names usage levels of dormant services. Resets (`reset=true`) leave the usage
+            levels of dormant services as they are. `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was already used
+            for a different request; `IDEMPOTENCY_IN_PROGRESS` (with `Retry-After`): a request with this key is
+            still being processed; retry after `Retry-After` seconds with the same key.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying (`IDEMPOTENCY_IN_PROGRESS` only).
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [error, code, service]
+                    properties:
+                      error:
+                        type: string
+                      code:
+                        type: string
+                        enum: [SERVICE_DISABLED, SERVICE_NOT_FOUND]
+                      service:
+                        type: string
+                  - $ref: '#/components/schemas/IdempotencyProblem'
+              examples:
+                serviceDisabled:
+                  summary: Increment of a usage level of a disabled service
+                  value:
+                    error: 'Service petclinic is disabled in this organization: its features are not available and its usage levels cannot change until it is enabled again (upload a pricing with saasName petclinic)'
+                    code: SERVICE_DISABLED
+                    service: petclinic
+                idempotencyConflict:
+                  summary: The Idempotency-Key was used for a different request
+                  value:
+                    error: Idempotency-Key was already used for a different request
+                    code: IDEMPOTENCY_CONFLICT
 
   /contracts/{userId}/userContact:
     put:
@@ -3376,7 +4646,7 @@ paths:
         **Authentication**: User API Key (ADMIN) | Organization API Key
 
         **User Permission**: 
-        - ADMIN user: can update contact information in any organization
+        - ADMIN user: can update contact information in any organization (naming it with `organizationId`)
 
         **Organization Permission**:
         - ALL scope: can update contact information in the organization
@@ -3387,6 +4657,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/AdminContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3397,10 +4668,17 @@ paths:
       responses:
         '200':
           description: Contact updated
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
                 type: object
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '400':
+          $ref: '#/components/responses/OrganizationIdRequired'
 
   /contracts/{userId}/billingPeriod:
     put:
@@ -3411,7 +4689,7 @@ paths:
         **Authentication**: User API Key (ADMIN) | Organization API Key
 
         **User Permission**: 
-        - ADMIN user: can update billing period in any organization
+        - ADMIN user: can update billing period in any organization (naming it with `organizationId`)
 
         **Organization Permission**:
         - ALL scope: can update billing period in the organization
@@ -3422,6 +4700,7 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/AdminContractOrganizationId'
         - name: userId
           in: path
           required: true
@@ -3432,10 +4711,17 @@ paths:
       responses:
         '200':
           description: Billing period updated
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
           content:
             application/json:
               schema:
                 type: object
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '400':
+          $ref: '#/components/responses/OrganizationIdRequired'
 
   /features:
     get:
@@ -3580,6 +4866,8 @@ paths:
                     type: array
                     items:
                       type: object
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /features/{userId}/pricing-token:
     post:
@@ -3587,6 +4875,15 @@ paths:
       description: |
         Generates a JWT token containing the user's pricing and subscription information 
         for use by client-side feature evaluation.
+
+        Payload (`PricingTokenPayload`): `sub` (`urn:space:<organizationId>:<percent-encoded userId>`), `userId`, `organizationId`, `aud`
+        (the organization), `iss` (this SPACE server), `iat`, `exp`, `features`, `pricingContext`,
+        `subscriptionContext` and, optionally, `subscription` - the subscription the token was computed from, with
+        the `contractVersion` of the contract. A `userId` is only unique within an organization, so `sub` names
+        both. Verifiers should check `iss` and `aud` and read the user from `userId`; clients must not parse
+        `sub`. Clients must ignore claims
+        they do not know; `subscription`, `userId`, `organizationId`, `aud` and `iss` are absent, and `sub` is
+        the bare `userId`, in tokens issued by older SPACE versions.
 
         **Authentication**: Organization API Key only
 
@@ -3617,26 +4914,41 @@ paths:
               schema:
                 type: object
                 properties:
-                  token:
+                  pricingToken:
                     type: string
-                    description: JWT token with pricing information
+                    description: JWT (HS256) whose payload is a `PricingTokenPayload`
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
 
   /features/{userId}/{featureId}:
     post:
       summary: Evaluate single feature
       description: |
-        Evaluates a specific feature for a user with expected consumption, returning 
-        whether the feature is allowed and any usage warnings.
+        Evaluates one feature for a user. With an expected consumption (the body), a feature that is enabled
+        also consumes: the usage levels of every limit involved are incremented in one atomic update that
+        only applies while each level stays within its limit (see "Usage limits and consumption"). When it
+        does not fit, the answer is that of an evaluation over the limit and nothing is consumed. An
+        applied consumption is identified by `consumptionId`.
+
+        With `revert=true` nothing is evaluated: the consumption named by `consumptionId` is reverted
+        (`204`; again `204` if it was already reverted). Without `consumptionId` (deprecated), the oldest
+        consumption of the feature made in the last two minutes, or the latest with `latest=true`, is
+        reverted; when there is none, nothing changes (`204`). Either way, a revert that skipped usage levels
+        which their service no longer has answers `200` with a `ConsumptionRevertResult` instead of `204`.
 
         **Authentication**: Organization API Key only
 
-        **Permission**: Org Key with any scope
+        **Permission**: Org Key with any scope (ALL/MANAGEMENT/EVALUATION). Recording the expected
+        consumption and reverting it (`?revert=true`) are part of the evaluation and allowed for every
+        scope; setting or resetting usage levels directly (`PUT /contracts/{userId}/usageLevels`)
+        requires ALL or MANAGEMENT.
 
       tags:
         - Features
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - name: userId
           in: path
           required: true
@@ -3645,6 +4957,7 @@ paths:
         - name: featureId
           in: path
           required: true
+          description: '`<service>-<feature>`, the service in lowercase.'
           schema:
             type: string
         - name: server
@@ -3660,36 +4973,132 @@ paths:
           schema:
             type: boolean
             default: false
-          description: Reset feature usage levels after evaluation
-        - name: latest
+          description: Revert a consumption of this feature instead of evaluating it.
+        - name: consumptionId
           in: query
           required: false
           schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+          description: |
+            With `revert=true`: the consumption to revert (`consumptionId` of the evaluation that applied
+            it). Only accepted with `revert=true`.
+        - name: latest
+          in: query
+          required: false
+          deprecated: true
+          schema:
             type: boolean
             default: false
-          description: Use the latest feature configuration
+          description: |
+            Deprecated, with `revert=true` and no `consumptionId`: revert the latest consumption of the last
+            two minutes instead of the oldest one. Use `consumptionId`.
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema:
               type: object
-              properties:
-                expectedConsumption:
-                  type: number
-                  example: 1.5
+              description: |
+                Expected consumption: usage limit id (`<service>-<limit>`) -> amount to add. When given, it
+                must name every limit involved in the evaluation of the feature (zero for a limit that this
+                call does not spend). An empty object (or no body) evaluates without consuming.
+              additionalProperties:
+                type: number
+              example:
+                petclinic-maxPets: 1
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
-          description: Feature evaluation result
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  allowed:
-                    type: boolean
-                  reason:
-                    type: string
+                oneOf:
+                  - $ref: '#/components/schemas/FeatureEvaluationResult'
+                  - $ref: '#/components/schemas/ConsumptionRevertResult'
+              examples:
+                partialRevert:
+                  summary: A revert that skipped a usage level its service no longer has
+                  value:
+                    consumptionId: 6f1c2a9e-3b7d-4c55-9a0e-2d8f4b1c7e63
+                    reverted:
+                      petclinic-maxPets: 2
+                    skipped:
+                      - petclinic-maxVisits
+          description: |
+            Feature evaluation result (`FeatureEvaluationResult`), or, with `revert=true`, a revert that skipped
+            usage levels which their service, still in the contract, no longer has (`ConsumptionRevertResult`;
+            the other levels were reverted and the consumption is marked reverted).
+
+            A feature of a service that is disabled (dormant in the contract) answers
+            `{ eval: false, limit: null, used: null, error: { code: SERVICE_DISABLED, message } }` (or
+            `SERVICE_NOT_FOUND` when the organization no longer has the service), like `FLAG_NOT_FOUND` for an
+            unknown feature, and nothing is consumed: no usage level changes and there is no `consumptionId`.
+        '204':
+          description: Reverted, every usage level of the consumption (or nothing to revert)
+        '400':
+          description: Invalid body or query (for example `consumptionId` without `revert=true`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Contract not found, or (revert) consumption not found or expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: |
+            Nothing was changed, because either:
+            - the contract kept changing while the consumption was being applied; retry (`error` only);
+            - `revert=true` (with or without `consumptionId`) on a consumption with a usage level of a service
+              that the contract no longer has: it cannot be reverted exactly, nothing is subtracted and it is
+              not marked reverted (`error` only);
+            - `revert=true` on a feature of a service of the contract that is disabled (`SERVICE_DISABLED`; it is
+              dormant until a pricing with its saasName is uploaded again) or that the organization no longer
+              has (`SERVICE_NOT_FOUND`), with or without `consumptionId`. The consumption is not reverted and
+              stays revertible: once the service is enabled again, the same revert applies (with an
+              `Idempotency-Key`, this answer is stored for the key like any other below 500, so use a new key); or
+            - `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was used for a different request;
+              `IDEMPOTENCY_IN_PROGRESS` (with `Retry-After`): a request with this key is still running.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Error'
+                  - type: object
+                    required: [error, code, service]
+                    properties:
+                      error:
+                        type: string
+                      code:
+                        type: string
+                        enum: [SERVICE_DISABLED, SERVICE_NOT_FOUND]
+                      service:
+                        type: string
+                  - $ref: '#/components/schemas/IdempotencyProblem'
+              examples:
+                contractChanged:
+                  summary: The contract kept changing while consuming
+                  value:
+                    error: 'CONFLICT: The contract changed while the consumption was being applied; retry'
+                serviceDisabled:
+                  summary: Revert on a feature of a disabled service
+                  value:
+                    error: 'Service petclinic is disabled in this organization: its features are not available and its usage levels cannot change until it is enabled again (upload a pricing with saasName petclinic)'
+                    code: SERVICE_DISABLED
+                    service: petclinic
+                idempotencyConflict:
+                  summary: The Idempotency-Key was used for a different request
+                  value:
+                    error: Idempotency-Key was already used for a different request
+                    code: IDEMPOTENCY_CONFLICT
 
   /analytics/api-calls:
     get:
@@ -3829,7 +5238,8 @@ paths:
     get:
       summary: Get event service status
       description: |
-        Checks if the WebSocket event service is running and operational.
+        Checks if the WebSocket event service is running and operational. See the `Events` tag for the Socket.IO
+        namespaces (`/pricings`, `/contracts`) and their messages.
 
         **Authentication**: Public (no API key required)
 
@@ -3847,44 +5257,55 @@ paths:
                     type: string
                     example: The WebSocket event service is active
 
-  # /events/test-event:
-  #   post:
-  #     summary: Send test event (for testing)
-  #     description: |
-  #       Sends a test event to all connected WebSocket clients (used for testing purposes).
+  /events/test-event:
+    post:
+      summary: Send test event (for testing)
+      description: |
+        Sends a test `PRICING_ARCHIVED` event to every client of the `/pricings` namespace (used for testing
+        purposes). Disabled (`404`) when `ENVIRONMENT=production` unless `ENABLE_TEST_EVENTS=true`.
 
-  #       **Authentication**: Public
+        **Authentication**: Organization API Key with scope ALL | User API Key (ADMIN)
 
-  #     tags:
-  #       - Events
-  #     requestBody:
-  #       required: true
-  #       content:
-  #         application/json:
-  #           schema:
-  #             type: object
-  #             required:
-  #               - serviceName
-  #               - pricingVersion
-  #             properties:
-  #               serviceName:
-  #                 type: string
-  #                 example: Zoom
-  #               pricingVersion:
-  #                 type: string
-  #                 example: "1.0"
-  #     responses:
-  #       '200':
-  #         description: Event sent successfully
-  #         content:
-  #           application/json:
-  #             schema:
-  #               type: object
-  #               properties:
-  #                 success:
-  #                   type: boolean
-  #                 message:
-  #                   type: string
+      tags:
+        - Events
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - serviceName
+                - pricingVersion
+              properties:
+                serviceName:
+                  type: string
+                  example: Zoom
+                pricingVersion:
+                  type: string
+                  example: "1.0"
+      responses:
+        '200':
+          description: Event sent successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        '400':
+          description: serviceName and pricingVersion are required
+        '401':
+          description: API key missing
+        '403':
+          description: Not an organization key with scope ALL nor an ADMIN user
+        '404':
+          description: Disabled in production
 
   /events/client:
     get:
@@ -3937,6 +5358,9 @@ components:
         version: { type: string }
         createdAt: { type: string, format: date-time }
         contentHash: { type: string, description: SHA-256 of canonical functional pricing content }
+        private:
+          type: boolean
+          description: Present only for callers whose SPHERE API key may read the pricing; `true` for a private version.
     SphereConfiguration:
       type: object
       required: [permanentUrl, policy]
@@ -3945,18 +5369,33 @@ components:
         policy:
           type: string
           enum: [all_last, new_last, all_pick, new_pick]
-          description: All migrates current bindings with cheapest-valid-plan fallback. New preserves them. Last orders public versions by pricing date. Pick requires selectedVersionId.
+          description: All migrates current bindings with cheapest-valid-plan fallback. New preserves them. Last orders accessible versions by pricing date. Pick requires selectedVersionId.
         selectedVersionId:
           type: string
-          description: Required for all_pick and new_pick; immutable public SPHERE version ID.
+          description: Required for all_pick and new_pick; immutable accessible SPHERE version ID.
         acceptedSyntaxUpgradeVersionId:
           type: string
-          description: Required only when preview reports a syntax upgrade; must equal that inspected public version ID.
+          description: Required only when preview reports a syntax upgrade; must equal that inspected accessible version ID.
         pollIntervalMinutes:
           type: integer
           enum: [1, 5, 15]
           default: 5
-          description: How often SPACE checks SPHERE for a newer public version for this linked service.
+          description: How often SPACE checks SPHERE for a newer accessible version for this linked service.
+        sphereApiKey:
+          type: string
+          nullable: true
+          writeOnly: true
+          description: >-
+            Optional SPHERE API key (`sk-...`). SPACE sends it as `x-api-key` on every SPHERE request of this service,
+            so that private versions the key may read are listed and imported. Use a MANAGEMENT or ALL key of the organisation
+            that owns the pricing; a VIEW key only reveals what its user may read. Write-only: stored encrypted
+            (AES-256-GCM with the key in `SPHERE_KEY_ENCRYPTION_KEY`, bound to the service, its SPHERE pricing and the
+            SPHERE API origin) and never returned; if the SPHERE origin changes, SPACE does not send it there and the
+            service reports `degraded` until the key is entered again. Rotate the encryption key with
+            `SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS`. Rejected with 400 when `SPHERE_KEY_ENCRYPTION_KEY` is not set.
+            Private versions are stored outside the statically served files: they are only available through
+            `GET .../pricings/{version}?format=yaml` (authorised) and have no public URL (`.../public-url` answers
+            `404`).
     SphereCreateService:
       allOf:
         - $ref: '#/components/schemas/SphereConfiguration'
@@ -3987,12 +5426,14 @@ components:
       type: object
       properties:
         source: { type: string, enum: [manual, sphere] }
+        disabled: { type: boolean, description: Whether the service is paused; existing contracts and retained snapshots are preserved. }
         configuration:
           allOf:
             - $ref: '#/components/schemas/SphereConfiguration'
             - type: object
               properties:
                 target: { $ref: '#/components/schemas/SphereVersion' }
+                hasApiKey: { type: boolean, description: Whether a SPHERE API key is stored for this service. }
                 revision: { type: integer }
                 status: { type: string, enum: [ready, queued, checking, applying, blocked, degraded] }
                 error: { type: string, nullable: true }
@@ -4043,6 +5484,31 @@ components:
           type: string
       required:
         - error
+
+    IdempotencyProblem:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          enum: [IDEMPOTENCY_CONFLICT, IDEMPOTENCY_IN_PROGRESS, IDEMPOTENCY_KEY_INVALID, IDEMPOTENCY_STATE_CHANGED]
+        contractVersion:
+          description: Current version(s) for an unsafe prepared mutation, like a contract precondition response.
+          oneOf:
+            - type: string
+              nullable: true
+            - type: object
+              additionalProperties:
+                type: string
+                nullable: true
+        novated:
+          type: array
+          items:
+            type: string
+      required:
+        - error
+        - code
 
     FieldValidationError:
       type: object
@@ -4161,6 +5627,43 @@ components:
         createdAt:
           type: string
           format: date-time
+        defaultVersion:
+          type: string
+          description: Manual services only, optional. Version for new contracts (see `NewContractsPricing`).
+        source:
+          type: string
+          enum: [manual, sphere]
+        sphere:
+          type: object
+          description: SPHERE binding of a linked service (see `SphereSyncState.configuration`); the API key is never included.
+          properties:
+            pricingId: { type: string }
+            permanentUrl: { type: string, format: uri }
+            policy: { type: string, enum: [all_last, new_last, all_pick, new_pick] }
+            target: { $ref: '#/components/schemas/SphereVersion' }
+            status: { type: string, enum: [ready, queued, checking, applying, blocked, degraded] }
+            hasApiKey: { type: boolean, description: Whether a SPHERE API key is stored for this service. }
+
+    NewContractsPricing:
+      type: object
+      required: [version, yamlUrl, source]
+      properties:
+        version:
+          type: string
+          description: Pricing version SPACE assigns to new contracts of the service (unescaped).
+          example: "2025-01-10"
+        yamlUrl:
+          type: string
+          description: Path of its Pricing2Yaml file (`format=yaml`), on the same kind of route as the request.
+          example: /api/v1/services/acme/pricings/2025-01-10?format=yaml
+        source:
+          type: string
+          enum: [sphere-policy, default, latest-active]
+          description: |
+            `sphere-policy`: target of the SPHERE synchronization policy (linked services). `default`: the service's
+            `defaultVersion`. `latest-active`: fallback, the most recently created (`createdAt`) active version;
+            versions without a known creation date (remote URL pricings) come last, and versions created at the
+            same time are ordered by version, descending (numeric-aware), so the answer is deterministic.
 
     Pricing:
       type: object
@@ -4168,6 +5671,45 @@ components:
         version:
           type: string
           example: "1.0.0"
+        yamlPath:
+          type: string
+          description: |
+            Storage reference of the stored Pricing2Yaml file
+            (`/private/pricings/...` for uploaded pricings,
+            `/private/sphere/...` for SPHERE snapshots). It is **not a URL**:
+            download the file with `GET .../pricings/{pricingVersion}?format=yaml`
+            and the credentials of the owning organization. Versions before this
+            change returned a `/static/pricings/...` path that was served
+            without authentication; such paths now answer 404.
+          example: /private/pricings/63f74bf8eeed64058364b52e-zoom-2025.yaml
+        sphere:
+          type: object
+          readOnly: true
+          description: |
+            Present only on snapshots imported from SPHERE (services with
+            `source: sphere`): the SPHERE pricing and version this pricing copies.
+            Clients can open the pricing in SPHERE through `permanentUrl`
+            (`/p/{pricingId}`), where SPHERE applies its own permissions.
+          properties:
+            serviceId:
+              type: string
+            pricingId:
+              type: string
+              pattern: '^[a-f0-9]{24}$'
+            versionId:
+              type: string
+              pattern: '^[a-f0-9]{24}$'
+            permanentUrl:
+              type: string
+              format: uri
+              example: https://sphere.score.us.es/p/65f0c1a2b3c4d5e6f7a8b9c0
+            version:
+              type: string
+            createdAt:
+              type: string
+              format: date-time
+            contentHash:
+              type: string
         service:
           type: string
         available:
@@ -4218,6 +5760,429 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SubscriptionSnapshot'
+        contractVersion:
+          $ref: '#/components/schemas/ContractVersion'
+
+    ContractEvent:
+      type: object
+      description: |
+        Socket.IO `message` event of the `/contracts` namespace (not an HTTP response). A hint to re-read the
+        contract: delivery is at most once per connection, without replay or ordering (see the `Events` tag).
+      required: [code, eventId, occurredAt, details]
+      properties:
+        code:
+          type: string
+          enum: [CONTRACT_CREATED, CONTRACT_NOVATED, CONTRACT_DELETED, CONTRACT_RENEWED]
+        eventId:
+          type: string
+          format: uuid
+          description: |
+            UUIDv7 of this event, the same in every copy of it (every connection and instance); drop repeats.
+            Compare for equality only, never to order changes. Capability `contract-event-ids`.
+        occurredAt:
+          type: string
+          format: date-time
+          description: |
+            ISO 8601 in UTC with milliseconds. Uses the API instance's clock when the write returned if that
+            timestamp is retained; otherwise defaults to the notification attempt time, including recovery or
+            retries where the original timestamp is unavailable. Not an authoritative ordering or commit
+            timestamp; instance clocks may differ. Capability `contract-event-ids`.
+        details:
+          type: object
+          required: [userId, organizationId, contractVersion, services]
+          properties:
+            userId:
+              type: string
+            organizationId:
+              type: string
+            contractVersion:
+              type: string
+              nullable: true
+              description: Version after the change; `null` for `CONTRACT_DELETED`.
+            services:
+              type: array
+              items:
+                type: string
+      example:
+        code: CONTRACT_NOVATED
+        eventId: 019a2a6b-7c1e-7d3f-9b2a-5c4e8f1a2b3c
+        occurredAt: '2026-10-27T10:00:00.123Z'
+        details:
+          userId: 01c36d29-0d6a-4b41-83e9-8c6d9310c508
+          organizationId: 507f1f77bcf86cd799439012
+          contractVersion: 4-2c26b46b68ffc68f
+          services: [acme]
+
+    PricingTokenPayload:
+      type: object
+      description: |
+        Payload of the pricing token (JWT claims besides `iat` and `exp`). A `userId` is only unique within an
+        organization, so the registered claims name both (RFC 7519 §4.1, RFC 8725 §3.9). In tokens of SPACE
+        versions without `contract-userid-per-org`, `sub` is the bare `userId` and `userId`, `organizationId`,
+        `aud` and `iss` are absent.
+      required: [sub, userId, organizationId, aud, iss, features, pricingContext, subscriptionContext]
+      properties:
+        sub:
+          type: string
+          description: |
+            The URN `urn:space:<organizationId>:<encodeURIComponent(userId)>` (RFC 7519 §2: a `StringOrURI`
+            containing `:` is a URI), unique within the issuer: the organization id is 24 hex characters and the
+            percent-encoded `userId` contains no `:`, `/` or space. An opaque identifier: clients must not parse
+            it and read the `userId` and `organizationId` claims instead.
+          example: 'urn:space:65f1c0ffee0000000000000a:42'
+        userId:
+          type: string
+          description: userId of the contract, as stored (unique within its organization)
+          example: '42'
+        organizationId:
+          type: string
+          description: Organization of the contract
+          example: 65f1c0ffee0000000000000a
+        aud:
+          type: string
+          description: The organization of the contract (same as `organizationId`). A verifier checks it against the organization it serves.
+          example: 65f1c0ffee0000000000000a
+        iss:
+          type: string
+          description: The SPACE server that issued the token (`JWT_ISSUER`, default `space`).
+          example: space
+        features:
+          type: object
+          description: Detailed evaluation of every feature (`{ eval, used, limit, error }` by `service-feature`)
+        pricingContext:
+          type: object
+        subscriptionContext:
+          type: object
+        subscription:
+          $ref: '#/components/schemas/PricingTokenSubscription'
+        dormantServices:
+          type: array
+          items:
+            type: string
+          description: |
+            Services of `subscription` that are disabled (or no longer exist) in the organization: their features
+            are not in `features`. Only present when there are any (`service-disable-dormant`).
+
+    PricingTokenSubscription:
+      type: object
+      description: |
+        Optional claim. The subscription the token was computed from: the same contract the `features` of the
+        token were evaluated on.
+
+        A token is a snapshot. SPACE drops its cached token when the contract changes, but a token already
+        issued keeps this subscription until it expires (`JWT_EXPIRATION`). Treat `contractVersion` here as
+        advisory: a novation sent with it as `If-Match` may answer `412 CONTRACT_CHANGED`, after which the
+        caller reads the contract (or a new token) again.
+      required: [contractedServices, subscriptionPlans, subscriptionAddOns, contractVersion]
+      properties:
+        contractedServices:
+          $ref: '#/components/schemas/ContractedService'
+        subscriptionPlans:
+          $ref: '#/components/schemas/SubscriptionPlans'
+        subscriptionAddOns:
+          $ref: '#/components/schemas/SubscriptionAddons'
+        contractVersion:
+          $ref: '#/components/schemas/ContractVersion'
+      example:
+        contractedServices:
+          acme: "2024-06-08"
+        subscriptionPlans:
+          acme: growth
+        subscriptionAddOns:
+          acme:
+            extraStorage: 2
+        contractVersion: 3-9f86d081884c7d65
+
+    NovationPreview:
+      type: object
+      required: [valid, errors, effective, versionChanges, usageWarnings, billingPeriod, contractVersion, dormantServices]
+      properties:
+        valid:
+          type: boolean
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/SubscriptionError'
+        effective:
+          type: object
+          description: The subscription the novation would store (service keys lowercase, versions unescaped).
+          properties:
+            contractedServices:
+              $ref: '#/components/schemas/ContractedService'
+            subscriptionPlans:
+              $ref: '#/components/schemas/SubscriptionPlans'
+            subscriptionAddOns:
+              $ref: '#/components/schemas/SubscriptionAddons'
+        versionChanges:
+          type: object
+          description: |
+            Services whose pricing version would change. `reason`: `requested` (from `contractedServices`),
+            `new-contracts-version` (a service the contract did not have, without an explicit version) or
+            `policy:<all_last|new_last|all_pick|new_pick>` (decided by the SPHERE synchronization policy).
+          additionalProperties:
+            type: object
+            required: [from, to, reason]
+            properties:
+              from:
+                type: string
+                nullable: true
+              to:
+                type: string
+              reason:
+                type: string
+        usageWarnings:
+          type: array
+          items:
+            type: object
+            required: [service, usageLimit, consumed, newLimit]
+            properties:
+              service:
+                type: string
+              usageLimit:
+                type: string
+              consumed:
+                type: number
+              newLimit:
+                type: number
+                description: Plan value, overridden by add-on usageLimits, plus usageLimitsExtensions x quantity.
+        billingPeriod:
+          type: object
+          required: [startDate, endDate, restarts]
+          properties:
+            startDate:
+              type: string
+              format: date-time
+            endDate:
+              type: string
+              format: date-time
+            restarts:
+              type: boolean
+              description: '`false` with `keepBillingPeriod`.'
+        contractVersion:
+          $ref: '#/components/schemas/ContractVersion'
+        dormantServices:
+          type: array
+          items:
+            type: string
+          description: |
+            Services of `effective` that are disabled: kept exactly as the contract has them, their features stay
+            unavailable until they are enabled again (`service-disable-dormant`).
+      example:
+        valid: false
+        errors:
+          - code: ADDON_NOT_AVAILABLE
+            service: acme
+            path: subscriptionAddOns.acme.extraStorage
+            message: Add-on extraStorage is not available for plan starter in the request organization
+        effective:
+          contractedServices:
+            acme: "2025-01-10"
+          subscriptionPlans:
+            acme: starter
+          subscriptionAddOns:
+            acme:
+              extraStorage: 2
+        versionChanges:
+          acme:
+            from: "2024-06-08"
+            to: "2025-01-10"
+            reason: policy:all_last
+        usageWarnings:
+          - service: acme
+            usageLimit: storage
+            consumed: 42
+            newLimit: 10
+        billingPeriod:
+          startDate: "2026-10-27T10:00:00.000Z"
+          endDate: "2026-11-26T10:00:00.000Z"
+          restarts: true
+        contractVersion: 3-9f86d081884c7d65
+        dormantServices: []
+
+    ContractPricings:
+      type: object
+      required: [services, contractVersion]
+      properties:
+        services:
+          type: object
+          description: Keyed by contracted service name (lowercase, as in `contractedServices`).
+          additionalProperties:
+            $ref: '#/components/schemas/ContractServicePricing'
+        contractVersion:
+          $ref: '#/components/schemas/ContractVersion'
+      example:
+        services:
+          acme:
+            version: "2024-06-08"
+            status: archived
+            yamlUrl: /api/v1/services/acme/pricings/2024-06-08?format=yaml
+            newContractsVersion: "2025-01-10"
+            plan: growth
+            addOns:
+              extraStorage: 2
+            serviceStatus: enabled
+        contractVersion: 3-9f86d081884c7d65
+
+    ContractServicePricing:
+      type: object
+      required: [version, status, yamlUrl, newContractsVersion, addOns, serviceStatus]
+      properties:
+        version:
+          type: string
+          description: '`contractedServices[service]`, unescaped.'
+        status:
+          type: string
+          enum: [active, archived]
+          description: |
+            `archived` also covers versions no longer listed by the service (e.g. SPHERE history) and services
+            that no longer exist in the organization (deleted or disabled); for those, `yamlUrl` answers `404`
+            and `newContractsVersion` is `null`.
+        yamlUrl:
+          type: string
+          description: Path of its Pricing2Yaml file (`format=yaml`), on the same kind of route as the request.
+        newContractsVersion:
+          type: string
+          nullable: true
+          description: |
+            Version new contracts of the service get; `null` if there is none (unknown service, no active
+            version). Other failures answer `500` instead of `null`.
+        plan:
+          type: string
+          description: '`subscriptionPlans[service]`, when the service has plans.'
+        addOns:
+          type: object
+          description: '`subscriptionAddOns[service]` (empty object when none).'
+          additionalProperties:
+            type: integer
+        serviceStatus:
+          type: string
+          enum: [enabled, disabled, not-found]
+          description: |
+            The service itself: `disabled` while it is disabled (dormant in the contract: its features are not
+            available until a pricing with its saasName is uploaded again), `not-found` when the organization no
+            longer has it (`service-disable-dormant`).
+
+    ContractVersion:
+      type: string
+      readOnly: true
+      description: |
+        Opaque version of the contract for optimistic concurrency. It changes with every change of the
+        subscription (contracted pricing versions, plans, add-ons), of the billing period, and with every
+        novation or SPHERE migration, also when a novation returns to an earlier subscription. Recording usage
+        does not change it. Novations write only their subscription, billing period and history fields,
+        preserving concurrent consumption and contact changes with or without a precondition. Group novations
+        never recreate a contract deleted during the operation. Treat the version as an opaque string: compare it for equality and send it back in
+        `If-Match` (or `expectedContractVersion`). Single-contract responses also carry it as
+        `ETag: "<contractVersion>"`, which CORS exposes to browser clients.
+      example: 3-9f86d081884c7d65
+
+    SubscriptionErrorCode:
+      type: string
+      description: |
+        Stable code of a subscription validation problem:
+        - `PLAN_NOT_FOUND`: the plan does not exist in the pricing version. Also reported, with the path
+          `subscriptionPlans.<service>`, when the service has neither a plan nor add-ons selected.
+        - `ADDON_NOT_FOUND`: the add-on does not exist in the pricing version (names are case-sensitive).
+        - `ADDON_NOT_AVAILABLE`: the add-on is not available for the selected plan.
+        - `ADDON_DEPENDENCY_MISSING`: an add-on it depends on is not selected.
+        - `ADDON_EXCLUDED`: it cannot be combined with another selected add-on.
+        - `QUANTITY_OUT_OF_RANGE`: the quantity violates min/max/step.
+        - `VERSION_NOT_FOUND`: the service or its pricing version does not exist in the organization.
+        - `VERSION_ARCHIVED`: the version is archived; new contracts and version changes cannot use it (a
+          contract keeps an archived version it already has).
+        - `PRIVATE_PLAN` / `PRIVATE_ADDON`: private, and the contract does not already have it. Only reported
+          when the request opts in with `rejectPrivate`.
+        Limits below the current consumption are not an error.
+      enum:
+        - PLAN_NOT_FOUND
+        - ADDON_NOT_FOUND
+        - ADDON_NOT_AVAILABLE
+        - ADDON_DEPENDENCY_MISSING
+        - ADDON_EXCLUDED
+        - QUANTITY_OUT_OF_RANGE
+        - VERSION_NOT_FOUND
+        - VERSION_ARCHIVED
+        - PRIVATE_PLAN
+        - PRIVATE_ADDON
+
+    SubscriptionError:
+      type: object
+      required: [code, service, path, message]
+      properties:
+        code:
+          $ref: '#/components/schemas/SubscriptionErrorCode'
+        service:
+          type: string
+          example: petclinic
+        path:
+          type: string
+          description: Location of the offending value in the request body.
+          example: subscriptionAddOns.petclinic.extraVisits
+        message:
+          type: string
+          description: Human-readable; may change between releases (switch on `code`).
+
+    OrganizationIdRequiredError:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+          example: 'ORGANIZATION ID REQUIRED: a userId is only unique within an organization, so platform ADMIN users must name the organization on this route. Pass the organizationId query parameter (?organizationId=<id>) or use /organizations/{organizationId}/contracts/42'
+        code:
+          type: string
+          enum: [ORGANIZATION_ID_REQUIRED]
+    InvalidSubscription:
+      type: object
+      required: [error, errors]
+      properties:
+        error:
+          type: string
+          description: '`Invalid subscription: ` followed by the first message.'
+        errors:
+          type: array
+          description: Every problem found.
+          items:
+            $ref: '#/components/schemas/SubscriptionError'
+      example:
+        error: 'Invalid subscription: Add-on extraVisits quantity 4 is not valid. It must be between 3 and Infinity, and a multiple of 3 in the request organization'
+        errors:
+          - code: QUANTITY_OUT_OF_RANGE
+            service: petclinic
+            path: subscriptionAddOns.petclinic.extraVisits
+            message: Add-on extraVisits quantity 4 is not valid. It must be between 3 and Infinity, and a multiple of 3 in the request organization
+
+    ContractChanged:
+      type: object
+      description: The novation was conditional on a contract version that is no longer current. Nothing was written.
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          enum: [CONTRACT_CHANGED]
+        contractVersion:
+          type: string
+          description: Current version of the contract (single-contract novation).
+        contractVersions:
+          type: object
+          description: |
+            Group novation: current version of every contract whose precondition failed (`null` for userIds
+            of `expectedContractVersions` that are not in the group).
+          additionalProperties:
+            type: string
+            nullable: true
+        novated:
+          type: array
+          description: |
+            Group novation only, rare: every precondition held when checked, but some contracts changed before
+            their own write. Those are listed in `contractVersions` and were not written; the userIds listed
+            here were novated.
+          items:
+            type: string
+      example:
+        error: CONTRACT_CHANGED
+        contractVersion: 4-2c26b46b68ffc68f
 
     UserContact:
       type: object
@@ -4387,6 +6352,70 @@ components:
         service:
           type: string
 
+    FeatureEvaluationResult:
+      type: object
+      required: [eval, used, limit, error]
+      properties:
+        eval:
+          type: boolean
+          description: Whether the feature is enabled (and, with an expected consumption, consumed).
+        used:
+          type: object
+          nullable: true
+          additionalProperties:
+            oneOf:
+              - type: number
+              - type: boolean
+          description: |
+            Usage level of each limit involved: with an applied consumption, the stored level after it; with
+            a refused one, the level plus the amount it would have reached.
+        limit:
+          type: object
+          nullable: true
+          additionalProperties:
+            oneOf:
+              - type: number
+              - type: boolean
+          description: Limit of each usage level involved, as the contract's subscription sets it.
+        error:
+          type: object
+          nullable: true
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+        consumptionId:
+          type: string
+          description: |
+            Only when this evaluation applied an expected consumption (`atomic-usage-limits`): the id to
+            revert it with `?revert=true&consumptionId=`.
+
+    ConsumptionRevertResult:
+      type: object
+      required: [consumptionId, reverted, skipped]
+      description: |
+        Answer (`200`) of a revert that skipped usage levels which their service, still in the contract, no
+        longer has (for example, after its pricing version was archived with a fallback without that limit). A revert that skipped nothing answers
+        `204` without a body.
+      properties:
+        consumptionId:
+          type: string
+          description: The consumption reverted (with `consumptionId`, the same one; without it, the one picked).
+        reverted:
+          type: object
+          additionalProperties:
+            type: number
+          description: |
+            Usage limit id (`<service>-<limit>`) -> amount recorded, for each level that was reverted (never
+            below zero; a level renewed since the consumption is left as it is).
+        skipped:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: Usage limit ids (`<service>-<limit>`) of the levels skipped, which their service no longer has.
+
   requestBodies:
     SubscriptionCreation:
       description: Creates a new subscription within SPACE
@@ -4397,7 +6426,6 @@ components:
             type: object
             required:
               - userContact
-              - contractedServices
               - subscriptionPlans
               - subscriptionAddOns
             properties:
@@ -4414,9 +6442,21 @@ components:
                   renewalDays:
                     $ref: '#/components/schemas/RenewalDays'
               contractedServices:
-                $ref: '#/components/schemas/ContractedService'
+                allOf:
+                  - $ref: '#/components/schemas/ContractedService'
+                description: |
+                  Optional. Services subscribed in `subscriptionPlans`/`subscriptionAddOns` without an entry here get
+                  the version for new contracts (`GET /services/{serviceName}/pricings/new-contracts`). SPHERE-linked
+                  services always get their policy target.
               subscriptionPlans:
                 $ref: '#/components/schemas/SubscriptionPlans'
+              rejectPrivate:
+                type: boolean
+                default: false
+                description: |
+                  Opt-in: reject private plans and add-ons (`PRIVATE_PLAN` / `PRIVATE_ADDON`), for contracts a
+                  customer configures. Without it they are accepted, as before. Same as the query parameter
+                  `rejectPrivate=true`; not stored.
               subscriptionAddOns:
                 $ref: '#/components/schemas/SubscriptionAddons'
           example:
@@ -4453,11 +6493,45 @@ components:
               - subscriptionAddOns
             properties:
               contractedServices:
-                $ref: '#/components/schemas/ContractedService'
+                allOf:
+                  - $ref: '#/components/schemas/ContractedService'
+                description: |
+                  Optional. Services subscribed in `subscriptionPlans`/`subscriptionAddOns` without an entry here keep
+                  the version the contract has (or, if the contract does not have them, get the version for new
+                  contracts). SPHERE-linked services follow their synchronization policy.
               subscriptionPlans:
                 $ref: '#/components/schemas/SubscriptionPlans'
               subscriptionAddOns:
                 $ref: '#/components/schemas/SubscriptionAddons'
+              keepBillingPeriod:
+                type: boolean
+                default: false
+                description: |
+                  Keep the current billing period (start and end date) instead of starting a new one. The previous
+                  subscription is still added to `history`. Same as the query parameter `keepBillingPeriod=true`.
+              rejectPrivate:
+                type: boolean
+                default: false
+                description: |
+                  Opt-in: reject private plans and add-ons the contract does not have yet (`PRIVATE_PLAN` /
+                  `PRIVATE_ADDON`), for changes a customer makes. Private plans and add-ons the contract already
+                  has can always be kept. Without it they are accepted, as before (operator-assigned deals).
+                  Same as the query parameter `rejectPrivate=true`; not stored.
+              expectedContractVersion:
+                type: string
+                description: |
+                  `PUT /contracts/{userId}` only. Apply the novation only if the contract still has this
+                  `contractVersion`; otherwise answer `412`. Same as `If-Match`; if both are sent, `If-Match`
+                  must list this version (or be `*`). On `PUT /contracts?groupId=` it answers `400`: use
+                  `expectedContractVersions`.
+              expectedContractVersions:
+                type: object
+                description: |
+                  `PUT /contracts?groupId=` only. userId -> `contractVersion` of every contract of the group.
+                  Apply the novation only if each of them still has that version; otherwise answer `412` with
+                  the current versions and write nothing.
+                additionalProperties:
+                  type: string
           example:
             contractedServices:
               zoom: "2025"
@@ -4532,7 +6606,111 @@ components:
               maxPets: 2
               maxVisits: 5
 
+  headers:
+    IdempotentReplayed:
+      description: |
+        `true` when the response is the stored response of an earlier request with the same
+        `Idempotency-Key` (nothing was applied again). Absent otherwise.
+      schema:
+        type: string
+        enum: ['true']
+    ContractETag:
+      description: '`"<contractVersion>"` of the returned contract.'
+      schema:
+        type: string
+      example: '"3-9f86d081884c7d65"'
+
   responses:
+    IdempotencyConflict:
+      description: |
+        `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was already used for a different request (method,
+        route, path parameters, query, body or `If-Match`); nothing was applied. Use a new key for a new
+        request. `IDEMPOTENCY_IN_PROGRESS`: a request with this key is still being processed; retry after
+        `Retry-After` seconds with the same key. `IDEMPOTENCY_STATE_CHANGED`: a prepared but unapplied
+        mutation conflicts with a later contract change; inspect `contractVersion` and any already
+        `novated` group members before submitting a corrected operation with a new key.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying (`IDEMPOTENCY_IN_PROGRESS` only).
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IdempotencyProblem'
+    IdempotencyUnavailable:
+      description: The operation could not be safely acknowledged; retry the same Idempotency-Key. A prepared action is preserved.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              code:
+                type: string
+                enum: [IDEMPOTENCY_UNAVAILABLE, IDEMPOTENCY_RESPONSE_TOO_LARGE]
+    InvalidSubscription:
+      description: |
+        The subscription is not valid. `errors` lists every problem with a stable `code`. Contract creation always
+        answers `400`; novations answer `404` when every problem is a missing plan, add-on or version (as before)
+        and `400` otherwise.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InvalidSubscription'
+    ContractChanged:
+      description: The contract changed since the given version (`If-Match`/`expectedContractVersion`). Nothing was written.
+      headers:
+        ETag:
+          $ref: '#/components/headers/ContractETag'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ContractChanged'
+    ContractNotFound:
+      description: |
+        No contract with this `userId` exists in the caller's organization (contracts of other
+        organizations are reported the same way).
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Contract with userId 01c4a3cb-0bd5-4d4f-bc1a-0d5bb3d1f6a3 not found
+    DormantService:
+      description: |
+        The request needs a service of the contract that is disabled (`SERVICE_DISABLED`; it is dormant until a
+        pricing with its saasName is uploaded again) or that the organization no longer has
+        (`SERVICE_NOT_FOUND`), e.g. `?revert=true` on one of its features. Nothing was changed.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              code:
+                type: string
+                enum: [SERVICE_DISABLED, SERVICE_NOT_FOUND]
+              service:
+                type: string
+    OrganizationIdRequired:
+      description: |
+        Platform ADMIN on a direct route that addresses contracts by `userId` or `groupId`, without
+        `organizationId`. A `userId` (or `groupId`) is only unique within an organization, so the organization
+        is part of what identifies the contract. Checked before anything is read, locked or written. Repeat the
+        request with `?organizationId=<id>` or through `/organizations/{organizationId}/contracts/...`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/OrganizationIdRequiredError'
     UnprocessableEntity:
       description: Request sent could not be processed properly
       content:
@@ -4546,6 +6724,99 @@ components:
                   $ref: '#/components/schemas/FieldValidationError'
 
   parameters:
+    ContractOrganizationId:
+      name: organizationId
+      in: query
+      required: false
+      description: |
+        Organization whose contracts a platform ADMIN user lists or prunes on `GET` / `DELETE /contracts`;
+        without it, every organization. Organization API keys and organization-scoped routes already have an
+        organization: the parameter may repeat it, any other value answers `403`.
+      schema:
+        type: string
+    AdminContractOrganizationId:
+      name: organizationId
+      in: query
+      required: false
+      description: |
+        Organization of the contract(s). **Required for platform ADMIN users** on the direct routes that address
+        contracts by `userId` or `groupId`: a `userId` (or `groupId`) is only unique within an organization.
+        Without it they get `400` with `code: ORGANIZATION_ID_REQUIRED` (see `OrganizationIdRequired`) and nothing
+        is read or changed. Not needed with an organization API key or on the organization-scoped routes, which
+        already have an organization: the parameter may repeat it, any other value answers `403`; a repeated
+        parameter answers `400`.
+      schema:
+        type: string
+    RejectPrivate:
+      name: rejectPrivate
+      in: query
+      required: false
+      description: |
+        Opt-in: `true` rejects private plans and add-ons that the contract does not already have
+        (`PRIVATE_PLAN` / `PRIVATE_ADDON`), for subscriptions a customer configures. Default: they are accepted,
+        as before. Same as the body field `rejectPrivate: true`.
+      schema:
+        type: boolean
+        default: false
+    PricingFormat:
+      name: format
+      in: query
+      required: false
+      description: |
+        `json` (default): the parsed pricing, as before. `yaml`: the stored Pricing2Yaml file of the version, byte for
+        byte (`Content-Type: application/yaml; charset=utf-8`), with `X-Pricing-Syntax-Version` and
+        `ETag: "<sha256 hex of the body>"`. For SPHERE-linked services, versions SPACE no longer keeps are fetched
+        from SPHERE and checked against its content hash.
+      schema:
+        type: string
+        enum: [json, yaml]
+        default: json
+    IfNoneMatchPricingYaml:
+      name: If-None-Match
+      in: header
+      required: false
+      description: '`format=yaml` only: answer `304` when the file still has this ETag.'
+      schema:
+        type: string
+    KeepBillingPeriod:
+      name: keepBillingPeriod
+      in: query
+      required: false
+      description: |
+        `true` keeps the current billing period (start and end date) instead of starting a new one; the previous
+        subscription is still added to `history`. Default: the billing period restarts, as before.
+      schema:
+        type: boolean
+        default: false
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Makes the request apply at most once (capability `idempotency-key`; see "Idempotency-Key"). 1 to
+        255 characters, unique per operation within the organization (a UUID). Repeating the same request
+        with the same key replays the first response with `Idempotent-Replayed: true`; another request with
+        the same key answers `409 IDEMPOTENCY_CONFLICT`. Without it the request is handled as before. On a
+        single-feature evaluation it only applies when the request consumes or reverts. `400
+        IDEMPOTENCY_KEY_INVALID` for an empty or longer key.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+      example: 6f1c2b8e-3f4a-4b7e-9d21-0c5a7e8b9f10
+    IfMatchContractVersion:
+      name: If-Match
+      in: header
+      required: false
+      description: |
+        `"<contractVersion>"` the novation is conditional on, or a comma-separated list of them (any one
+        may match). Comparison is strong: weak tags (`W/"..."`) never match. An unquoted value is taken as
+        one tag, and `*` matches any current version. On mismatch the request fails with
+        `412 CONTRACT_CHANGED` and nothing is written. Without it (and without `expectedContractVersion`) the novation is unconditional,
+        as before.
+      schema:
+        type: string
+      example: '"3-9f86d081884c7d65"'
     Username:
       name: username
       in: path

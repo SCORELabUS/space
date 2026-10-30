@@ -1,4 +1,5 @@
 import SphereSyncPanel from '@/components/services/SphereSyncPanel';
+import DefaultVersionSelector from '@/components/services/DefaultVersionSelector';
 import { getSynchronization } from '@/api/services/sphereApi';
 import type { SyncState } from '@/api/services/sphereApi';
 import { useEffect, useState } from 'react';
@@ -19,6 +20,14 @@ import ServiceOptionsMenu from '../../components/ServiceOptionsMenu';
 import { useCustomConfirm } from '@/hooks/useCustomConfirm';
 
 export default function ServiceDetailPage() {
+  const { name } = useParams<{ name: string }>();
+  const { user } = useAuth();
+  const { currentOrganization } = useOrganization();
+  // Service drafts may contain a new SPHERE key. Never carry them into another context.
+  return <ServiceDetailContent key={JSON.stringify([name, user.apiKey, currentOrganization?.id])} />;
+}
+
+function ServiceDetailContent() {
   const { name } = useParams<{ name: string }>();
   const { user } = useAuth();
   const { currentOrganization } = useOrganization();
@@ -48,6 +57,8 @@ export default function ServiceDetailPage() {
         setArchivedPricings(archived);
         setLoading(false);
       }
+    }).catch(() => {
+      if (mounted) { setActivePricings([]); setArchivedPricings([]); setLoading(false); }
     });
     return () => {
       mounted = false;
@@ -116,7 +127,7 @@ export default function ServiceDetailPage() {
   function handleDisableService() {
     if (!currentOrganization?.id) return;
     showConfirm(
-      `Are you sure you want to disable service ${name}? This action is potentially destructive. It will remove this service from all contracts. Any contract that includes only this service will be deactivated.`,
+      `Are you sure you want to disable service ${name}? Its features will be unavailable until reactivated. Existing contracts, usage and billing dates will be preserved.`,
       'danger'
     ).then(confirmed => {
       if (confirmed && currentOrganization?.id) {
@@ -153,7 +164,8 @@ export default function ServiceDetailPage() {
         />
       </div>
       {syncState?.source === 'sphere' && <p className="mb-7 text-sm text-gray-500 dark:text-gray-400">Monitor pricing releases, synchronization and contract updates in one place.</p>}
-      {syncState?.source === 'sphere' && currentOrganization && <SphereSyncPanel state={syncState} apiKey={user.apiKey} organizationId={currentOrganization.id} service={name!} onChange={setSyncState} canManage={user.role === 'ADMIN' || currentOrganization.owner === user.username || currentOrganization.members.some(member => member.username === user.username && ['ADMIN', 'MANAGER'].includes(member.role))} />}
+      {syncState?.source === 'sphere' && currentOrganization && <SphereSyncPanel state={syncState} apiKey={user.apiKey} organizationId={currentOrganization.id} service={name!} onChange={setSyncState} canDisable={user.role === 'ADMIN' || currentOrganization.owner === user.username || currentOrganization.members.some(member => member.username === user.username && member.role === 'ADMIN')} canManage={user.role === 'ADMIN' || currentOrganization.owner === user.username || currentOrganization.members.some(member => member.username === user.username && ['ADMIN', 'MANAGER'].includes(member.role))} />}
+      {syncState?.source === 'manual' && !loading && currentOrganization && <DefaultVersionSelector key={`${currentOrganization.id}/${name}`} apiKey={user.apiKey} organizationId={currentOrganization.id} serviceName={name!} activePricings={activePricings} canManage={user.role === 'ADMIN' || currentOrganization.owner === user.username || currentOrganization.members.some(member => member.username === user.username && ['ADMIN', 'MANAGER'].includes(member.role))} />}
       <AddVersionModal
         open={addVersionOpen}
         onClose={handleAddVersionClose}

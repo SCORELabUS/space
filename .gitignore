@@ -142,6 +142,7 @@ api/scripts/output/
 
 # Static files
 api/public/static
+api/private
 
 # Generated files for testing purposes
 api/src/test/data/generated/

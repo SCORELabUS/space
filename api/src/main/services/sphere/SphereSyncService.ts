@@ -1,3 +1,4 @@
+import { assertNoPendingRelocation } from '../serviceRelocationState';
 import SphereSyncRepository from '../../repositories/mongoose/SphereSyncRepository';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -10,9 +11,13 @@ import { escapeVersion, resetEscapeVersion } from '../../utils/helpers';
 import { isSubscriptionValidInPricing } from '../../controllers/validation/ContractValidation';
 import { validatePricingData } from '../validation/PricingServiceValidation';
 import SphereClient, { functionalHash } from './SphereClient';
-import { SphereConfiguration, SphereManifest, SphereVersion, SyntaxUpgrade, isSphereSyncEnabled, sameSnapshotCreatedAt, selectVersion, validateConfiguration } from './types';
+import { SphereConfiguration, SphereManifest, SphereVersion, SyntaxUpgrade, isSphereSyncEnabled, publicSphereSource, sameSnapshotCreatedAt, selectVersion, validateConfiguration } from './types';
+import { decryptSphereApiKey, encryptSphereApiKey, isValidSphereApiKey } from './credentials';
 import { migrateSubscription, migrateUsage } from './migration';
+import { isSphereSnapshotYamlPath, pricingYamlFile, removePricingYaml, sphereSnapshotYamlPath } from '../pricingFiles';
 import { withOrganizationLock } from './lock';
+import { SphereVersionNotListedError } from './errors';
+import { contractCacheKeys } from '../../utils/contracts/cacheKeys';
 
 export default class SphereSyncService {
   private client = new SphereClient();
@@ -22,15 +27,68 @@ export default class SphereSyncService {
   private reconciledAt = 0;
   private jobs = new Set<Promise<unknown>>();
 
-  async preview(config: SphereConfiguration) {
+  /**
+   * `config.sphereApiKey` (optional) is used for this request only: preview
+   * never stores it, so private versions can be inspected before linking.
+   * A scoped service preview may reuse its stored credential without exposing
+   * it to the caller. Explicit null still previews anonymous access.
+   */
+  async preview(config: SphereConfiguration, organizationId?: string, serviceName?: string) {
     const link = this.client.parseLink(config.permanentUrl);
-    const manifest = await this.client.manifest(link.pricingId);
+    if (config.sphereApiKey != null && !isValidSphereApiKey(config.sphereApiKey)) throw new Error('Invalid sphereApiKey');
+    let apiKey = config.sphereApiKey ?? undefined;
+    if (serviceName !== undefined) {
+      if (typeof serviceName !== 'string' || !serviceName.trim()) throw new Error('Invalid serviceName');
+      if (typeof organizationId !== 'string' || !organizationId) throw new Error('Organization ID is required');
+      const service: any = await this.repository.service({ organizationId, name: serviceName, source: 'sphere' });
+      if (!service) throw new Error('Linked service not found');
+      const storedLink = this.client.parseLink(service.sphere.permanentUrl);
+      if (link.pricingId !== service.sphere.pricingId || link.permanentUrl !== storedLink.permanentUrl) {
+        throw new Error('Changing pricing identity is not supported');
+      }
+      if (config.sphereApiKey === undefined) apiKey = await this.apiKey(service);
+    }
+    const manifest = await this.client.manifest(link.pricingId, apiKey);
     const target = selectVersion(manifest, config);
-    return { ...manifest, ...link, syntaxUpgrade: await this.inspectSyntaxUpgrade(link.pricingId, target) };
+    return { ...manifest, ...link, syntaxUpgrade: await this.inspectSyntaxUpgrade(link.pricingId, target, apiKey) };
+  }
+  /** What a stored key of `service` is bound to: the service, its SPHERE pricing and the current SPHERE origin. */
+  private credentialContext(serviceId: unknown, pricingId: string) {
+    return { serviceId: String(serviceId), pricingId, origin: this.client.apiOrigin() };
+  }
+  /**
+   * Decrypted SPHERE API key of a linked service, or undefined (public versions
+   * only). Refuses (SphereCredentialError) when SPHERE is no longer the origin
+   * the key was entered for. A key that only SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS
+   * decrypts is re-encrypted with the current key and stored again.
+   */
+  private async apiKey(service: any): Promise<string | undefined> {
+    const credential = service?.sphere?.encryptedApiKey;
+    if (!credential) return undefined;
+    const context = this.credentialContext(service._id, service.sphere.pricingId);
+    const { apiKey, rotated } = decryptSphereApiKey(credential, context);
+    if (rotated && service._id) {
+      const fresh = encryptSphereApiKey(apiKey, context);
+      try {
+        // Conditional on the credential that was read, so a key entered meanwhile is kept.
+        await this.repository.updateService({ _id: service._id, 'sphere.encryptedApiKey.data': credential.data },
+          { $set: { 'sphere.encryptedApiKey': fresh } });
+        service.sphere.encryptedApiKey = fresh;
+      } catch (error) {
+        console.error('SPHERE API key could not be re-encrypted with the current key', (error as Error).message);
+      }
+    }
+    return apiKey;
   }
   async create(config: SphereConfiguration, organizationId: string) {
     validateConfiguration(config);
+    const serviceId = new mongoose.Types.ObjectId();
+    // Encrypt first, so a missing SPHERE_KEY_ENCRYPTION_KEY fails before any SPHERE call or import.
+    const encryptedApiKey = config.sphereApiKey
+      ? encryptSphereApiKey(config.sphereApiKey, this.credentialContext(serviceId, this.client.parseLink(config.permanentUrl).pricingId))
+      : undefined;
     return withOrganizationLock(organizationId, async assertOwned => {
+      await assertNoPendingRelocation(organizationId);
       const manifest = await this.preview(config);
       const version = selectVersion(manifest, config);
       if (manifest.syntaxUpgrade && config.acceptedSyntaxUpgradeVersionId !== version.versionId) {
@@ -39,8 +97,7 @@ export default class SphereSyncService {
       const name = manifest.name.toLowerCase();
       if (!name || /[.$\x00]/.test(name)) throw new Error('Invalid service name in SPHERE pricing');
       if (await this.repository.serviceExists({ organizationId, name })) throw new Error('Service already exists');
-      const serviceId = new mongoose.Types.ObjectId();
-      const local = await this.importVersion({ _id: serviceId, name, organizationId, sphere: manifest }, version);
+      const local = await this.importVersion({ _id: serviceId, name, organizationId, sphere: { ...manifest, encryptedApiKey } }, version);
       let persisted = false;
       try {
         await assertOwned();
@@ -48,11 +105,11 @@ export default class SphereSyncService {
           activePricings: { [escapeVersion(version.version)]: { id: local._id } }, archivedPricings: {},
           sphere: { permanentUrl: manifest.permanentUrl, pricingId: manifest.pricingId, name: manifest.name,
             policy: config.policy, selectedVersionId: config.policy.endsWith('_pick') ? config.selectedVersionId : undefined,
-            pollIntervalMinutes: config.pollIntervalMinutes ?? 5,
+            pollIntervalMinutes: config.pollIntervalMinutes ?? 5, ...(encryptedApiKey ? { encryptedApiKey } : {}),
             target: version, revision: 1, status: 'ready', lastCheckedAt: new Date(), lastSyncedAt: new Date(), nextCheckAt: this.nextCheck(String(serviceId), config.pollIntervalMinutes ?? 5) } });
         persisted = true;
         await this.invalidate(created).catch(error => console.error('Initial cache invalidation failed', error.message));
-        return created;
+        return { ...created, sphere: publicSphereSource(created.sphere) };
       } catch (error) {
         if (!persisted) await this.removeCopy(local);
         throw error;
@@ -60,41 +117,73 @@ export default class SphereSyncService {
     });
   }
   async historicalPricing(organizationId: string, name: string, version: string) {
+    return parsePricingToSpacePricingObject(retrievePricingFromText(await this.historicalPricingYaml(organizationId, name, version)));
+  }
+  /** The SPHERE source text of a version SPACE does not keep, checked against the manifest's content hash. */
+  async historicalPricingYaml(organizationId: string, name: string, version: string): Promise<string> {
     const service: any = await this.repository.service({ organizationId, name, source: 'sphere' });
-    if (!service) throw new Error('Historical pricing not found');
-    const manifest = await this.client.manifest(service.sphere.pricingId);
+    if (!service) throw new SphereVersionNotListedError('Historical pricing not found');
+    const apiKey = await this.apiKey(service);
+    const manifest = await this.client.manifest(service.sphere.pricingId, apiKey);
     const remote = manifest.versions.find(v => v.version === resetEscapeVersion(version));
-    if (!remote) throw new Error('Historical version is no longer public in SPHERE');
-    const text = await this.client.yaml(service.sphere.pricingId, remote.versionId);
+    if (!remote) throw new SphereVersionNotListedError('Historical version is no longer public in SPHERE');
+    const text = await this.client.yaml(service.sphere.pricingId, remote.versionId, apiKey);
     if (functionalHash(text) !== remote.contentHash) throw new Error('Historical version changed during retrieval');
-    return parsePricingToSpacePricingObject(retrievePricingFromText(text));
+    return text;
   }
   async get(organizationId: string, name: string) {
     const service: any = await this.repository.service({ organizationId, name });
     if (!service) throw new Error('Service not found');
     const retained = await this.repository.pricings({ 'sphere.serviceId': String(service._id) });
     const run = service.sphere?.runId ? await this.repository.run(service.sphere.runId) : null;
-    return { source: service.source ?? 'manual', configuration: service.sphere ?? null, retainedVersions: retained.map((v: any) => ({ ...v, version: v.sphere?.version ?? resetEscapeVersion(v.version) })), run };
+    return { source: service.source ?? 'manual', disabled: Boolean(service.disabled), configuration: publicSphereSource(service.sphere ?? null), retainedVersions: retained.map((v: any) => ({ ...v, version: v.sphere?.version ?? resetEscapeVersion(v.version) })), run };
   }
   async configure(organizationId: string, name: string, config: SphereConfiguration) {
     validateConfiguration(config);
     return withOrganizationLock(organizationId, async assertOwned => {
+      await assertNoPendingRelocation(organizationId);
       const service: any = await this.repository.service({ organizationId, name, source: 'sphere', disabled: false });
       if (!service) throw new Error('Linked service not found');
       if (service.sphere.status === 'applying') throw new Error('Synchronization is applying; retry after recovery');
       if (config.permanentUrl && config.permanentUrl !== service.sphere.permanentUrl) throw new Error('Changing pricing identity is not supported');
-      const manifest = await this.client.manifest(service.sphere.pricingId);
+      // sphereApiKey: a string replaces the stored key, null removes it, omitted keeps it.
+      const encryptedApiKey = config.sphereApiKey
+        ? encryptSphereApiKey(config.sphereApiKey, this.credentialContext(service._id, service.sphere.pricingId))
+        : undefined;
+      const apiKey = config.sphereApiKey === undefined ? await this.apiKey(service) : config.sphereApiKey ?? undefined;
+      // Validate the policy (and the new key) against what SPHERE shows with that key.
+      const manifest = await this.client.manifest(service.sphere.pricingId, apiKey);
       selectVersion(manifest, config);
       await assertOwned();
-      await this.repository.updateService({ _id: service._id }, { $set: { 'sphere.policy': config.policy,
+      const update: any = { $set: { 'sphere.policy': config.policy,
         'sphere.selectedVersionId': config.policy.endsWith('_pick') ? config.selectedVersionId : null,
         'sphere.pollIntervalMinutes': config.pollIntervalMinutes ?? service.sphere.pollIntervalMinutes ?? 5,
-        'sphere.status': 'queued', 'sphere.nextCheckAt': new Date() }, $inc: { 'sphere.revision': 1 } });
+        'sphere.status': 'queued', 'sphere.nextCheckAt': new Date() }, $inc: { 'sphere.revision': 1 } };
+      if (encryptedApiKey) update.$set['sphere.encryptedApiKey'] = encryptedApiKey;
+      else if (config.sphereApiKey === null) update.$unset = { 'sphere.encryptedApiKey': '' };
+      await this.repository.updateService({ _id: service._id }, update);
       await this.invalidate(service);
       return this.get(organizationId, name);
     });
   }
+  async resume(organizationId: string, name: string) {
+    return withOrganizationLock(organizationId, async assertOwned => {
+      await assertNoPendingRelocation(organizationId);
+      const service: any = await this.repository.service({ organizationId, name, source: 'sphere' });
+      if (!service) throw new Error('Linked service not found');
+      if (service.sphere.status === 'applying') throw new Error('Synchronization is applying; retry after recovery');
+      await assertOwned();
+      await this.repository.updateService({ _id: service._id }, { $set: {
+        disabled: false, 'sphere.status': 'queued', 'sphere.nextCheckAt': new Date(),
+      } });
+      await this.invalidate(service);
+      await container.resolve('cacheService').del(`features.${organizationId}.*`);
+      if (service.disabled) container.resolve('eventService').emitPricingActivedMessage(service.name, service.sphere.target.version);
+      return this.get(organizationId, name);
+    });
+  }
   async enqueue(organizationId: string, name: string) {
+    await assertNoPendingRelocation(organizationId);
     if (!await this.repository.serviceExists({ organizationId, name, source: 'sphere', disabled: false })) throw new Error('Linked service not found');
     await this.repository.updateService({ organizationId, name, source: 'sphere', disabled: false, 'sphere.status': { $ne: 'applying' } },
       { $set: { 'sphere.nextCheckAt': new Date(), 'sphere.status': 'queued' } });
@@ -156,6 +245,7 @@ export default class SphereSyncService {
     const initial: any = await this.repository.service({ _id: id });
     if (!initial || initial.disabled || initial.source !== 'sphere') return;
     return withOrganizationLock(initial.organizationId, async assertOwned => {
+      await assertNoPendingRelocation(initial.organizationId);
       const service: any = await this.repository.service({ _id: id });
       if (!service || service.disabled || new Date(service.sphere.nextCheckAt ?? 0).getTime() > Date.now()) return;
       let run: any = service.sphere.status === 'applying' && service.sphere.runId ? await this.repository.run(service.sphere.runId) : null;
@@ -163,7 +253,7 @@ export default class SphereSyncService {
       try {
         if (!run) {
           await this.repository.updateService({ _id: id }, { $set: { 'sphere.status': 'checking', 'sphere.lastCheckedAt': new Date() } });
-          const manifest = await this.client.manifest(service.sphere.pricingId);
+          const manifest = await this.client.manifest(service.sphere.pricingId, await this.apiKey(service));
           const candidate = selectVersion(manifest, service.sphere, service.sphere.target);
           // Check every retained public snapshot for content changes, even when the target is unchanged.
           const retained: any[] = await this.repository.pricings({ 'sphere.serviceId': id });
@@ -200,8 +290,7 @@ export default class SphereSyncService {
           'sphere.lastSyncedAt': new Date(), 'sphere.nextCheckAt': this.nextCheck(id, service.sphere.pollIntervalMinutes ?? 5),
           'sphere.migrated': counts.migrated, 'sphere.replaced': counts.replaced } });
         for (const changed of await this.repository.contracts({ 'synchronizationHistory.runId': String(run._id) })) {
-          await container.resolve('cacheService').del(`contracts.${changed.userContact!.userId}`);
-          await container.resolve('cacheService').del(`features.${changed.userContact!.userId}.*`);
+          for (const key of contractCacheKeys(changed)) await container.resolve('cacheService').del(key);
         }
         await this.repository.updateRun({ _id: run._id }, { $set: { status: 'ready', finishedAt: new Date(), ...counts } });
         await this.invalidate(service);
@@ -225,15 +314,17 @@ export default class SphereSyncService {
       if (existing.sphere.contentHash !== version.contentHash) throw new Error('An imported version changed content; publish a new SPHERE version');
       return existing;
     }
-    const text = await this.client.yaml(service.sphere.pricingId, version.versionId);
+    const text = await this.client.yaml(service.sphere.pricingId, version.versionId, await this.apiKey(service));
     if (functionalHash(text) !== version.contentHash) throw new Error('SPHERE snapshot changed while downloading; retry');
     const parsed = retrievePricingFromText(text);
     if (parsed.version !== version.version || !sameSnapshotCreatedAt(parsed.createdAt, version.createdAt)) throw new Error(`Invalid SPHERE snapshot metadata: SPHERE lists version ${version.version} created ${version.createdAt}, the YAML says ${parsed.version} created ${new Date(parsed.createdAt).toISOString()}`);
     const data = parsePricingToSpacePricingObject(parsed);
     const errors = validatePricingData(data);
     if (errors.length) throw new Error(`Invalid pricing: ${errors.join(', ')}`);
-    const yamlPath = `/static/pricings/sphere/${service._id}/${version.versionId}.yaml`;
-    const file = path.resolve('public', '.' + yamlPath);
+    // Outside public/: snapshots are read only through GET .../pricings/{version}?format=yaml.
+    const yamlPath = sphereSnapshotYamlPath(String(service._id), version.versionId);
+    const file = pricingYamlFile(yamlPath);
+    if (!file) throw new Error(`Invalid SPHERE snapshot path ${yamlPath}`);
     await fs.mkdir(path.dirname(file), { recursive: true });
     // Persist the parsed Pricing2Yaml model, not the remote source text. This
     // makes a confirmed legacy-syntax upgrade explicit and reproducible.
@@ -246,8 +337,8 @@ export default class SphereSyncService {
       return await this.repository.pricing({ _id: saved._id });
     } catch (error) { await fs.rm(file, { force: true }); throw error; }
   }
-  private async inspectSyntaxUpgrade(pricingId: string, version: SphereVersion): Promise<SyntaxUpgrade | undefined> {
-    const text = await this.client.yaml(pricingId, version.versionId);
+  private async inspectSyntaxUpgrade(pricingId: string, version: SphereVersion, apiKey?: string): Promise<SyntaxUpgrade | undefined> {
+    const text = await this.client.yaml(pricingId, version.versionId, apiKey);
     if (functionalHash(text) !== version.contentHash) throw new Error('SPHERE snapshot changed while downloading; retry');
     const source = yaml.load(text) as { syntaxVersion?: unknown };
     if (!source || typeof source !== 'object' || typeof source.syntaxVersion !== 'string') {
@@ -303,10 +394,11 @@ export default class SphereSyncService {
         contractedServices: contract.contractedServices, subscriptionPlans: contract.subscriptionPlans,
         subscriptionAddOns: contract.subscriptionAddOns,
         [usagePath]: contract.usageLevels?.[service.name] ?? { $exists: false } }, update);
+      const occurredAt = new Date();
       if (result.modifiedCount) {
         await this.repository.updateRun({ _id: run._id }, { $inc: { migrated: 1, replaced: migrated.replaced ? 1 : 0 } });
-        await container.resolve('cacheService').del(`contracts.${contract.userContact.userId}`);
-        await container.resolve('cacheService').del(`features.${contract.userContact.userId}.*`);
+        for (const key of contractCacheKeys(contract)) await container.resolve('cacheService').del(key);
+        await this.emitNovated(contract._id, occurredAt);
         return;
       }
       contract = await this.repository.contract({ _id: contract._id });
@@ -332,6 +424,15 @@ export default class SphereSyncService {
     const service: any = await this.repository.service({ _id: id });
     if (!service || service.source !== 'sphere') throw new Error('Linked service not found');
     if (service.sphere.status === 'applying') throw new Error('Synchronization is applying; retry after recovery');
+    if (disable) {
+      // Pausing never mutates contracts or runs retention cleanup: old versions stay referenced.
+      await assertOwned();
+      await this.repository.updateService({ _id: id }, { $set: { disabled: true } });
+      await this.invalidate(service);
+      await container.resolve('cacheService').del(`features.${service.organizationId}.*`);
+      container.resolve('eventService').emitServiceDisabledMessage(service.name);
+      return true;
+    }
     for (const contract of await this.contracts(service)) {
       await assertOwned();
       const update: any = { $unset: { [`contractedServices.${service.name}`]: '', [`subscriptionPlans.${service.name}`]: '',
@@ -339,25 +440,31 @@ export default class SphereSyncService {
         $push: { synchronizationHistory: { service: service.name, pricingId: service.sphere.pricingId,
           fromVersion: resetEscapeVersion(contract.contractedServices[service.name]), reason: 'service_removed', at: new Date() } } };
       if (Object.keys(contract.contractedServices).length === 1) update.$set = { 'billingPeriod.endDate': new Date(), 'billingPeriod.autoRenew': false };
-      await this.repository.updateContract({ _id: contract._id, contractedServices: contract.contractedServices }, update);
-      await container.resolve('cacheService').del(`contracts.${contract.userContact.userId}`);
-      await container.resolve('cacheService').del(`features.${contract.userContact.userId}.*`);
+      const removed = await this.repository.updateContract({ _id: contract._id, contractedServices: contract.contractedServices }, update);
+      const removedAt = new Date();
+      for (const key of contractCacheKeys(contract)) await container.resolve('cacheService').del(key);
+      if (removed?.modifiedCount) await this.emitNovated(contract._id, removedAt);
     }
     await assertOwned();
-    if (disable) {
-      await this.repository.updateService({ _id: id }, { $set: { disabled: true } });
-      await this.cleanup(id, assertOwned);
-      container.resolve('eventService').emitServiceDisabledMessage(service.name);
-    } else {
-      if (await this.repository.contractExists({ organizationId: service.organizationId, [`contractedServices.${service.name}`]: { $exists: true } })) throw new Error('Contract binding changed; retry removal');
-      for (const copy of await this.repository.pricings({ 'sphere.serviceId': id })) await this.removeCopy(copy);
-      await this.repository.deleteService({ _id: id });
-    }
+    if (await this.repository.contractExists({ organizationId: service.organizationId, [`contractedServices.${service.name}`]: { $exists: true } })) throw new Error('Contract binding changed; retry removal');
+    for (const copy of await this.repository.pricings({ 'sphere.serviceId': id })) await this.removeCopy(copy);
+    await this.repository.deleteService({ _id: id });
     await this.invalidate(service);
     return true;
   }
+  /** Tell the contract's organization that synchronization changed its binding (`occurredAt`: when it was written). */
+  private async emitNovated(contractId: unknown, occurredAt: Date) {
+    try {
+      const events = container.resolve('eventService');
+      if (typeof events?.emitContractEvent !== 'function') return;
+      const updated = await this.repository.contract({ _id: contractId });
+      if (updated) events.emitContractEvent('CONTRACT_NOVATED', updated, { occurredAt });
+    } catch (error) {
+      console.error('Contract event could not be emitted', (error as Error).message);
+    }
+  }
   private async removeCopy(copy: any) {
-    if (copy.yamlPath?.startsWith('/static/pricings/sphere/')) await fs.rm(path.resolve('public', '.' + copy.yamlPath), { force: true });
+    if (isSphereSnapshotYamlPath(copy.yamlPath)) removePricingYaml(copy.yamlPath);
     await this.repository.deletePricing({ _id: copy._id });
     await container.resolve('cacheService').del(`pricing.id.${copy._id}`);
   }

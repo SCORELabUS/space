@@ -1,9 +1,9 @@
-import { body, check } from 'express-validator';
+import { body, check, query } from 'express-validator';
 import { LeanPricing } from '../../types/models/Pricing';
-import { Subscription } from '../../types/models/Contract';
+import { LeanContract, Subscription } from '../../types/models/Contract';
 import ServiceService from '../../services/ServiceService';
 import container from '../../config/container';
-import { convertKeysToLowercase } from '../../utils/helpers';
+import { convertKeysToLowercase, escapeVersion } from '../../utils/helpers';
 
 const create = [
   // userContact (required)
@@ -58,10 +58,10 @@ const create = [
     .isInt({ min: 1 })
     .withMessage('billingPeriod.renewalDays must be a positive integer'),
 
-  // contractedServices (optional)
+  // contractedServices (optional): services of subscriptionPlans/subscriptionAddOns
+  // that it omits get the version for new contracts of the service.
   check('contractedServices')
-    .exists({ checkNull: true })
-    .withMessage('The contractedServices field is required')
+    .optional()
     .isObject()
     .withMessage(
       'contractedServices must be an object where keys are service names and values are pricing versions'
@@ -108,10 +108,11 @@ const create = [
 ];
 
 const novate = [
-  // contractedServices (optional)
+  // contractedServices (optional): services it omits keep the version of the
+  // contract or, if the contract does not have them, get the version for new
+  // contracts; SPHERE policies still apply.
   check('contractedServices')
-    .exists({ checkNull: true })
-    .withMessage('The contractedServices field is required')
+    .optional()
     .isObject()
     .withMessage(
       'contractedServices must be an object where keys are service names and values are pricing versions'
@@ -155,6 +156,50 @@ const novate = [
     .isInt({ min: 0 })
     .withMessage('Each add-on quantity must be an integer greater than or equal to 0'),
 ];
+
+const contractVersionPreconditions = [
+  body('expectedContractVersion')
+    .optional()
+    .isString()
+    .withMessage('expectedContractVersion must be a string (the contractVersion of the contract)'),
+  body('expectedContractVersions')
+    .optional()
+    .isObject()
+    .withMessage('expectedContractVersions must be an object of userId -> contractVersion'),
+  body('expectedContractVersions.*')
+    .optional()
+    .isString()
+    .withMessage('Each value in expectedContractVersions must be a string (contractVersion)'),
+];
+
+/** `rejectPrivate` (opt-in), as a query parameter or a body field. */
+function rejectPrivateOption() {
+  return [
+    body('rejectPrivate')
+      .optional()
+      .isBoolean({ strict: true })
+      .withMessage('rejectPrivate must be a boolean'),
+    query('rejectPrivate')
+      .optional()
+      .isIn(['true', 'false'])
+      .withMessage('rejectPrivate must be true or false'),
+  ];
+}
+
+const novationOptions = [
+  body('keepBillingPeriod')
+    .optional()
+    .isBoolean({ strict: true })
+    .withMessage('keepBillingPeriod must be a boolean'),
+  query('keepBillingPeriod')
+    .optional()
+    .isIn(['true', 'false'])
+    .withMessage('keepBillingPeriod must be true or false'),
+  ...rejectPrivateOption(),
+];
+
+novate.push(...contractVersionPreconditions, ...novationOptions);
+create.push(...rejectPrivateOption());
 
 const incrementUsageLevels = [
   body()
@@ -287,120 +332,403 @@ async function isSubscriptionValid(subscription: Subscription, organizationId: s
       );
     }
 
-    isSubscriptionValidInPricing(serviceName, subscription, pricing)
+    isSubscriptionValidInPricing(serviceName, subscription, pricing);
   }
+}
+
+/**
+ * Stable codes of subscription validation errors (see `SubscriptionError`).
+ * Clients may switch on them; the messages are for humans and may change.
+ */
+type SubscriptionErrorCode =
+  | 'PLAN_NOT_FOUND'
+  | 'ADDON_NOT_FOUND'
+  | 'ADDON_NOT_AVAILABLE'
+  | 'ADDON_DEPENDENCY_MISSING'
+  | 'ADDON_EXCLUDED'
+  | 'QUANTITY_OUT_OF_RANGE'
+  | 'VERSION_NOT_FOUND'
+  | 'VERSION_ARCHIVED'
+  | 'PRIVATE_PLAN'
+  | 'PRIVATE_ADDON';
+
+interface SubscriptionError {
+  code: SubscriptionErrorCode;
+  service: string;
+  /** Location of the offending value in the request body, e.g. `subscriptionAddOns.acme.extraStorage`. */
+  path: string;
+  message: string;
+}
+
+/**
+ * What the contract had before, for rules that only apply to selections made
+ * now: a private plan or add-on the contract already has may be kept.
+ */
+interface SubscriptionValidationContext {
+  /** Reject private plans and add-ons that the contract does not already have. */
+  rejectPrivate?: boolean;
+  previousPlan?: string;
+  previousAddOns?: Record<string, number>;
+}
+
+/** A subscription failed validation; `errors` lists every problem found. */
+class SubscriptionValidationError extends Error {
+  constructor(public readonly errors: SubscriptionError[]) {
+    super(`Invalid subscription: ${errors[0]?.message ?? 'unknown error'}`);
+    this.name = 'SubscriptionValidationError';
+  }
+}
+
+/**
+ * Every problem of the selection of one service against one pricing version.
+ *
+ * The order (and the first message) is the one the original validation
+ * reported, so `isSubscriptionValidInPricing` keeps its behaviour. Checks that
+ * depend on an add-on existing are skipped for add-ons that do not.
+ */
+function subscriptionErrorsInPricing(
+  serviceName: string,
+  subscription: Subscription,
+  pricing: LeanPricing,
+  context: SubscriptionValidationContext = {}
+): SubscriptionError[] {
+  const errors: SubscriptionError[] = [];
+  const selectedPlan: string | undefined = subscription.subscriptionPlans[serviceName];
+  const selectedAddOns = subscription.subscriptionAddOns[serviceName];
+  const pricingPlans = convertKeysToLowercase(pricing.plans || {});
+  const planPath = `subscriptionPlans.${serviceName}`;
+
+  if (!selectedPlan && !selectedAddOns) {
+    // Nothing selected for the service: reported as PLAN_NOT_FOUND (documented
+    // with the codes), since there is no dedicated code for an empty selection.
+    errors.push({
+      code: 'PLAN_NOT_FOUND',
+      service: serviceName,
+      path: planPath,
+      message: `Service ${serviceName} must have either a plan or add-ons selected`,
+    });
+    return errors;
+  }
+
+  if (selectedPlan) {
+    const plan = pricingPlans[selectedPlan.toLowerCase()];
+    if (!plan) {
+      errors.push({
+        code: 'PLAN_NOT_FOUND',
+        service: serviceName,
+        path: planPath,
+        message: `Plan ${selectedPlan} for service ${serviceName} not found in the request organization`,
+      });
+    } else if (
+      context.rejectPrivate &&
+      plan.private &&
+      selectedPlan.toLowerCase() !== context.previousPlan?.toLowerCase()
+    ) {
+      errors.push({
+        code: 'PRIVATE_PLAN',
+        service: serviceName,
+        path: planPath,
+        message: `Plan ${selectedPlan} of service ${serviceName} is private and cannot be selected`,
+      });
+    }
+  }
+
+  if (!selectedAddOns) {
+    return errors;
+  }
+
+  const pricingAddOns = convertKeysToLowercase(pricing.addOns || {});
+
+  for (const addOnName in selectedAddOns) {
+    const path = `subscriptionAddOns.${serviceName}.${addOnName}`;
+    const addOn = pricing.addOns?.[addOnName];
+
+    if (!addOn) {
+      const otherCase = pricingAddOns[addOnName.toLowerCase()];
+      errors.push({
+        code: 'ADDON_NOT_FOUND',
+        service: serviceName,
+        path,
+        message: otherCase
+          ? `Add-on ${addOnName} declared in the subscription not found in pricing version ${pricing.version} in the request organization (add-on names are case-sensitive)`
+          : `Add-on ${addOnName} declared in the subscription not found in pricing version ${pricing.version} in the request organization`,
+      });
+      continue;
+    }
+
+    const availableFor = addOn.availableFor ?? Object.keys(pricing.plans ?? {});
+    if (selectedPlan && !availableFor.map(p => p.toLowerCase()).includes(selectedPlan.toLowerCase())) {
+      errors.push({
+        code: 'ADDON_NOT_AVAILABLE',
+        service: serviceName,
+        path,
+        message: `Add-on ${addOnName} is not available for plan ${selectedPlan} in the request organization`,
+      });
+    }
+
+    const dependentAddOns = addOn.dependsOn ?? [];
+    if (!dependentAddOns.every(dependentAddOn => Object.prototype.hasOwnProperty.call(selectedAddOns, dependentAddOn))) {
+      errors.push({
+        code: 'ADDON_DEPENDENCY_MISSING',
+        service: serviceName,
+        path,
+        message: `Add-on ${addOnName} requires the following add-ons to be selected in the request organization: ${dependentAddOns.join(', ')}`,
+      });
+    }
+
+    const excludedAddOns = addOn.excludes ?? [];
+    if (excludedAddOns.some(excludedAddOn => Object.prototype.hasOwnProperty.call(selectedAddOns, excludedAddOn))) {
+      errors.push({
+        code: 'ADDON_EXCLUDED',
+        service: serviceName,
+        path,
+        message: `Add-on ${addOnName} cannot be selected with the following add-ons in the request organization: ${excludedAddOns.join(', ')}`,
+      });
+    }
+
+    const quantity = selectedAddOns[addOnName];
+    const minQuantity = addOn.subscriptionConstraints?.minQuantity ?? 1;
+    const maxQuantity = addOn.subscriptionConstraints?.maxQuantity ?? Infinity;
+    const quantityStep = addOn.subscriptionConstraints?.quantityStep ?? 1;
+    const isValidQuantity =
+      quantity >= minQuantity &&
+      quantity <= maxQuantity &&
+      (quantity - minQuantity) % quantityStep === 0;
+
+    if (!isValidQuantity) {
+      errors.push({
+        code: 'QUANTITY_OUT_OF_RANGE',
+        service: serviceName,
+        path,
+        message: `Add-on ${addOnName} quantity ${quantity} is not valid. It must be between ${minQuantity} and ${maxQuantity}, and a multiple of ${quantityStep} in the request organization`,
+      });
+    }
+
+    if (
+      context.rejectPrivate &&
+      addOn.private &&
+      !Object.prototype.hasOwnProperty.call(context.previousAddOns ?? {}, addOnName)
+    ) {
+      errors.push({
+        code: 'PRIVATE_ADDON',
+        service: serviceName,
+        path,
+        message: `Add-on ${addOnName} of service ${serviceName} is private and cannot be selected`,
+      });
+    }
+  }
+
+  return errors;
+}
+
+/** What a subscription is validated against, besides the pricings. */
+interface SubscriptionValidationOptions {
+  /**
+   * The contract being novated (absent for a new contract). Keeping what it
+   * already has - its pricing version of a service, even if archived since,
+   * and its private plan or add-ons - stays allowed.
+   */
+  previous?: Pick<LeanContract, 'contractedServices' | 'subscriptionPlans' | 'subscriptionAddOns'>;
+  /**
+   * Opt-in: reject private plans and add-ons that the contract does not
+   * already have (customer-facing changes). Off by default, so operators keep
+   * assigning private plans as before.
+   */
+  rejectPrivate?: boolean;
+}
+
+const findKey = (record: Record<string, unknown> | undefined, key: string) =>
+  Object.keys(record ?? {}).find(candidate => candidate.toLowerCase() === key.toLowerCase());
+
+/** Whether the subscription selects for `serviceName` the same plan and add-ons as `previous`. */
+function sameSelection(
+  subscription: Subscription,
+  previous: NonNullable<SubscriptionValidationOptions['previous']>,
+  serviceName: string
+): boolean {
+  const pick = <T>(record: Record<string, T> | undefined) => {
+    const key = findKey(record, serviceName);
+    return key === undefined ? undefined : record![key];
+  };
+  const plan = pick(subscription.subscriptionPlans);
+  const previousPlan = pick(previous.subscriptionPlans);
+  if ((plan ?? '').toLowerCase() !== (previousPlan ?? '').toLowerCase()) return false;
+
+  const addOns = Object.entries(pick(subscription.subscriptionAddOns) ?? {}).filter(([, quantity]) => quantity !== 0);
+  const previousAddOns = pick(previous.subscriptionAddOns) ?? {};
+  const previousSelected = Object.entries(previousAddOns).filter(([, quantity]) => quantity !== 0);
+  return (
+    addOns.length === previousSelected.length &&
+    addOns.every(([addOn, quantity]) => (previousAddOns as Record<string, number>)[addOn] === quantity)
+  );
+}
+
+/**
+ * Every problem of a subscription, with stable codes, and the pricings of the
+ * services whose version could be loaded.
+ *
+ * Besides what `isSubscriptionValidInPricing` checks, it rejects pricing
+ * versions that do not exist (`VERSION_NOT_FOUND`), archived versions for new
+ * contracts and for version changes (`VERSION_ARCHIVED`), and private plans and
+ * add-ons the contract does not already have (`PRIVATE_PLAN`, `PRIVATE_ADDON`),
+ * only with `rejectPrivate`. Usage below consumption is not an error.
+ */
+async function collectSubscriptionErrors(
+  subscription: Subscription,
+  organizationId: string,
+  options: SubscriptionValidationOptions = {}
+): Promise<{ errors: SubscriptionError[]; pricings: Record<string, LeanPricing> }> {
+  const serviceService: ServiceService = container.resolve('serviceService');
+  const errors: SubscriptionError[] = [];
+  const pricings: Record<string, LeanPricing> = {};
+  const previous = options.previous;
+
+  const loaded = await Promise.all(
+    Object.entries(subscription.contractedServices ?? {}).map(async ([serviceName, pricingVersion]) => {
+      const path = `contractedServices.${serviceName}`;
+      const previousKey = findKey(previous?.contractedServices, serviceName);
+      const unchanged =
+        previousKey !== undefined &&
+        escapeVersion(String(previous!.contractedServices[previousKey])) === escapeVersion(String(pricingVersion));
+      const notFound: SubscriptionError = {
+        code: 'VERSION_NOT_FOUND',
+        service: serviceName,
+        path,
+        message: `Pricing version ${pricingVersion} for service ${serviceName} not found in the request organization`,
+      };
+
+      const status = await serviceService.pricingVersionStatus(serviceName, pricingVersion, organizationId);
+      if (status === 'no-service') {
+        const dormant = (await serviceService.dormantServices([serviceName], organizationId))[serviceName.toLowerCase()];
+        if (dormant !== 'SERVICE_DISABLED') return { serviceName, error: notFound };
+        // A disabled service is dormant in the contracts that have it: a
+        // novation may keep it exactly as it is (so that it is there again
+        // when the service is enabled), but not subscribe to it or change it.
+        if (previous && unchanged && sameSelection(subscription, previous, serviceName)) {
+          return { serviceName, dormant: true };
+        }
+        return {
+          serviceName,
+          error: {
+            ...notFound,
+            message: previousKey !== undefined
+              ? `Service ${serviceName} is disabled in the request organization: a contract can keep its subscription to it unchanged, but cannot change it`
+              : `Service ${serviceName} is disabled in the request organization and cannot be subscribed to`,
+          },
+        };
+      }
+      if (status === 'archived' && !unchanged) {
+        return {
+          serviceName,
+          error: {
+            code: 'VERSION_ARCHIVED',
+            service: serviceName,
+            path,
+            message: previous
+              ? `Pricing version ${pricingVersion} of service ${serviceName} is archived; a contract can keep it but not change to it`
+              : `Pricing version ${pricingVersion} of service ${serviceName} is archived and cannot be used for new contracts`,
+          } as SubscriptionError,
+        };
+      }
+      // Missing versions are only looked up further (SPHERE history) when kept.
+      if (status === 'missing' && !unchanged) return { serviceName, error: notFound };
+
+      try {
+        const pricing = await serviceService.showPricing(serviceName, pricingVersion, organizationId);
+        return pricing ? { serviceName, pricing } : { serviceName, error: notFound };
+      } catch {
+        return { serviceName, error: notFound };
+      }
+    })
+  );
+
+  for (const result of loaded) {
+    if (result.error) errors.push(result.error);
+    else if (result.pricing) pricings[result.serviceName] = result.pricing as LeanPricing;
+  }
+
+  const serviceNames = Array.from(
+    new Set([
+      ...Object.keys(subscription.subscriptionPlans ?? {}),
+      ...Object.keys(subscription.subscriptionAddOns ?? {}),
+    ])
+  );
+
+  for (const serviceName of serviceNames) {
+    const pricing = pricings[serviceName];
+
+    if (!pricing) {
+      if (!Object.prototype.hasOwnProperty.call(subscription.contractedServices ?? {}, serviceName)) {
+        errors.push({
+          code: 'VERSION_NOT_FOUND',
+          service: serviceName,
+          path: Object.prototype.hasOwnProperty.call(subscription.subscriptionPlans ?? {}, serviceName)
+            ? `subscriptionPlans.${serviceName}`
+            : `subscriptionAddOns.${serviceName}`,
+          message: `NOT FOUND: Service with name ${serviceName} in the request organization. Please check the services declared in subscriptionPlans and subscriptionAddOns.`,
+        });
+      }
+      continue;
+    }
+
+    const previousPlanKey = findKey(previous?.subscriptionPlans, serviceName);
+    const previousAddOnsKey = findKey(previous?.subscriptionAddOns, serviceName);
+    errors.push(
+      ...subscriptionErrorsInPricing(serviceName, subscription, pricing, {
+        rejectPrivate: options.rejectPrivate === true,
+        previousPlan: previousPlanKey ? previous!.subscriptionPlans[previousPlanKey] : undefined,
+        previousAddOns: previousAddOnsKey ? previous!.subscriptionAddOns[previousAddOnsKey] : undefined,
+      })
+    );
+  }
+
+  return { errors, pricings };
+}
+
+/**
+ * Validate a subscription for a new contract or a novation and throw a
+ * `SubscriptionValidationError` listing every problem (see
+ * `collectSubscriptionErrors`).
+ */
+async function validateSubscription(
+  subscription: Subscription,
+  organizationId: string,
+  options: SubscriptionValidationOptions = {}
+): Promise<Record<string, LeanPricing>> {
+  const { errors, pricings } = await collectSubscriptionErrors(subscription, organizationId, options);
+  if (errors.length > 0) {
+    throw new SubscriptionValidationError(errors);
+  }
+  return pricings;
 }
 
 function isSubscriptionValidInPricing(
   serviceName: string,
   subscription: Subscription,
   pricing: LeanPricing
-): void {  
-  const selectedPlan: string | undefined = subscription.subscriptionPlans[serviceName];
-  const selectedAddOns = subscription.subscriptionAddOns[serviceName];
-  const pricingPlans = convertKeysToLowercase(pricing.plans || {});
-
-  if (!selectedPlan && !selectedAddOns) {
-    throw new Error(
-      `Service ${serviceName} must have either a plan or add-ons selected`
-    );
-  }
-
-  if (selectedPlan && !pricingPlans[selectedPlan.toLowerCase()]) {
-    throw new Error(
-      `Plan ${selectedPlan} for service ${serviceName} not found in the request organization`
-    );
-  }
-
-  _validateAddOns(selectedAddOns, selectedPlan, pricing);
-}
-
-function _validateAddOns(
-  selectedAddOns: Record<string, number>,
-  selectedPlan: string | undefined,
-  pricing: LeanPricing
 ): void {
-  if (!selectedAddOns) {
-    return;
-  }
-
-  const pricingAddOns = convertKeysToLowercase(pricing.addOns || {});
-
-  for (const addOnName in selectedAddOns) {
-
-    if (!pricingAddOns[addOnName.toLowerCase()]){
-      throw new Error(`Add-on ${addOnName} declared in the subscription not found in pricing version ${pricing.version} in the request organization`);
-    }
-
-    _validateAddOnAvailability(addOnName, selectedPlan, pricing);
-    _validateDependentAddOns(addOnName, selectedAddOns, pricing);
-    _validateExcludedAddOns(addOnName, selectedAddOns, pricing);
-    _validateAddOnQuantity(addOnName, selectedAddOns, pricing);
+  const [first] = subscriptionErrorsInPricing(serviceName, subscription, pricing);
+  if (first) {
+    throw new Error(first.message);
   }
 }
 
-function _validateAddOnAvailability(
-  addOnName: string,
-  selectedPlan: string | undefined,
-  pricing: LeanPricing
-): void {
-  if (
-    selectedPlan && pricing.addOns![addOnName] &&
-    !(pricing.addOns![addOnName].availableFor ?? Object.keys(pricing.plans!))?.map(p => p.toLowerCase()).includes(selectedPlan.toLowerCase())
-  ) {
-    throw new Error(
-      `Add-on ${addOnName} is not available for plan ${selectedPlan} in the request organization`
-    );
-  }
-}
-
-function _validateDependentAddOns(
-  addOnName: string,
-  selectedAddOns: Record<string, number>,
-  pricing: LeanPricing
-): void {
-
-  const dependentAddOns = pricing.addOns![addOnName].dependsOn ?? [];
-  if (!dependentAddOns.every(dependentAddOn => selectedAddOns.hasOwnProperty(dependentAddOn))) {
-    throw new Error(
-      `Add-on ${addOnName} requires the following add-ons to be selected in the request organization: ${dependentAddOns.join(', ')}`
-    );
-  }
-}
-
-function _validateExcludedAddOns(
-  addOnName: string,
-  selectedAddOns: Record<string, number>,
-  pricing: LeanPricing
-): void {
-  const excludedAddOns = pricing.addOns![addOnName].excludes ?? [];
-  if (excludedAddOns.some(excludedAddOn => selectedAddOns.hasOwnProperty(excludedAddOn))) {
-    throw new Error(
-      `Add-on ${addOnName} cannot be selected with the following add-ons in the request organization: ${excludedAddOns.join(', ')}`
-    );
-  }
-}
-
-function _validateAddOnQuantity(
-  addOnName: string,
-  selectedAddOns: Record<string, number>,
-  pricing: LeanPricing
-): void {
-  const quantity = selectedAddOns[addOnName];
-  const minQuantity = pricing.addOns![addOnName].subscriptionConstraints?.minQuantity ?? 1;
-  const maxQuantity = pricing.addOns![addOnName].subscriptionConstraints?.maxQuantity ?? Infinity;
-  const quantityStep = pricing.addOns![addOnName].subscriptionConstraints?.quantityStep ?? 1;
-
-  const isValidQuantity =
-    quantity >= minQuantity &&
-    quantity <= maxQuantity &&
-    (quantity - minQuantity) % quantityStep === 0;
-
-  if (!isValidQuantity) {
-    throw new Error(
-      `Add-on ${addOnName} quantity ${quantity} is not valid. It must be between ${minQuantity} and ${maxQuantity}, and a multiple of ${quantityStep} in the request organization`
-    );
-  }
-}
-
-export { create, novate, incrementUsageLevels, novateUserContact, novateBillingPeriod, isSubscriptionValid, isSubscriptionValidInPricing };
+export {
+  create,
+  novate,
+  incrementUsageLevels,
+  novateUserContact,
+  novateBillingPeriod,
+  isSubscriptionValid,
+  isSubscriptionValidInPricing,
+  subscriptionErrorsInPricing,
+  collectSubscriptionErrors,
+  validateSubscription,
+  SubscriptionValidationError,
+};
+export type {
+  SubscriptionError,
+  SubscriptionErrorCode,
+  SubscriptionValidationContext,
+  SubscriptionValidationOptions,
+};
