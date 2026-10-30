@@ -4,6 +4,9 @@ import ServiceMongoose from './models/ServiceMongoose';
 import { LeanService } from '../../types/models/Service';
 import { LeanPricing } from '../../types/models/Pricing';
 
+/** Escape a string for use as a literal inside a regular expression. */
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 export type ServiceQueryFilters = {
   name?: string;
   page?: number;
@@ -53,8 +56,9 @@ class ServiceRepository extends RepositoryBase {
     organizationId: string,
     disabled = false
   ): Promise<LeanService | null> {
+    // Exact, case-insensitive: the name comes from the URL and is not a pattern.
     const query: any = {
-      name: { $regex: name, $options: 'i' },
+      name: { $regex: `^${escapeRegex(name)}$`, $options: 'i' },
       disabled: disabled,
       organizationId: organizationId,
     };
@@ -71,8 +75,9 @@ class ServiceRepository extends RepositoryBase {
     organizationId: string,
     disabled = false
   ): Promise<LeanService[] | null> {
+    // Exact, case-insensitive: contract service names are not patterns.
     const query: any = {
-      name: { $in: names.map(name => new RegExp(name, 'i')) },
+      name: { $in: names.map(name => new RegExp(`^${escapeRegex(name)}$`, 'i')) },
       disabled: disabled,
       organizationId: organizationId,
     };
@@ -109,7 +114,7 @@ class ServiceRepository extends RepositoryBase {
   }
 
   async update(name: string, data: any, organizationId: string) {
-    const query: any = { name: { $regex: name, $options: 'i' } };
+    const query: any = { name: { $regex: `^${escapeRegex(name)}$`, $options: 'i' }, organizationId };
     if (organizationId) {
       query.organizationId = organizationId;
     }

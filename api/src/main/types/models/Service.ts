@@ -11,6 +11,8 @@ export interface LeanService {
   name: string;
   disabled: boolean;
   organizationId: string;
+  /** Manual services: version assigned to new contracts that omit one (an active version). */
+  defaultVersion?: string;
   activePricings: Map<string, PricingEntry>;
   archivedPricings?: Map<string, PricingEntry>;
 }

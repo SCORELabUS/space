@@ -111,6 +111,32 @@ class ContractService {
     return contract;
   }
 
+  /**
+   * Services subscribed in `subscriptionPlans`/`subscriptionAddOns` but missing
+   * from `contractedServices` get the version for new contracts of the service
+   * (see `ServiceService.newContractsPricing`). Unknown services are left for
+   * validation to report.
+   */
+  async _fillNewContractVersions(contractData: ContractToCreate): Promise<void> {
+    contractData.contractedServices = { ...(contractData.contractedServices ?? {}) };
+    const contracted = new Set(Object.keys(contractData.contractedServices).map(key => key.toLowerCase()));
+    const subscribed = new Set(
+      [...Object.keys(contractData.subscriptionPlans ?? {}), ...Object.keys(contractData.subscriptionAddOns ?? {})]
+        .map(key => key.toLowerCase())
+    );
+
+    for (const serviceName of subscribed) {
+      if (contracted.has(serviceName)) continue;
+      try {
+        const { version } = await this.serviceService.newContractsPricing(serviceName, contractData.organizationId);
+        contractData.contractedServices[serviceName] = version;
+      } catch (error) {
+        if (!(error as Error).message.toLowerCase().includes('not found')) throw error;
+        // Reported by validation as VERSION_NOT_FOUND.
+      }
+    }
+  }
+
   async index(queryParams: any, organizationId?: string): Promise<LeanContract[]> {
     const errors = validateContractQueryFilters(queryParams);
 
@@ -182,26 +208,8 @@ class ContractService {
       );
     }
 
+    await this._fillNewContractVersions(contractData);
     await enforceSpherePolicy(contractData.organizationId, contractData);
-
-    const servicesKeys = Object.keys(contractData.contractedServices || {}).map(key =>
-      key.toLowerCase()
-    );
-    const services = await this.serviceService.indexByNames(
-      servicesKeys,
-      contractData.organizationId
-    );
-
-    if (!services || services.length === 0) {
-      throw new Error(`Invalid contract: Services not found: ${servicesKeys.join(', ')}`);
-    }
-
-    if (services && servicesKeys.length !== services.length) {
-      const missingServices = servicesKeys.filter(
-        key => !services.some(service => service.name.toLowerCase() === key.toLowerCase())
-      );
-      throw new Error(`Invalid contract: Services not found: ${missingServices.join(', ')}`);
-    }
 
     // Convert keys to lowercase for contractedServices, subscriptionPlans and subscriptionAddOns
     contractData.contractedServices = convertKeysToLowercase(contractData.contractedServices);
@@ -223,6 +231,25 @@ class ContractService {
     } catch (error) {
       if (error instanceof SubscriptionValidationError) throw error;
       throw new Error(`Invalid subscription: ${error}`);
+    }
+
+    const servicesKeys = Object.keys(contractData.contractedServices || {}).map(key =>
+      key.toLowerCase()
+    );
+    const services = await this.serviceService.indexByNames(
+      servicesKeys,
+      contractData.organizationId
+    );
+
+    if (!services || services.length === 0) {
+      throw new Error(`Invalid contract: Services not found: ${servicesKeys.join(', ')}`);
+    }
+
+    if (services && servicesKeys.length !== services.length) {
+      const missingServices = servicesKeys.filter(
+        key => !services.some(service => service.name.toLowerCase() === key.toLowerCase())
+      );
+      throw new Error(`Invalid contract: Services not found: ${missingServices.join(', ')}`);
     }
 
     for (const serviceName in contractData.contractedServices) {

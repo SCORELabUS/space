@@ -37,6 +37,11 @@ const loadFileRoutes = function (app: express.Application) {
     .get(memberRole, hasPermission(['OWNER', 'ADMIN', 'MANAGER', 'EVALUATOR']), serviceController.indexPricings)
     .post(memberRole, hasPermission(['OWNER','ADMIN', 'MANAGER']), upload, serviceController.addPricingToService);
 
+  // Before .../pricings/:pricingVersion, which would otherwise match it.
+  app
+    .route(baseUrl + '/organizations/:organizationId/services/:serviceName/pricings/new-contracts')
+    .get(memberRole, hasPermission(['OWNER', 'ADMIN', 'MANAGER', 'EVALUATOR']), serviceController.showNewContractsPricing);
+
   app
     .route(baseUrl + '/organizations/:organizationId/services/:serviceName/pricings/:pricingVersion/public-url')
     .get(memberRole, hasPermission(['OWNER', 'ADMIN', 'MANAGER', 'EVALUATOR']), serviceController.showPublicPricingUrl);
@@ -68,6 +73,11 @@ const loadFileRoutes = function (app: express.Application) {
     .route(baseUrl + '/services/:serviceName/pricings')
     .get(serviceController.indexPricings)
     .post(upload, serviceController.addPricingToService);
+
+  // Before /services/:serviceName/pricings/:pricingVersion, which would otherwise match it.
+  app
+    .route(baseUrl + '/services/:serviceName/pricings/new-contracts')
+    .get(serviceController.showNewContractsPricing);
 
   app
     .route(baseUrl + '/services/:serviceName/pricings/:pricingVersion/public-url')

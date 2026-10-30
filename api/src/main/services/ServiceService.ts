@@ -19,7 +19,7 @@ import ContractRepository from '../repositories/mongoose/ContractRepository';
 import { performNovation } from '../utils/contracts/novation';
 import { isSubscriptionValidInPricing } from '../controllers/validation/ContractValidation';
 import { generateUsageLevels } from '../utils/contracts/helpers';
-import { escapeVersion } from '../utils/helpers';
+import { escapeVersion, resetEscapeVersion } from '../utils/helpers';
 import { resetEscapeVersionInService } from '../utils/services/helpers';
 import CacheService from './CacheService';
 import OrganizationRepository from '../repositories/mongoose/OrganizationRepository';
@@ -63,6 +63,24 @@ function readSyntaxVersion(body: Buffer): string | undefined {
   }
 }
 
+/**
+ * Order pricing versions newest first: by `createdAt` (descending; versions
+ * without a valid date last), then by version, descending and numeric-aware
+ * (`10.0` before `2.0`), so that equal dates give the same answer every time.
+ */
+function compareNewestFirst(
+  a: { version: string; createdAt?: Date | string | null },
+  b: { version: string; createdAt?: Date | string | null }
+): number {
+  const timeA = a.createdAt ? new Date(a.createdAt).getTime() : NaN;
+  const timeB = b.createdAt ? new Date(b.createdAt).getTime() : NaN;
+  const datedA = Number.isFinite(timeA);
+  const datedB = Number.isFinite(timeB);
+  if (datedA && datedB && timeA !== timeB) return timeB - timeA;
+  if (datedA !== datedB) return datedA ? -1 : 1;
+  return resetEscapeVersion(String(b.version)).localeCompare(resetEscapeVersion(String(a.version)), undefined, { numeric: true });
+}
+
 class ServiceService {
   private readonly serviceRepository: ServiceRepository;
   private readonly pricingRepository: PricingRepository;
@@ -96,6 +114,9 @@ class ServiceService {
       (this as any)[method] = async (...args: any[]) => {
         const organizationId = args[args.length - 1];
         if (await ServiceModel.exists({ name: args[0], organizationId, source: 'sphere' })) {
+          if (method === 'update' && args[1] && 'defaultVersion' in args[1]) {
+            throw new Error('INVALID DATA: the version for new contracts of a SPHERE-linked service is decided by its synchronization policy');
+          }
           throw new Error('Invalid operation: manage linked pricing through SPHERE synchronization settings');
         }
         return original(...args);
@@ -256,6 +277,63 @@ class ServiceService {
 
       return { ...pricing, url: pricingLocator.url };
     }
+  }
+
+  /**
+   * The pricing version SPACE assigns to new contracts of a service:
+   * - SPHERE-linked services: the target of the synchronization policy;
+   * - manual services: `defaultVersion` when it is set (and still active);
+   * - otherwise the most recently created active version (`createdAt`).
+   * Versions are returned unescaped.
+   */
+  async newContractsPricing(
+    serviceName: string,
+    organizationId: string
+  ): Promise<{ version: string; source: 'sphere-policy' | 'default' | 'latest-active'; serviceName: string }> {
+    const service: LeanService | null = await this.serviceRepository.findByName(serviceName, organizationId);
+
+    if (!service) {
+      throw new Error(`NOT FOUND: Service with name ${serviceName}`);
+    }
+
+    if (service.source === 'sphere' && service.sphere?.target?.version) {
+      return { version: service.sphere.target.version, source: 'sphere-policy', serviceName: service.name };
+    }
+
+    if (service.defaultVersion && service.activePricings?.has(escapeVersion(service.defaultVersion))) {
+      return { version: resetEscapeVersion(escapeVersion(service.defaultVersion)), source: 'default', serviceName: service.name };
+    }
+
+    const latest = await this._latestActiveVersion(service);
+
+    if (!latest) {
+      throw new Error(`NOT FOUND: No active pricing version for service ${serviceName}`);
+    }
+
+    return { version: latest, source: 'latest-active', serviceName: service.name };
+  }
+
+  /**
+   * The most recently created active version of a service (unescaped), without
+   * loading the pricings: only `createdAt` of the locally stored ones is read.
+   * Versions without a known creation date (remote URL pricings, legacy
+   * documents) come after dated ones; ties are broken by version, descending
+   * (see `compareNewestFirst`), so the answer is deterministic.
+   */
+  async _latestActiveVersion(service: LeanService): Promise<string | null> {
+    const entries: [string, any][] = service.activePricings instanceof Map
+      ? Array.from(service.activePricings.entries())
+      : Object.entries(service.activePricings ?? {});
+    if (entries.length === 0) return null;
+
+    const ids = entries.map(([, entry]) => entry?.id).filter(Boolean).map(String);
+    const createdAt = await this.pricingRepository.findCreatedAtByIds(ids);
+    const candidates = entries.map(([version, entry]) => ({
+      version: resetEscapeVersion(version),
+      createdAt: entry?.id ? createdAt.get(String(entry.id)) : undefined,
+    }));
+
+    return candidates.sort(compareNewestFirst)[0].version;
   }
 
   /**
@@ -862,6 +940,25 @@ class ServiceService {
       dataToUpdate.name = newServiceData.name;
     }
 
+    if (service.source === 'sphere' && 'defaultVersion' in newServiceData) {
+      throw new Error('INVALID DATA: the version for new contracts of a SPHERE-linked service is decided by its synchronization policy');
+    }
+
+    if (newServiceData.defaultVersion === null) {
+      dataToUpdate.defaultVersion = undefined; // removes it
+    } else if (newServiceData.defaultVersion !== undefined) {
+      const escaped = escapeVersion(String(newServiceData.defaultVersion));
+      const active = service.activePricings instanceof Map
+        ? service.activePricings.has(escaped)
+        : Object.prototype.hasOwnProperty.call(service.activePricings ?? {}, escaped);
+      if (!active) {
+        throw new Error(
+          `INVALID DATA: defaultVersion ${newServiceData.defaultVersion} is not an active pricing version of service ${service.name}`
+        );
+      }
+      dataToUpdate.defaultVersion = resetEscapeVersion(escaped);
+    }
+
     if (newServiceData.organizationId && newServiceData.organizationId !== organizationId) {
       const organization = await this.organizationRepository.findById(
         newServiceData.organizationId
@@ -1023,6 +1120,10 @@ class ServiceService {
         {
           [`activePricings.${formattedPricingVersion}`]: undefined,
           [`archivedPricings.${formattedPricingVersion}`]: pricingLocator,
+          // An archived version cannot be the version for new contracts.
+          ...(service.defaultVersion && escapeVersion(service.defaultVersion) === formattedPricingVersion
+            ? { defaultVersion: undefined }
+            : {}),
         },
         organizationId
       );
@@ -1270,14 +1371,8 @@ class ServiceService {
   ): Promise<LeanPricing | null> {
     const pricings = await this.indexPricings(serviceName, 'active', organizationId);
 
-    const sortedPricings = pricings.sort((a, b) => {
-      // Sort by createdAt date (descending - newest first)
-      if (a.createdAt && b.createdAt) {
-        return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-      }
-
-      return 0;
-    });
+    // Newest first, with a deterministic tie-breaker (see compareNewestFirst).
+    const sortedPricings = pricings.sort(compareNewestFirst);
 
     return sortedPricings.length > 0 ? sortedPricings[0] : null;
   }
