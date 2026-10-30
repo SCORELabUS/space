@@ -31,6 +31,9 @@ const byUserId = (userId: string, organizationId: string): Record<string, unknow
   return { 'userContact.userId': userId, organizationId };
 };
 
+/** The maps of a contract that are keyed by service name. */
+export const SERVICE_MAPS = ['contractedServices', 'subscriptionPlans', 'subscriptionAddOns', 'usageLevels'] as const;
+
 /** Duplicate key error of the unique index { organizationId, userContact.userId }. */
 const isDuplicateKey = (error: any): boolean => error?.code === 11000;
 
@@ -171,6 +174,7 @@ class ContractRepository extends RepositoryBase {
 
     pipeline.push({ $skip: offset === 0 ? (page - 1) * limit : offset });
     pipeline.push({ $limit: Math.min(limit, 100) });
+    pipeline.push({ $unset: 'serviceRelocationOperationId' });
 
     const contracts = await ContractMongoose.aggregate(pipeline);
 
@@ -189,6 +193,10 @@ class ContractRepository extends RepositoryBase {
     const { pipeline } = buildMatchPipeline({ filters: { services: [serviceName] }, organizationId });
     const contracts = await ContractMongoose.aggregate(pipeline);
     return contracts.map(contract => toPlainObject<LeanContract>(contract));
+  }
+
+  async findForRelocation(id: string): Promise<any> {
+    return ContractMongoose.findById(id).select('+serviceRelocationOperationId').lean();
   }
 
   async findByUserId(userId: string, organizationId: string): Promise<LeanContract | null> {
@@ -281,62 +289,6 @@ class ContractRepository extends RepositoryBase {
     );
 
     return contract ? toPlainObject<LeanContract>(contract.toJSON()) : null;
-  }
-
-  async changeServiceName(oldServiceName: string, newServiceName: string, organizationId: string): Promise<number> {
-    const oldServiceKey = oldServiceName.toLowerCase();
-    const newServiceKey = newServiceName.toLowerCase();
-
-    const result = await ContractMongoose.updateMany(
-      {
-        organizationId,
-        [`contractedServices.${oldServiceKey}`]: { $exists: true }
-      },
-      [
-        {
-          $set: {
-            contractedServices: {
-              $arrayToObject: {
-                $map: {
-                  input: { $objectToArray: '$contractedServices' },
-                  as: 'item',
-                  in: {
-                    k: { $cond: [{ $eq: ['$$item.k', oldServiceKey] }, newServiceKey, '$$item.k'] },
-                    v: '$$item.v'
-                  }
-                }
-              }
-            },
-            subscriptionPlans: {
-              $arrayToObject: {
-                $map: {
-                  input: { $objectToArray: '$subscriptionPlans' },
-                  as: 'item',
-                  in: {
-                    k: { $cond: [{ $eq: ['$$item.k', oldServiceKey] }, newServiceKey, '$$item.k'] },
-                    v: '$$item.v'
-                  }
-                }
-              }
-            },
-            subscriptionAddOns: {
-              $arrayToObject: {
-                $map: {
-                  input: { $objectToArray: '$subscriptionAddOns' },
-                  as: 'item',
-                  in: {
-                    k: { $cond: [{ $eq: ['$$item.k', oldServiceKey] }, newServiceKey, '$$item.k'] },
-                    v: '$$item.v'
-                  }
-                }
-              }
-            }
-          }
-        }
-      ]
-    );
-
-    return result.modifiedCount;
   }
 
   /**
@@ -452,7 +404,7 @@ class ContractRepository extends RepositoryBase {
    * @returns the contract after the write, `contract` itself when it names
    *          none of the services, or null when the guard no longer held.
    */
-  async removeServicesFromContract(contract: LeanContract, serviceNames: string[]): Promise<LeanContract | null> {
+  async removeServicesFromContract(contract: LeanContract, serviceNames: string[], operationId?: string): Promise<LeanContract | null> {
     const names = new Set(serviceNames.map(name => name.toLowerCase()));
     const plain = (value: any): Record<string, any> =>
       value instanceof Map ? Object.fromEntries(value) : value ?? {};
@@ -490,12 +442,104 @@ class ContractRepository extends RepositoryBase {
       };
     }
 
+    if (operationId) update.$set = { ...(update.$set ?? {}), serviceRelocationOperationId: operationId };
     const written = await ContractMongoose.findOneAndUpdate(
       { ...contractVersionGuard(contract), ...byUserId(contract.userContact.userId, contract.organizationId) },
       update,
       { new: true }
     );
     return written ? toPlainObject<LeanContract>(written.toJSON()) : null;
+  }
+
+  /**
+   * For every contract of the organization that names the service in any of
+   * `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` or
+   * `usageLevels` (case-insensitively): its userId and the keys of those four
+   * maps. Not paginated; only keys are read, not the contracts.
+   */
+  async findServiceKeysOfContracts(
+    organizationId: string,
+    serviceName: string
+  ): Promise<{ userId: string; keys: Record<(typeof SERVICE_MAPS)[number], string[]> }[]> {
+    if (!organizationId) throw new Error('An organization is required to look for the contracts of a service');
+    const name = new RegExp(`^${escapeRegex(serviceName)}$`, 'i');
+    const keysOf = (field: string) => ({
+      $map: { input: { $objectToArray: { $ifNull: [`$${field}`, {}] } }, in: '$$this.k' },
+    });
+    const rows = await ContractMongoose.aggregate([
+      { $match: { organizationId } },
+      {
+        $project: {
+          _id: 0,
+          userId: '$userContact.userId',
+          ...Object.fromEntries(SERVICE_MAPS.map(field => [field, keysOf(field)])),
+        },
+      },
+      { $match: { $or: SERVICE_MAPS.map(field => ({ [field]: name })) } },
+    ]);
+    return rows.map(row => ({
+      userId: String(row.userId),
+      keys: Object.fromEntries(SERVICE_MAPS.map(field => [field, (row[field] ?? []).map(String)])) as any,
+    }));
+  }
+
+  /**
+   * Rename a service in one contract and/or move the contract to another
+   * organization, as it was read (`contract`). Renaming rewrites the keys of
+   * the service (compared case-insensitively) in `contractedServices`,
+   * `subscriptionPlans`, `subscriptionAddOns` and `usageLevels` to `name`
+   * (lowercased), keeping their values; moving sets `organizationId`.
+   *
+   * Targeted (an update pipeline over those fields only, evaluated on the
+   * stored document, so consumption recorded meanwhile is kept) and
+   * conditional on the version of the contract that was read
+   * (`contractVersionGuard`) and on its organization: when the contract
+   * changed in between, nothing is written and null is returned, so the caller
+   * re-reads and retries.
+   *
+   * @throws `CONFLICT:` when the target organization already has a contract
+   *         with this userId (unique index).
+   */
+  async renameOrMoveServiceInContract(
+    contract: LeanContract,
+    serviceName: string,
+    change: { name?: string; organizationId?: string },
+    operationId?: string
+  ): Promise<LeanContract | null> {
+    const from = serviceName.toLowerCase();
+    const $set: Record<string, unknown> = {};
+    if (change.name) {
+      const to = change.name.toLowerCase();
+      for (const field of SERVICE_MAPS) {
+        $set[field] = {
+          $arrayToObject: {
+            $map: {
+              input: { $objectToArray: { $ifNull: [`$${field}`, {}] } },
+              in: { k: { $cond: [{ $eq: [{ $toLower: '$$this.k' }, from] }, to, '$$this.k'] }, v: '$$this.v' },
+            },
+          },
+        };
+      }
+    }
+    if (change.organizationId) $set.organizationId = change.organizationId;
+    if (operationId) $set.serviceRelocationOperationId = { $literal: operationId };
+    if (Object.keys($set).length === 0) return contract;
+
+    try {
+      const written = await ContractMongoose.findOneAndUpdate(
+        { ...contractVersionGuard(contract), ...byUserId(contract.userContact.userId, contract.organizationId) },
+        [{ $set }],
+        { new: true }
+      );
+      return written ? toPlainObject<LeanContract>(written.toJSON()) : null;
+    } catch (error) {
+      if (isDuplicateKey(error)) {
+        throw new Error(
+          `CONFLICT: Organization ${change.organizationId} already has a contract for userId ${contract.userContact.userId}`
+        );
+      }
+      throw error;
+    }
   }
 
   /** userId, organization and contracted services of every contract of an organization (for events). */

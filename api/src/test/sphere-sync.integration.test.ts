@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import mongoose from 'mongoose';
 import nock from 'nock';
 import fs from 'node:fs/promises';
+import { AsyncResource } from 'node:async_hooks';
 const mocks = vi.hoisted(() => ({ cache: { del: vi.fn(async () => {}), get: vi.fn(async () => null), set: vi.fn(async () => {}) }, events: { emitPricingActivedMessage: vi.fn(), emitServiceDisabledMessage: vi.fn() } }));
 vi.mock('../main/config/container', async () => {
   const Repository = (await import('../main/repositories/mongoose/SphereSyncRepository')).default;
@@ -15,7 +16,7 @@ import Pricing from '../main/repositories/mongoose/models/PricingMongoose';
 import Contract from '../main/repositories/mongoose/models/ContractMongoose';
 import { SphereLease, SphereRun } from '../main/repositories/mongoose/models/SphereSyncMongoose';
 import { enforceSpherePolicy } from '../main/services/sphere/contractPolicy';
-import { withOrganizationLock } from '../main/services/sphere/lock';
+import { withOrganizationLock, withOrganizationLocks } from '../main/services/sphere/lock';
 import { featuresCachePattern } from '../main/utils/contracts/cacheKeys';
 import { pricingYamlFile } from '../main/services/pricingFiles';
 const id = '111111111111111111111111', one = '222222222222222222222222', two = '333333333333333333333333';
@@ -285,10 +286,22 @@ describe('SPHERE synchronization with isolated MongoDB', () => {
     });
     expect((await Service.findById(service.id).lean())?.disabled).toBe(false);
   });
-  it('excludes simultaneous organization writers' , async () => {
-    await withOrganizationLock('org', async () => {
-      await expect(withOrganizationLock('org', async () => {})).rejects.toThrow('busy');
+  it('allows nested ownership while excluding independent organization writers', async () => {
+    const competing = new AsyncResource('independent-organization-writer');
+    try {
+      await withOrganizationLock('org', async () => {
+        await expect(withOrganizationLock('org', async () => true)).resolves.toBe(true);
+        await expect(competing.runInAsyncScope(() => withOrganizationLock('org', async () => {}))).rejects.toThrow('busy');
+      });
+      await expect(withOrganizationLock('org', async () => true)).resolves.toBe(true);
+    } finally { competing.emitDestroy(); }
+  });
+  it('checks every acquired organization lease before a write', async () => {
+    const service = await create();
+    await withOrganizationLocks(['org', 'another'], async () => {
+      await SphereLease.updateOne({ _id: 'sphere:another' }, { $set: { owner: 'replacement' } });
+      await expect(Service.updateOne({ _id: service.id }, { $set: { disabled: true } })).rejects.toThrow('lock lost');
     });
-    await expect(withOrganizationLock('org', async () => true)).resolves.toBe(true);
+    expect((await Service.findById(service.id).lean())?.disabled).toBe(false);
   });
 });

@@ -1,3 +1,4 @@
+import { assertNoPendingRelocation } from '../serviceRelocationState';
 import SphereSyncRepository from '../../repositories/mongoose/SphereSyncRepository';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -87,6 +88,7 @@ export default class SphereSyncService {
       ? encryptSphereApiKey(config.sphereApiKey, this.credentialContext(serviceId, this.client.parseLink(config.permanentUrl).pricingId))
       : undefined;
     return withOrganizationLock(organizationId, async assertOwned => {
+      await assertNoPendingRelocation(organizationId);
       const manifest = await this.preview(config);
       const version = selectVersion(manifest, config);
       if (manifest.syntaxUpgrade && config.acceptedSyntaxUpgradeVersionId !== version.versionId) {
@@ -139,6 +141,7 @@ export default class SphereSyncService {
   async configure(organizationId: string, name: string, config: SphereConfiguration) {
     validateConfiguration(config);
     return withOrganizationLock(organizationId, async assertOwned => {
+      await assertNoPendingRelocation(organizationId);
       const service: any = await this.repository.service({ organizationId, name, source: 'sphere', disabled: false });
       if (!service) throw new Error('Linked service not found');
       if (service.sphere.status === 'applying') throw new Error('Synchronization is applying; retry after recovery');
@@ -165,6 +168,7 @@ export default class SphereSyncService {
   }
   async resume(organizationId: string, name: string) {
     return withOrganizationLock(organizationId, async assertOwned => {
+      await assertNoPendingRelocation(organizationId);
       const service: any = await this.repository.service({ organizationId, name, source: 'sphere' });
       if (!service) throw new Error('Linked service not found');
       if (service.sphere.status === 'applying') throw new Error('Synchronization is applying; retry after recovery');
@@ -179,6 +183,7 @@ export default class SphereSyncService {
     });
   }
   async enqueue(organizationId: string, name: string) {
+    await assertNoPendingRelocation(organizationId);
     if (!await this.repository.serviceExists({ organizationId, name, source: 'sphere', disabled: false })) throw new Error('Linked service not found');
     await this.repository.updateService({ organizationId, name, source: 'sphere', disabled: false, 'sphere.status': { $ne: 'applying' } },
       { $set: { 'sphere.nextCheckAt': new Date(), 'sphere.status': 'queued' } });
@@ -240,6 +245,7 @@ export default class SphereSyncService {
     const initial: any = await this.repository.service({ _id: id });
     if (!initial || initial.disabled || initial.source !== 'sphere') return;
     return withOrganizationLock(initial.organizationId, async assertOwned => {
+      await assertNoPendingRelocation(initial.organizationId);
       const service: any = await this.repository.service({ _id: id });
       if (!service || service.disabled || new Date(service.sphere.nextCheckAt ?? 0).getTime() > Date.now()) return;
       let run: any = service.sphere.status === 'applying' && service.sphere.runId ? await this.repository.run(service.sphere.runId) : null;

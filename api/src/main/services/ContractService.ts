@@ -1,5 +1,6 @@
 import ServiceModel from '../repositories/mongoose/models/ServiceMongoose';
 import ContractModel from '../repositories/mongoose/models/ContractMongoose';
+import { assertNoPendingRelocation, relocationGlobalLease } from './serviceRelocationState';
 import { withOrganizationLock } from './sphere/lock';
 import { enforceSpherePolicy } from './sphere/contractPolicy';
 import container from '../config/container';
@@ -170,8 +171,9 @@ class ContractService {
           }
         }
         const org = method === 'create' ? args[0]?.organizationId : method.endsWith('ByGroupId') ? args[1] : contract?.organizationId;
-        if (!org || !await ServiceModel.exists({ organizationId: org, source: 'sphere' })) return original(...args);
+        if (!org) return original(...args);
         return withOrganizationLock(org, async assertOwned => {
+          await assertNoPendingRelocation(org);
           if (await ServiceModel.exists({ organizationId: org, source: 'sphere', 'sphere.status': 'applying' })) throw new Error('Synchronization is applying; retry shortly');
           if (contract) await this.cacheService.del(contractCacheKey(contract.organizationId, contract.userContact.userId));
           await assertOwned();
@@ -179,9 +181,14 @@ class ContractService {
           const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
           for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
           return result;
-        });
+        }, 2000);
       };
     }
+    const prune = this.prune.bind(this);
+    this.prune = async (organizationId?: string) => withOrganizationLock(organizationId ?? relocationGlobalLease, async () => {
+      await assertNoPendingRelocation(organizationId);
+      return prune(organizationId);
+    }, 2000);
 
   }
 

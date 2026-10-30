@@ -115,6 +115,7 @@ class ServiceRepository extends RepositoryBase {
   }
 
   async update(name: string, data: any, organizationId: string) {
+    // Exact, case-insensitive and organization-bound.
     const query: any = { name: { $regex: `^${escapeRegex(name)}$`, $options: 'i' }, organizationId };
     if (organizationId) {
       query.organizationId = organizationId;

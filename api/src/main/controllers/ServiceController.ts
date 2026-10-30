@@ -1,3 +1,4 @@
+import { ServiceRelocationPendingError } from '../services/serviceRelocationState';
 import container from '../config/container.js';
 import { createHash } from 'node:crypto';
 import ServiceService, { PricingYamlUnavailableError, PricingYamlUpstreamError } from '../services/ServiceService.js';
@@ -41,6 +42,7 @@ class ServiceController {
 
       res.json(services);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       res.status(err.message === 'Invalid disabled filter' ? 400 : 500).send({ error: err.message });
     }
   }
@@ -70,6 +72,7 @@ class ServiceController {
 
       return res.json(pricings);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -91,6 +94,7 @@ class ServiceController {
 
       return res.json(service);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -124,6 +128,7 @@ class ServiceController {
 
       return res.json(pricing);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err instanceof PricingYamlUnavailableError) {
         res.status(404).send({ error: 'PRICING_YAML_UNAVAILABLE', message: err.message });
       } else if (err.message.toLowerCase().includes('not found')) {
@@ -160,6 +165,7 @@ class ServiceController {
 
       res.status(200).type('application/yaml; charset=utf-8').send(body);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err instanceof PricingYamlUnavailableError) {
         res.status(404).send({ error: 'PRICING_YAML_UNAVAILABLE', message: err.message });
       } else if (err instanceof PricingYamlUpstreamError) {
@@ -188,6 +194,7 @@ class ServiceController {
 
       res.json({ version, yamlUrl: pricingYamlUrl(req.params.organizationId, serviceName, version), source });
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -222,6 +229,7 @@ class ServiceController {
         requiresAuthentication: true,
       });
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -276,6 +284,7 @@ class ServiceController {
       }
       res.status(201).json(service);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (
         err.message.toLowerCase().includes('parsing') ||
         err.message.toLowerCase().includes('already exists') ||
@@ -319,6 +328,7 @@ class ServiceController {
 
       res.status(201).json(service);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('exists')) {
@@ -345,6 +355,7 @@ class ServiceController {
 
       res.json(service);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('invalid data')) {
         return res.status(400).send({ error: err.message });
       }
@@ -391,6 +402,7 @@ class ServiceController {
         res.json(service);
       }
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('last active pricing')) {
@@ -420,6 +432,7 @@ class ServiceController {
       const result = await this.serviceService.prune(organizationId);
       res.json({ message: `Pruned ${result ?? 0} services` });
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.startsWith('CONFLICT')) {
         res.status(409).send({ error: err.message });
       } else {
@@ -445,6 +458,7 @@ class ServiceController {
         res.status(404).send({ error: 'Service not found' });
       }
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -471,6 +485,7 @@ class ServiceController {
         res.status(404).send({ error: 'Pricing not found' });
       }
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (
         err.message.toLowerCase().includes('not found') ||
         err.message.toLowerCase().includes('invalid')
