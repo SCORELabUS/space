@@ -13,6 +13,7 @@ import { LeanOrganization } from '../main/types/models/Organization';
 import Contract from '../main/repositories/mongoose/models/ContractMongoose';
 import Service from '../main/repositories/mongoose/models/ServiceMongoose';
 import Pricing from '../main/repositories/mongoose/models/PricingMongoose';
+import Organization from '../main/repositories/mongoose/models/OrganizationMongoose';
 import { ServiceRelocation, ServiceRelocationStep } from '../main/repositories/mongoose/models/ServiceRelocationMongoose';
 import { PETCLINIC_BASE_VERSION, uploadPetclinicService, writePetclinicVariant } from './utils/services/petclinicVersions';
 
@@ -172,6 +173,60 @@ describe('Service relocation recovery', () => {
     expect((await pending()).stage).toBe('contracts'); fault.mockRestore();
     const resumed = await update(); expect(resumed.status, JSON.stringify(resumed.body)).toBe(200);
     expect(JSON.stringify(resumed.body)).not.toContain('serviceRelocationOperationId'); await expectComplete();
+  });
+
+  it.each(['source', 'target'] as const)('rechecks revoked %s permission before resuming a persisted move', async revokedSide => {
+    // Stop after the service itself has moved: recovery must still use the
+    // original route, whose source and requested target need fresh authority.
+    const repository: any = container.resolve('serviceRepository'), original = repository.update.bind(repository);
+    const fault = vi.spyOn(repository, 'update').mockImplementationOnce(async (...args: any[]) => {
+      await original(...args); throw new Error('Injected move awaiting authorized recovery');
+    });
+    expect((await update()).status).toBe(500);
+    expect(await Service.findById(serviceId).lean()).toMatchObject({ name: TO, organizationId: target.id });
+    const operation = await pending();
+    expect(operation).not.toBeNull();
+    fault.mockRestore();
+
+    const recoveryState = () => Promise.all([
+      ServiceRelocation.findById(operation._id).lean(),
+      ServiceRelocationStep.find({ operationId: operation._id }).sort({ _id: 1 }).lean(),
+      Service.findById(serviceId).lean(),
+      Pricing.find({ _id: { $in: pricingIds } }).sort({ _id: 1 }).lean(),
+      Contract.find({ 'userContact.userId': { $in: [...singles, mixed] } }).select('+serviceRelocationOperationId').sort({ _id: 1 }).lean(),
+    ]);
+    const pausedState = await recoveryState();
+    const changedOrganization = revokedSide === 'source' ? source : target;
+    const organizationBefore: any = await Organization.findById(changedOrganization.id).lean();
+    const replacement = await createTestUser('USER', `replacement_${uuidv4()}`);
+    const execution = vi.spyOn(container.resolve('serviceService'), 'update');
+    try {
+      await Organization.updateOne({ _id: changedOrganization.id }, { $set: {
+        owner: replacement.username,
+        // A MANAGER may ordinarily update the source, but cannot move out;
+        // an EVALUATOR may read the target, but cannot receive a moved service.
+        members: [{ username: owner.username, role: revokedSide === 'source' ? 'MANAGER' : 'EVALUATOR' }],
+      } });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const denied = await update();
+        expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+        expect(denied.body.error).toContain('moving a service');
+        expect(await recoveryState()).toEqual(pausedState);
+      }
+      expect(execution).not.toHaveBeenCalled();
+
+      await Organization.updateOne({ _id: changedOrganization.id }, { $set: {
+        owner: organizationBefore.owner, members: organizationBefore.members,
+      } });
+      const resumed = await update();
+      expect(resumed.status, JSON.stringify(resumed.body)).toBe(200);
+      await expectComplete();
+    } finally {
+      await Organization.updateOne({ _id: changedOrganization.id }, { $set: {
+        owner: organizationBefore.owner, members: organizationBefore.members,
+      } });
+      await deleteTestUser(replacement.username);
+    }
   });
 
   it('rejects changed or omitted destinations, target-only retries and new bindings while pending', async () => {

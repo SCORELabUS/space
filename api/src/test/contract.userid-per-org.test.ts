@@ -701,7 +701,7 @@ describe('Contract userId unique per organization', function () {
       expect(firstPage).toHaveLength(20);
       expect(firstPage.some((contract: LeanContract) => contract.userContact.userId === shared)).toBe(false);
 
-      const move = await request(app).put(`${baseUrl}/services/${zoomName}`).set('x-api-key', keyA)
+      const move = await request(app).put(`${baseUrl}/organizations/${orgA.id}/services/${zoomName}`).set('x-api-key', admin.apiKey)
         .send({ organizationId: orgB.id });
       expect(move.status, JSON.stringify(move.body)).toBe(409);
       expect(move.body.error).toContain(shared);
