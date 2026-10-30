@@ -12,14 +12,22 @@ const ISO_8601_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 type Emitted = { namespace: string; room?: string; event: string; payload: any };
 
-const recorder = (emitted: Emitted[]) => ({
-  of: (namespace: string) => ({
-    to: (room: string) => ({
-      emit: (event: string, payload: any) => emitted.push({ namespace, room, event, payload }),
+const recorder = (emitted: Emitted[]) => {
+  const socket = {
+    id: 'socket-1',
+    data: { organizationId: 'org-1' },
+    connected: true,
+    emit: (event: string, payload: any) => emitted.push({
+      namespace: '/contracts', room: 'organization:org-1', event, payload,
     }),
+    disconnect() { this.connected = false; },
+  };
+  const namespaces = new Map(['/contracts', '/pricings'].map(namespace => [namespace, {
+    sockets: new Map(namespace === '/contracts' ? [[socket.id, socket]] : []),
     emit: (event: string, payload: any) => emitted.push({ namespace, event, payload }),
-  }),
-});
+  }]));
+  return { socket, io: { of: (namespace: string) => namespaces.get(namespace)! } };
+};
 
 const contract = () => ({
   userContact: { userId: 'user-1', username: 'user-1' },
@@ -52,16 +60,20 @@ describe('EventService event ids', () => {
   beforeEach(() => {
     service = new EventService();
     emitted = [];
-    (service as any).io = recorder(emitted);
+    const { io, socket } = recorder(emitted);
+    (service as any).io = io;
+    (service as any).contractAuthorizers.set(socket, async () => 'org-1');
   });
 
-  it('adds eventId and occurredAt to every contract event, keeping code and details', () => {
+  it('adds eventId and occurredAt to every contract event, keeping code and details', async () => {
     const before = Date.now();
     for (const code of ['CONTRACT_CREATED', 'CONTRACT_NOVATED', 'CONTRACT_RENEWED'] as const) {
       service.emitContractEvent(code, contract());
     }
     service.emitContractEvent('CONTRACT_DELETED', contract(), { deleted: true });
     const after = Date.now();
+    expect(emitted).toHaveLength(0);
+    await (service as any).contractDelivery;
 
     expect(emitted.map(e => e.payload.code)).toEqual([
       'CONTRACT_CREATED',
@@ -81,10 +93,11 @@ describe('EventService event ids', () => {
     expect(emitted[3].payload.details.contractVersion).toBeNull();
   });
 
-  it('uses the time of the persisted change when the caller gives it', () => {
+  it('uses the time of the persisted change when the caller gives it', async () => {
     const persistedAt = new Date('2026-10-27T10:00:00.123Z');
 
     service.emitContractEvent('CONTRACT_NOVATED', contract(), { occurredAt: persistedAt });
+    await (service as any).contractDelivery;
 
     expect(emitted[0].payload.occurredAt).toBe('2026-10-27T10:00:00.123Z');
   });
@@ -113,12 +126,13 @@ describe('EventService event ids', () => {
     }
   });
 
-  it('gives every event its own id', () => {
+  it('gives every event its own id', async () => {
     for (let i = 0; i < 500; i++) {
       service.emitContractEvent('CONTRACT_NOVATED', contract());
       service.emitPricingCreatedMessage('petclinic', String(i));
     }
 
+    await (service as any).contractDelivery;
     const ids = emitted.map(e => e.payload.eventId);
     expect(ids).toHaveLength(1000);
     expect(new Set(ids).size).toBe(1000);
