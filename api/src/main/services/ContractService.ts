@@ -1114,43 +1114,35 @@ class ContractService {
       if (ceiling !== null) ceilings[`${serviceName}.${usageLimit}`] = ceiling;
     }
 
-    const updatedContract = await this.contractRepository.incrementUsageLevels(userId, increments, organizationId, {
-      ceilings,
-      guard: options.contract ? contractVersionGuard(options.contract) : undefined,
-    });
-
-    if (!updatedContract) {
-      return this._explainRejectedConsumption(userId, targets, organizationId, options.contract);
-    }
-
-    let consumptionId: string | undefined;
-    if (options.featureId) {
-      consumptionId = randomUUID();
-      const createdAt = new Date();
+    // Persist the intent before touching usage. The atomic increment carries
+    // its receipt; an ambiguous write is never compensated against a newer
+    // billing period, subscription, or recreated contract.
+    const source = options.contract ?? await this.contractRepository.findByUserId(userId, organizationId);
+    if (!source) throw new Error(`Contract with userId ${userId} not found`);
+    const consumptionId = options.featureId ? randomUUID() : undefined;
+    const createdAt = new Date(), expiresAt = new Date(createdAt.getTime() + consumptionRetentionSeconds() * 1000);
+    const resetTimeStamps = Object.fromEntries(targets.map(({ serviceName, usageLimit }) =>
+      [`${serviceName}.${usageLimit}`, source.usageLevels?.[serviceName]?.[usageLimit]?.resetTimeStamp ?? null]));
+    if (consumptionId) {
       try {
-        await this.usageConsumptionRepository.create({
-          id: consumptionId,
-          contractId: updatedContract.id,
-          organizationId,
-          userId,
-          featureId: normalizeFeatureId(options.featureId),
-          levels: targets.map(({ serviceName, usageLimit, amount }) => {
-            const resetTimeStamp = updatedContract.usageLevels[serviceName][usageLimit].resetTimeStamp;
-            return { serviceName, usageLimit, amount, resetTimeStamp: resetTimeStamp ? new Date(resetTimeStamp) : null };
-          }),
-          createdAt,
-          expiresAt: new Date(createdAt.getTime() + consumptionRetentionSeconds() * 1000),
-        });
+        await this.usageConsumptionRepository.create({ id: consumptionId, contractId: source.id, state: 'prepared',
+          organizationId, userId, featureId: normalizeFeatureId(options.featureId!), createdAt, expiresAt,
+          levels: targets.map(({ serviceName, usageLimit, amount }) => ({ serviceName, usageLimit, amount,
+            resetTimeStamp: resetTimeStamps[`${serviceName}.${usageLimit}`] ? new Date(resetTimeStamps[`${serviceName}.${usageLimit}`]!) : null })) });
       } catch (error) {
-        // Without its record the consumption could not be reverted: take it
-        // back and report the failure, rather than answer with an id that
-        // does not exist.
-        const negated = Object.fromEntries(Object.entries(increments).map(([path, amount]) => [path, -amount]));
-        await this.contractRepository.incrementUsageLevels(userId, negated, organizationId);
-        await this.cacheService.del(contractCacheKey(organizationId, userId));
-        throw error;
+        // A response lost after insert does not mean the durable intent is absent.
+        if (!await this.usageConsumptionRepository.find(consumptionId, { organizationId, userId, featureId: normalizeFeatureId(options.featureId!) })) throw error;
       }
     }
+    const updatedContract = await this.contractRepository.incrementUsageLevels(userId, increments, organizationId, {
+      ceilings, guard: contractVersionGuard(source),
+      ...(consumptionId ? { receipt: { id: consumptionId, expiresAt, contractId: source.id, resetTimeStamps } } : {}),
+    });
+    if (!updatedContract) {
+      if (consumptionId) await this.usageConsumptionRepository.delete(consumptionId);
+      return this._explainRejectedConsumption(userId, targets, organizationId, source);
+    }
+    if (consumptionId) await this.usageConsumptionRepository.applied(consumptionId);
 
     // Invalidate rather than restore a snapshot that a concurrent novation replaced.
     await this.cacheService.del(contractCacheKey(organizationId, userId));
@@ -1243,6 +1235,10 @@ class ContractService {
 
     // Refused before it is claimed, so that it is never seen as reverted.
     const existing = await this.usageConsumptionRepository.find(consumptionId, scope);
+    if (existing?.state === 'prepared') {
+      if (!await this.contractRepository.hasUsageConsumption(userId, organizationId, consumptionId, existing.contractId)) throw new Error(`Consumption ${consumptionId} not found for this contract`);
+      await this.usageConsumptionRepository.applied(consumptionId);
+    }
     if (existing && !existing.revertedAt && !await this.contractRepository.hasUsageRevert(userId, organizationId, existing.id, existing.contractId)) {
       const stored = await this.contractRepository.findByUserId(userId, organizationId);
       if (stored) this._resolveConsumption(existing, stored);
@@ -1251,7 +1247,11 @@ class ContractService {
     const claimed = await this.usageConsumptionRepository.claim(consumptionId, scope);
     if (!claimed) {
       const existing = await this.usageConsumptionRepository.find(consumptionId, scope);
-      if (existing?.revertedAt) return null;
+      if (existing?.revertedAt) {
+        await this.cacheService.del(contractCacheKey(organizationId, userId));
+        await this.cacheService.del(featuresCachePattern(organizationId, userId));
+        return null;
+      }
       throw new Error(`Consumption ${consumptionId} not found for userId ${userId} and feature ${featureId}`);
     }
 
@@ -1378,6 +1378,7 @@ class ContractService {
         if (done) {
           await this.usageConsumptionRepository.complete(consumption.id);
           await this.cacheService.del(contractCacheKey(organizationId, userId));
+          await this.cacheService.del(featuresCachePattern(organizationId, userId));
           return skipped.length === 0 ? null : { consumptionId: consumption.id,
             reverted: Object.fromEntries(present.map(({ serviceName, usageLimit, amount }) => [`${serviceName}-${usageLimit}`, amount])),
             skipped: skipped.map(({ serviceName, usageLimit }) => `${serviceName}-${usageLimit}`) };
@@ -1388,6 +1389,7 @@ class ContractService {
     }
     await this.usageConsumptionRepository.complete(consumption.id);
     await this.cacheService.del(contractCacheKey(organizationId, userId));
+    await this.cacheService.del(featuresCachePattern(organizationId, userId));
     return null;
   }
 

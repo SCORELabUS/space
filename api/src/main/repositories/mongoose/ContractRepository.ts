@@ -175,7 +175,7 @@ class ContractRepository extends RepositoryBase {
 
     pipeline.push({ $skip: offset === 0 ? (page - 1) * limit : offset });
     pipeline.push({ $limit: Math.min(limit, 100) });
-    pipeline.push({ $unset: ['serviceRelocationOperationId', 'usageRevertReceipts'] });
+    pipeline.push({ $unset: ['serviceRelocationOperationId', 'usageRevertReceipts', 'usageConsumptionReceipts'] });
 
     const contracts = await ContractMongoose.aggregate(pipeline);
 
@@ -381,7 +381,11 @@ class ContractRepository extends RepositoryBase {
     userId: string,
     increments: Record<string, number>,
     organizationId: string,
-    options: { ceilings?: Record<string, number>; guard?: Record<string, unknown> } = {}
+    options: {
+      ceilings?: Record<string, number>;
+      guard?: Record<string, unknown>;
+      receipt?: { id: string; expiresAt: Date; contractId?: string; resetTimeStamps?: Record<string, Date | null> };
+    } = {}
   ): Promise<LeanContract | null> {
     const { $expr: guardExpr, ...guard } = options.guard ?? {};
     const filter: Record<string, unknown> = { ...guard, ...byUserId(userId, organizationId) };
@@ -396,17 +400,42 @@ class ContractRepository extends RepositoryBase {
         // Evaluated by the database on the stored value: consumed + amount <= ceiling.
         bounds.push({ $lte: [{ $add: [`$usageLevels.${path}.consumed`, amount] }, ceiling] });
       }
+      if (options.receipt?.resetTimeStamps && Object.prototype.hasOwnProperty.call(options.receipt.resetTimeStamps, path)) {
+        // Null matches a non-renewable level (missing or explicit null).
+        filter[`usageLevels.${path}.resetTimeStamp`] = options.receipt.resetTimeStamps[path] ?? null;
+      }
     }
 
     if (bounds.length > 0) filter.$expr = { $and: bounds };
 
-    const contract = await ContractMongoose.findOneAndUpdate(
-      filter,
-      { $inc: inc },
-      { new: true }
-    );
+    let update: any = { $inc: inc };
+    if (options.receipt) {
+      const { id, expiresAt, contractId } = options.receipt;
+      const key = createHash('sha256').update(id).digest('hex');
+      filter[`usageConsumptionReceipts.${key}`] = { $exists: false };
+      if (contractId) filter._id = contractId;
+      // The private receipt and increment are ONE write. A lost acknowledgement
+      // cannot reapply the same consumption; unrelated expired receipts are pruned.
+      const set = Object.fromEntries(Object.entries(inc).map(([path, amount]) => [path, { $add: [`$${path}`, amount] }]));
+      update = [
+        { $set: { usageConsumptionReceipts: { $arrayToObject: { $filter: {
+          input: { $objectToArray: { $ifNull: ['$usageConsumptionReceipts', {}] } },
+          as: 'receipt', cond: { $gt: ['$$receipt.v', new Date()] },
+        } } } } },
+        { $set: { ...set, [`usageConsumptionReceipts.${key}`]: expiresAt } },
+      ];
+    }
 
+    const contract = await ContractMongoose.findOneAndUpdate(filter, update, { new: true });
     return contract ? toPlainObject<LeanContract>(contract.toJSON()) : null;
+  }
+
+  async hasUsageConsumption(userId: string, organizationId: string, consumptionId: string, contractId?: string): Promise<boolean> {
+    const key = createHash('sha256').update(consumptionId).digest('hex');
+    return Boolean(await ContractMongoose.exists({
+      ...byUserId(userId, organizationId), ...(contractId ? { _id: contractId } : {}),
+      [`usageConsumptionReceipts.${key}`]: { $exists: true },
+    }));
   }
 
   /**

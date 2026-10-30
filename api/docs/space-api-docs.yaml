@@ -87,11 +87,19 @@ info:
     last two minutes, in the same way; it used to restore a cached snapshot of the level, which also undid
     everything recorded after it.
 
+    Consumption intent is persisted before its atomic increment. Private, expiring receipts are written in
+    the same contract update as the increment or refund; interrupted acknowledgements can be recovered
+    without compensating against a newer billing period or subtracting twice. Cache failures never reopen
+    an applied refund. The original contract identity is checked, so recreating the same userId does not
+    make old records refundable against a new contract. The deprecated two-minute lookup also excludes
+    expired records, even before MongoDB TTL cleanup removes them.
+
     Consumption records follow their service: renaming a service, or moving it to another organization,
     rewrites the records of the contracts it rewrites (the service name, and the organization of the
     contracts that move with it), so a revert by `consumptionId` keeps subtracting exactly what was consumed,
     addressed with the new feature id (`<new service>-<feature>`) from the organization the contract is in
-    now. Records of a contract that stays and loses the moved service, and of deleted services (prune,
+    now. These record updates participate in the recoverable relocation steps, so a retry after a partial
+    relocation completes them without repeating contract mutations. Records of a contract that stays and loses the moved service, and of deleted services (prune,
     destroy: exact name, case-insensitively, in that organization only), are deleted (`404`).
 
     Each usage level of a consumption is reverted on the service it belongs to:

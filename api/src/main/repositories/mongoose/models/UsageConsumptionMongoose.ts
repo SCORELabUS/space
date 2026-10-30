@@ -30,6 +30,7 @@ const usageConsumptionSchema = new Schema(
     levels: { type: [consumedLevelSchema], required: true },
     createdAt: { type: Date, required: true },
     expiresAt: { type: Date, required: true },
+    state: { type: String, enum: ['prepared', 'applied'], default: 'applied' },
     contractId: { type: String },
     revertRequestedAt: { type: Date },
     revertedAt: { type: Date },

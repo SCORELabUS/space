@@ -10,6 +10,7 @@ export interface ConsumedLevel {
 export interface UsageConsumption {
   id: string;
   contractId?: string;
+  state?: 'prepared' | 'applied';
   organizationId: string;
   userId: string;
   featureId: string;
@@ -28,6 +29,7 @@ export interface ConsumptionScope {
 
 const toConsumption = (doc: any): UsageConsumption => ({
   id: String(doc._id),
+  state: doc.state ?? 'applied',
   ...(doc.contractId ? { contractId: doc.contractId } : {}),
   organizationId: doc.organizationId,
   userId: doc.userId,
@@ -81,6 +83,7 @@ class UsageConsumptionRepository {
     await UsageConsumptionMongoose.create({
       _id: consumption.id,
       contractId: consumption.contractId,
+      state: consumption.state ?? 'applied',
       organizationId: consumption.organizationId,
       userId: consumption.userId,
       featureId: consumption.featureId,
@@ -98,7 +101,7 @@ class UsageConsumptionRepository {
   /** Claim this consumption for a revert; null when it does not exist (in this scope) or was already completed. */
   async claim(id: string, scope: ConsumptionScope): Promise<UsageConsumption | null> {
     const doc = await UsageConsumptionMongoose.findOneAndUpdate(
-      { _id: id, ...scopeFilter(scope), revertedAt: { $exists: false }, expiresAt: { $gt: new Date() } },
+      { _id: id, ...scopeFilter(scope), state: { $ne: 'prepared' }, revertedAt: { $exists: false }, expiresAt: { $gt: new Date() } },
       { $set: { revertRequestedAt: new Date() } },
       { new: true }
     ).lean();
@@ -111,7 +114,7 @@ class UsageConsumptionRepository {
    */
   async claimRecent(scope: ConsumptionScope, since: Date, latest: boolean): Promise<UsageConsumption | null> {
     const doc = await UsageConsumptionMongoose.findOneAndUpdate(
-      { ...scopeFilter(scope), revertedAt: { $exists: false }, createdAt: { $gte: since } },
+      { ...scopeFilter(scope), state: { $ne: 'prepared' }, revertedAt: { $exists: false }, expiresAt: { $gt: new Date() }, createdAt: { $gte: since } },
       { $set: { revertRequestedAt: new Date() } },
       { new: true, sort: { createdAt: latest ? -1 : 1, _id: latest ? -1 : 1 } }
     ).lean();
@@ -119,6 +122,10 @@ class UsageConsumptionRepository {
   }
 
   /** Give a claim back, when the revert could not be applied (so that it can be retried). */
+  async applied(id: string): Promise<void> {
+    await UsageConsumptionMongoose.updateOne({ _id: id }, { $set: { state: 'applied' } });
+  }
+
   async complete(id: string): Promise<void> {
     await UsageConsumptionMongoose.updateOne({ _id: id, revertedAt: { $exists: false } }, { $set: { revertedAt: new Date() } });
   }

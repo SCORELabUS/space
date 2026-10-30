@@ -13,6 +13,7 @@ import { LeanOrganization } from '../main/types/models/Organization';
 import Contract from '../main/repositories/mongoose/models/ContractMongoose';
 import Service from '../main/repositories/mongoose/models/ServiceMongoose';
 import Pricing from '../main/repositories/mongoose/models/PricingMongoose';
+import UsageConsumption from '../main/repositories/mongoose/models/UsageConsumptionMongoose';
 import Organization from '../main/repositories/mongoose/models/OrganizationMongoose';
 import { ServiceRelocation, ServiceRelocationStep } from '../main/repositories/mongoose/models/ServiceRelocationMongoose';
 import { PETCLINIC_BASE_VERSION, uploadPetclinicService, writePetclinicVariant } from './utils/services/petclinicVersions';
@@ -59,6 +60,7 @@ describe('Service relocation recovery', () => {
     await ServiceRelocationStep.deleteMany({ operationId: { $in: operations.map(operation => operation._id) } });
     await ServiceRelocation.deleteMany({ _id: { $in: operations.map(operation => operation._id) } });
     for (const org of [source, target]) {
+      await UsageConsumption.deleteMany({ organizationId: org.id });
       await Contract.deleteMany({ organizationId: org.id }); await Pricing.deleteMany({ _organizationId: org.id });
       await Service.deleteMany({ organizationId: org.id }); await deleteTestOrganization(org.id!);
     }
@@ -250,4 +252,39 @@ describe('Service relocation recovery', () => {
     expect(await Service.countDocuments({ source: 'sphere', organizationId: target.id })).toBe(0);
     const resumed = await update(); expect(resumed.status, JSON.stringify(resumed.body)).toBe(200); await expectComplete();
   });
+  it('replays consumption-record relocation after the contract and record writes survived a failed effects step', async () => {
+    const targetKey = generateOrganizationApiKey();
+    await addApiKeyToOrganization(target.id!, { key: targetKey, scope: 'ALL' });
+    const records = new Map<string, string>();
+    for (const userId of [...singles, mixed]) {
+      const id = uuidv4(); records.set(userId, id);
+      await UsageConsumption.create({ _id: id, contractId: String(before.get(userId)._id), organizationId: source.id,
+        userId, featureId: `${OLD}-pets`, levels: [{ serviceName: OLD, usageLimit: 'maxPets', amount: 2, resetTimeStamp: null }],
+        createdAt: new Date(), expiresAt: new Date(Date.now() + 86_400_000) });
+    }
+    const repository: any = container.resolve('usageConsumptionRepository'), original = repository.renameOrMoveService.bind(repository);
+    let injected = false; const rewritten: number[] = [];
+    vi.spyOn(repository, 'renameOrMoveService').mockImplementation(async (...args: any[]) => {
+      const count = await original(...args); rewritten.push(count);
+      if (!injected) { injected = true; throw new Error('Injected failure after consumption-record relocation'); }
+      return count;
+    });
+    const failed = await update(); expect(failed.status, JSON.stringify(failed.body)).toBe(500);
+    expect(injected).toBe(true); expect(await pending()).not.toBeNull();
+    const recovered = await update(); expect(recovered.status, JSON.stringify(recovered.body)).toBe(200);
+    await expectComplete();
+    expect(rewritten.filter(count => count > 0)).toEqual([1, 1]);
+    expect(rewritten).toContain(0); // Replaying the already moved record is a no-op.
+    for (const userId of singles) {
+      const id = records.get(userId)!;
+      expect(await UsageConsumption.findById(id).lean()).toMatchObject({ organizationId: target.id, userId,
+        featureId: `${NEW}-pets`, levels: [{ serviceName: NEW, usageLimit: 'maxPets', amount: 2 }] });
+      const requestRevert = () => request(app).post(`${baseUrl}/features/${userId}/${NEW}-pets?revert=true&consumptionId=${id}`).set('x-api-key', targetKey);
+      expect((await requestRevert()).status).toBe(204);
+      expect((await requestRevert()).status).toBe(204);
+      expect((await stored(userId)).usageLevels[NEW].maxPets.consumed).toBe(before.get(userId).usageLevels[OLD].maxPets.consumed - 2);
+    }
+    expect(await UsageConsumption.findById(records.get(mixed)).lean()).toBeNull();
+  });
+
 });
