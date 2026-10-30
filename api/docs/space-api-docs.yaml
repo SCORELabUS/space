@@ -91,6 +91,8 @@ info:
     - `reject-private`: the opt-in `rejectPrivate` option (query or body) of contract creation and novations, which rejects private plans and add-ons.
     - `pricing-yaml`: `GET .../pricings/{version}?format=yaml` returns the stored Pricing2Yaml file.
     - `new-contracts-version`: `GET .../pricings/new-contracts` and the optional service `defaultVersion`.
+    - `contract-pricings`: `GET /contracts/{userId}/pricings`.
+    - `novation-preview`: `POST /contracts/{userId}/novation/preview`.
 
   contact:
     email: agarcia29@us.es
@@ -3313,6 +3315,97 @@ paths:
         '404':
           $ref: '#/components/responses/ContractNotFound'
 
+  /organizations/{organizationId}/contracts/{userId}/novation/preview:
+    post:
+      summary: Preview a novation (dry run)
+      description: |
+        Runs exactly what `PUT /contracts/{userId}` would run with the same body and options - resolution of the
+        pricing versions (omitted services keep the contract's version or get the version for new contracts),
+        SPHERE policies, subscription validation (with the codes of `InvalidSubscription`) and the billing period
+        (`keepBillingPeriod`) - and writes nothing. An invalid configuration still answers `200`, with
+        `valid: false` and `errors`. Limits below the current consumption are reported as `usageWarnings` (they do
+        not make the novation invalid). Feature/limit diffs and prices are not computed by SPACE.
+
+        Send `contractVersion` back in `If-Match` when applying the change.
+
+        **Authentication**: User API Key
+
+        **Permission**: organization member with role OWNER, ADMIN or MANAGER, or ADMIN user (as for the novation)
+
+      tags:
+        - Contracts
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
+      responses:
+        '200':
+          description: What the novation would do
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NovationPreview'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '409':
+          description: A SPHERE synchronization is being applied; retry shortly
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /organizations/{organizationId}/contracts/{userId}/pricings:
+    get:
+      summary: Pricing versions of a contract
+      description: |
+        For each contracted service: the pricing version of the contract, whether it is still active, where to get
+        its Pricing2Yaml file, the version new contracts get (see `GET .../pricings/new-contracts`) and the
+        subscribed plan and add-ons; plus the `contractVersion` to send back in `If-Match` when novating.
+        Organization scoping as for `GET /contracts/{userId}`.
+
+        **Authentication**: User API Key
+
+        **Permission**: organization member with any role (OWNER/ADMIN/MANAGER/EVALUATOR), or ADMIN user
+
+      tags:
+        - Contracts
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pricing versions of the contract
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContractPricings'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+
   /contracts:
     get:
       summary: List all contracts
@@ -3747,6 +3840,87 @@ paths:
       responses:
         '204':
           description: Contract deleted
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+
+  /contracts/{userId}/novation/preview:
+    post:
+      summary: Preview a novation (dry run)
+      description: |
+        Runs exactly what `PUT /contracts/{userId}` would run with the same body and options - resolution of the
+        pricing versions (omitted services keep the contract's version or get the version for new contracts),
+        SPHERE policies, subscription validation (with the codes of `InvalidSubscription`) and the billing period
+        (`keepBillingPeriod`) - and writes nothing. An invalid configuration still answers `200`, with
+        `valid: false` and `errors`. Limits below the current consumption are reported as `usageWarnings` (they do
+        not make the novation invalid). Feature/limit diffs and prices are not computed by SPACE.
+
+        Send `contractVersion` back in `If-Match` when applying the change.
+
+        **Authentication**: User API Key (ADMIN) | Organization API Key
+
+        **Organization Permission**: ALL or MANAGEMENT scope (as for `PUT /contracts/{userId}`)
+
+      tags:
+        - Contracts
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
+      responses:
+        '200':
+          description: What the novation would do
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NovationPreview'
+        '404':
+          $ref: '#/components/responses/ContractNotFound'
+        '409':
+          description: A SPHERE synchronization is being applied; retry shortly
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /contracts/{userId}/pricings:
+    get:
+      summary: Pricing versions of a contract
+      description: |
+        For each contracted service: the pricing version of the contract, whether it is still active, where to get
+        its Pricing2Yaml file, the version new contracts get (see `GET .../pricings/new-contracts`) and the
+        subscribed plan and add-ons; plus the `contractVersion` to send back in `If-Match` when novating.
+        Organization scoping as for `GET /contracts/{userId}`.
+
+        **Authentication**: User API Key (ADMIN) | Organization API Key
+
+        **Organization Permission**: ALL or MANAGEMENT scope (same as `GET /contracts/{userId}`)
+
+      tags:
+        - Contracts
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pricing versions of the contract
+          headers:
+            ETag:
+              $ref: '#/components/headers/ContractETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContractPricings'
         '404':
           $ref: '#/components/responses/ContractNotFound'
 
@@ -4739,6 +4913,159 @@ components:
         contractVersion:
           $ref: '#/components/schemas/ContractVersion'
 
+    NovationPreview:
+      type: object
+      required: [valid, errors, effective, versionChanges, usageWarnings, billingPeriod, contractVersion]
+      properties:
+        valid:
+          type: boolean
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/SubscriptionError'
+        effective:
+          type: object
+          description: The subscription the novation would store (service keys lowercase, versions unescaped).
+          properties:
+            contractedServices:
+              $ref: '#/components/schemas/ContractedService'
+            subscriptionPlans:
+              $ref: '#/components/schemas/SubscriptionPlans'
+            subscriptionAddOns:
+              $ref: '#/components/schemas/SubscriptionAddons'
+        versionChanges:
+          type: object
+          description: |
+            Services whose pricing version would change. `reason`: `requested` (from `contractedServices`),
+            `new-contracts-version` (a service the contract did not have, without an explicit version) or
+            `policy:<all_last|new_last|all_pick|new_pick>` (decided by the SPHERE synchronization policy).
+          additionalProperties:
+            type: object
+            required: [from, to, reason]
+            properties:
+              from:
+                type: string
+                nullable: true
+              to:
+                type: string
+              reason:
+                type: string
+        usageWarnings:
+          type: array
+          items:
+            type: object
+            required: [service, usageLimit, consumed, newLimit]
+            properties:
+              service:
+                type: string
+              usageLimit:
+                type: string
+              consumed:
+                type: number
+              newLimit:
+                type: number
+                description: Plan value, overridden by add-on usageLimits, plus usageLimitsExtensions x quantity.
+        billingPeriod:
+          type: object
+          required: [startDate, endDate, restarts]
+          properties:
+            startDate:
+              type: string
+              format: date-time
+            endDate:
+              type: string
+              format: date-time
+            restarts:
+              type: boolean
+              description: '`false` with `keepBillingPeriod`.'
+        contractVersion:
+          $ref: '#/components/schemas/ContractVersion'
+      example:
+        valid: false
+        errors:
+          - code: ADDON_NOT_AVAILABLE
+            service: acme
+            path: subscriptionAddOns.acme.extraStorage
+            message: Add-on extraStorage is not available for plan starter in the request organization
+        effective:
+          contractedServices:
+            acme: "2025-01-10"
+          subscriptionPlans:
+            acme: starter
+          subscriptionAddOns:
+            acme:
+              extraStorage: 2
+        versionChanges:
+          acme:
+            from: "2024-06-08"
+            to: "2025-01-10"
+            reason: policy:all_last
+        usageWarnings:
+          - service: acme
+            usageLimit: storage
+            consumed: 42
+            newLimit: 10
+        billingPeriod:
+          startDate: "2026-10-27T10:00:00.000Z"
+          endDate: "2026-11-26T10:00:00.000Z"
+          restarts: true
+        contractVersion: 3-9f86d081884c7d65
+
+    ContractPricings:
+      type: object
+      required: [services, contractVersion]
+      properties:
+        services:
+          type: object
+          description: Keyed by contracted service name (lowercase, as in `contractedServices`).
+          additionalProperties:
+            $ref: '#/components/schemas/ContractServicePricing'
+        contractVersion:
+          $ref: '#/components/schemas/ContractVersion'
+      example:
+        services:
+          acme:
+            version: "2024-06-08"
+            status: archived
+            yamlUrl: /api/v1/services/acme/pricings/2024-06-08?format=yaml
+            newContractsVersion: "2025-01-10"
+            plan: growth
+            addOns:
+              extraStorage: 2
+        contractVersion: 3-9f86d081884c7d65
+
+    ContractServicePricing:
+      type: object
+      required: [version, status, yamlUrl, newContractsVersion, addOns]
+      properties:
+        version:
+          type: string
+          description: '`contractedServices[service]`, unescaped.'
+        status:
+          type: string
+          enum: [active, archived]
+          description: |
+            `archived` also covers versions no longer listed by the service (e.g. SPHERE history) and services
+            that no longer exist in the organization (deleted or disabled); for those, `yamlUrl` answers `404`
+            and `newContractsVersion` is `null`.
+        yamlUrl:
+          type: string
+          description: Path of its Pricing2Yaml file (`format=yaml`), on the same kind of route as the request.
+        newContractsVersion:
+          type: string
+          nullable: true
+          description: |
+            Version new contracts of the service get; `null` if there is none (unknown service, no active
+            version). Other failures answer `500` instead of `null`.
+        plan:
+          type: string
+          description: '`subscriptionPlans[service]`, when the service has plans.'
+        addOns:
+          type: object
+          description: '`subscriptionAddOns[service]` (empty object when none).'
+          additionalProperties:
+            type: integer
+
     ContractVersion:
       type: string
       readOnly: true
@@ -5096,7 +5423,12 @@ components:
               - subscriptionAddOns
             properties:
               contractedServices:
-                $ref: '#/components/schemas/ContractedService'
+                allOf:
+                  - $ref: '#/components/schemas/ContractedService'
+                description: |
+                  Optional. Services subscribed in `subscriptionPlans`/`subscriptionAddOns` without an entry here keep
+                  the version the contract has (or, if the contract does not have them, get the version for new
+                  contracts). SPHERE-linked services follow their synchronization policy.
               subscriptionPlans:
                 $ref: '#/components/schemas/SubscriptionPlans'
               subscriptionAddOns:

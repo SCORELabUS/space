@@ -14,6 +14,8 @@ export const SPACE_CAPABILITIES: readonly string[] = Object.freeze([
   'reject-private',
   'pricing-yaml',
   'new-contracts-version',
+  'contract-pricings',
+  'novation-preview',
 ]);
 
 export const CAPABILITIES_HEADER = 'X-Space-Capabilities';

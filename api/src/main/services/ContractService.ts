@@ -16,7 +16,9 @@ import ServiceService from './ServiceService';
 import { LeanPricing, LeanUsageLimit } from '../types/models/Pricing';
 import { addDays, isAfter } from 'date-fns';
 import {
+  SubscriptionError,
   SubscriptionValidationError,
+  collectSubscriptionErrors,
   validateSubscription,
 } from '../controllers/validation/ContractValidation';
 import { novationFields, performNovation } from '../utils/contracts/novation';
@@ -38,6 +40,76 @@ import {
   contractVersionGuard,
 } from '../utils/contracts/version';
 import { LeanUser } from '../types/models/User';
+import { pricingYamlUrl } from '../utils/services/helpers';
+
+/** Response of POST /contracts/{userId}/novation/preview. */
+export interface NovationPreview {
+  valid: boolean;
+  errors: SubscriptionError[];
+  effective: {
+    contractedServices: Record<string, string>;
+    subscriptionPlans: Record<string, string>;
+    subscriptionAddOns: Record<string, Record<string, number>>;
+  };
+  versionChanges: Record<string, { from: string | null; to: string; reason: string }>;
+  usageWarnings: { service: string; usageLimit: string; consumed: number; newLimit: number }[];
+  billingPeriod: { startDate: string; endDate: string; restarts: boolean };
+  contractVersion: string;
+}
+
+/**
+ * Numeric usage limits that the subscription would set below what the contract
+ * has already consumed. Limits as feature evaluation computes them: the plan's
+ * value, overridden by add-on `usageLimits`, plus add-on
+ * `usageLimitsExtensions` times the quantity.
+ */
+function usageBelowConsumption(
+  contract: LeanContract,
+  subscription: { subscriptionPlans: Record<string, string>; subscriptionAddOns: Record<string, Record<string, number>> },
+  pricings: Record<string, LeanPricing>
+): NovationPreview['usageWarnings'] {
+  const warnings: NovationPreview['usageWarnings'] = [];
+  const usageLevels = convertKeysToLowercase(contract.usageLevels ?? {});
+
+  for (const [service, pricing] of Object.entries(pricings)) {
+    const levels = usageLevels[service];
+    if (!levels) continue;
+
+    const planName = subscription.subscriptionPlans[service];
+    const planKey = Object.keys(pricing.plans ?? {}).find(key => key.toLowerCase() === planName?.toLowerCase());
+    const limits: Record<string, number | boolean | undefined> = { ...(planKey ? pricing.plans![planKey].usageLimits ?? {} : {}) };
+    const selected = subscription.subscriptionAddOns[service] ?? {};
+
+    // In pricing order, as feature evaluation applies them (later add-ons win).
+    for (const [addOnName, addOn] of Object.entries(pricing.addOns ?? {})) {
+      const quantity = selected[addOnName];
+      if (!(quantity > 0)) continue;
+      for (const [limit, value] of Object.entries(addOn.usageLimits ?? {})) limits[limit] = value;
+      for (const [limit, value] of Object.entries(addOn.usageLimitsExtensions ?? {})) {
+        if (typeof limits[limit] === 'number') limits[limit] = (limits[limit] as number) + value * quantity;
+      }
+    }
+
+    for (const [limit, level] of Object.entries(levels)) {
+      const newLimit = limits[limit];
+      if (typeof newLimit === 'number' && typeof level?.consumed === 'number' && level.consumed > newLimit) {
+        warnings.push({ service, usageLimit: limit, consumed: level.consumed, newLimit });
+      }
+    }
+  }
+
+  return warnings;
+}
+
+/** One entry of GET /contracts/{userId}/pricings. */
+export interface ContractPricing {
+  version: string;
+  status: 'active' | 'archived';
+  yamlUrl: string;
+  newContractsVersion: string | null;
+  plan?: string;
+  addOns: Record<string, number>;
+}
 
 /** Options shared by the novation routes (see S8 in the API docs). */
 export interface NovationOptions {
@@ -112,6 +184,130 @@ class ContractService {
   }
 
   /**
+   * The subscription a novation of `contract` actually applies, and why each
+   * pricing version is what it is. Shared by the novation and its preview so
+   * that the preview is exact.
+   *
+   * Service keys are lowercased. A service subscribed in
+   * `subscriptionPlans`/`subscriptionAddOns` without a `contractedServices`
+   * entry keeps the version the contract has or, for a service the contract
+   * does not have, gets the version for new contracts. SPHERE policies are
+   * enforced last.
+   */
+  async _resolveNovation(
+    contract: LeanContract,
+    requested: any
+  ): Promise<{
+    subscription: {
+      contractedServices: Record<string, string>;
+      subscriptionPlans: Record<string, string>;
+      subscriptionAddOns: Record<string, Record<string, number>>;
+      billingPeriod?: { autoRenew?: boolean };
+    };
+    reasons: Record<string, string>;
+  }> {
+    const subscription: {
+      contractedServices: Record<string, string>;
+      subscriptionPlans: Record<string, string>;
+      subscriptionAddOns: Record<string, Record<string, number>>;
+      billingPeriod?: { autoRenew?: boolean };
+    } = {
+      contractedServices: convertKeysToLowercase<string>(structuredClone(requested?.contractedServices ?? {})),
+      subscriptionPlans: convertKeysToLowercase<string>(structuredClone(requested?.subscriptionPlans ?? {})),
+      subscriptionAddOns: convertKeysToLowercase<Record<string, number>>(structuredClone(requested?.subscriptionAddOns ?? {})),
+    };
+    const reasons: Record<string, string> = {};
+    for (const service of Object.keys(subscription.contractedServices)) reasons[service] = 'requested';
+
+    const previous = convertKeysToLowercase<string>(contract.contractedServices ?? {});
+    const subscribed = new Set([...Object.keys(subscription.subscriptionPlans), ...Object.keys(subscription.subscriptionAddOns)]);
+    for (const service of subscribed) {
+      if (service in subscription.contractedServices) continue;
+      if (service in previous) {
+        subscription.contractedServices[service] = resetEscapeVersion(previous[service]);
+        reasons[service] = 'kept';
+        continue;
+      }
+      try {
+        const { version } = await this.serviceService.newContractsPricing(service, contract.organizationId);
+        subscription.contractedServices[service] = version;
+        reasons[service] = 'new-contracts-version';
+      } catch (error) {
+        if (!(error as Error).message.toLowerCase().includes('not found')) throw error;
+        // Reported by validation as VERSION_NOT_FOUND.
+      }
+    }
+
+    const beforePolicy = { ...subscription.contractedServices };
+    const decidedBy = await enforceSpherePolicy(contract.organizationId, subscription, contract);
+    for (const [service, version] of Object.entries(subscription.contractedServices)) {
+      if (escapeVersion(String(version)) !== escapeVersion(String(beforePolicy[service]))) {
+        reasons[service] = `policy:${decidedBy[service] ?? 'sphere'}`;
+      }
+    }
+
+    // Billing period fields of the body (autoRenew) are applied by performNovation, as before.
+    if (requested?.billingPeriod !== undefined) subscription.billingPeriod = structuredClone(requested.billingPeriod);
+
+    return { subscription, reasons };
+  }
+
+  /**
+   * What a novation would do, without writing anything (POST
+   * /contracts/{userId}/novation/preview): the same resolution, SPHERE policy,
+   * validation and billing period as `novate`, every validation problem with
+   * its code, and limits that would fall below the current consumption.
+   */
+  async previewNovation(
+    userId: string,
+    newSubscription: any,
+    organizationId?: string,
+    options: NovationOptions = {}
+  ): Promise<NovationPreview> {
+    const found = await this._findContract(userId, organizationId);
+    // The stored contract, as a conditional novation would see it.
+    const contract = (await this.contractRepository.findByUserId(userId, found.organizationId)) ?? found;
+
+    const { subscription, reasons } = await this._resolveNovation(contract, newSubscription);
+    const { errors, pricings } = await collectSubscriptionErrors(subscription, contract.organizationId, {
+      previous: contract,
+      rejectPrivate: options.rejectPrivate,
+    });
+
+    const previousVersions = resetEscapeContractedServiceVersions(convertKeysToLowercase(contract.contractedServices ?? {}));
+    const versionChanges: NovationPreview['versionChanges'] = {};
+    for (const [service, version] of Object.entries(subscription.contractedServices)) {
+      const to = resetEscapeVersion(escapeVersion(String(version)));
+      const from = previousVersions[service] ?? null;
+      if (from !== to) versionChanges[service] = { from, to, reason: reasons[service] ?? 'requested' };
+    }
+
+    const novated = performNovation(structuredClone(contract), subscription, {
+      keepBillingPeriod: options.keepBillingPeriod,
+    });
+
+    return {
+      valid: errors.length === 0,
+      errors,
+      effective: {
+        contractedServices: Object.fromEntries(
+          Object.entries(subscription.contractedServices).map(([service, version]) => [service, resetEscapeVersion(escapeVersion(String(version)))])
+        ),
+        subscriptionPlans: subscription.subscriptionPlans,
+        subscriptionAddOns: subscription.subscriptionAddOns,
+      },
+      versionChanges,
+      usageWarnings: usageBelowConsumption(contract, subscription, pricings),
+      billingPeriod: {
+        startDate: new Date(novated.billingPeriod.startDate).toISOString(),
+        endDate: new Date(novated.billingPeriod.endDate).toISOString(),
+        restarts: !options.keepBillingPeriod,
+      },
+      contractVersion: computeContractVersion(contract),
+    };
+  }
+
+  /**
    * Services subscribed in `subscriptionPlans`/`subscriptionAddOns` but missing
    * from `contractedServices` get the version for new contracts of the service
    * (see `ServiceService.newContractsPricing`). Unknown services are left for
@@ -171,6 +367,49 @@ class ContractService {
     queryParams.organizationId = organizationId;
 
     return this.contractRepository.countByFilters(queryParams);
+  }
+
+  /**
+   * The pricing versions of a contract (GET /contracts/{userId}/pricings): per
+   * contracted service, its version (unescaped), whether it is still active,
+   * the version new contracts get (null if it cannot be determined) and the
+   * subscribed plan and add-ons. `routeOrganizationId` only selects the kind of
+   * `yamlUrl` (organization-scoped or direct).
+   */
+  async pricings(
+    userId: string,
+    organizationId?: string,
+    routeOrganizationId?: string
+  ): Promise<{ contract: LeanContract; services: Record<string, ContractPricing> }> {
+    const contract = await this.show(userId, organizationId);
+    const services: Record<string, ContractPricing> = {};
+
+    for (const [serviceName, version] of Object.entries(contract.contractedServices)) {
+      const status = await this.serviceService.pricingVersionStatus(serviceName, version, contract.organizationId);
+      let storedName = serviceName;
+      let newContractsVersion: string | null = null;
+      try {
+        const forNewContracts = await this.serviceService.newContractsPricing(serviceName, contract.organizationId);
+        storedName = forNewContracts.serviceName;
+        newContractsVersion = forNewContracts.version;
+      } catch (error) {
+        // Unknown service or no active version: newContractsVersion stays null.
+        // Anything else (database or cache failure) is not hidden as "unknown".
+        if (!(error as Error).message.toLowerCase().includes('not found')) throw error;
+      }
+
+      services[serviceName] = {
+        version,
+        // A version that is neither active nor archived (e.g. SPHERE history) is no longer offered.
+        status: status === 'active' ? 'active' : 'archived',
+        yamlUrl: pricingYamlUrl(routeOrganizationId, storedName, version),
+        newContractsVersion,
+        plan: contract.subscriptionPlans?.[serviceName],
+        addOns: contract.subscriptionAddOns?.[serviceName] ?? {},
+      };
+    }
+
+    return { contract, services };
   }
 
   async show(userId: string, organizationId?: string): Promise<LeanContract> {
@@ -336,13 +575,13 @@ class ContractService {
       guard = contractVersionGuard(stored);
     }
 
-    await enforceSpherePolicy(contract.organizationId, newSubscription, contract);
-    await validateSubscription(newSubscription, contract.organizationId, {
+    const { subscription } = await this._resolveNovation(contract, newSubscription);
+    await validateSubscription(subscription, contract.organizationId, {
       previous: contract,
       rejectPrivate: options.rejectPrivate,
     });
 
-    const newContract = performNovation(contract, newSubscription, {
+    const newContract = performNovation(contract, subscription, {
       keepBillingPeriod: options.keepBillingPeriod,
     });
 
@@ -423,10 +662,8 @@ class ContractService {
     const updatedContracts: LeanContract[] = [];
 
     for (const contract of contracts) {
-      // Each contract gets its own copy: the SPHERE policy may pin a different
-      // version per contract.
-      const subscription = structuredClone(newSubscription);
-      await enforceSpherePolicy(contract.organizationId, subscription, contract);
+      // Resolved per contract: kept versions and the SPHERE policy may differ.
+      const { subscription } = await this._resolveNovation(contract, newSubscription);
       await validateSubscription(subscription, contract.organizationId, {
         previous: contract,
         rejectPrivate: options.rejectPrivate,

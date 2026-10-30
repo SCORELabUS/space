@@ -96,6 +96,12 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
     allowedUserRoles: ['ADMIN', 'USER'],
     allowedOrgRoles: [],
   },
+  {
+    path: '/organizations/*/contracts/*/novation/preview',
+    methods: ['POST'],
+    allowedUserRoles: ['ADMIN', 'USER'],
+    allowedOrgRoles: [],
+  },
 
   // ============================================
   // Organization Management Routes (User API Keys ONLY)
@@ -198,6 +204,13 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
     methods: ['DELETE'],
     allowedUserRoles: ['ADMIN'],
     allowedOrgRoles: ['ALL'],
+  },
+  {
+    // Dry run of PUT /contracts/{userId}: same permissions as the novation.
+    path: '/contracts/*/novation/preview',
+    methods: ['POST'],
+    allowedUserRoles: ['ADMIN'],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT'],
   },
   {
     path: '/contracts/**',

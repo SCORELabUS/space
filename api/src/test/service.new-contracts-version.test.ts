@@ -396,8 +396,8 @@ describe('Pricing version for new contracts', function () {
       });
     });
 
-    it('does not accept a defaultVersion', async function () {
-      const response = await setDefault('3.0', linkedName);
+    it.each([linkedName, linkedName.toUpperCase()])('does not accept a defaultVersion with service name %s', async function (name) {
+      const response = await setDefault('3.0', name);
 
       expect(response.status).toBe(400);
     });
