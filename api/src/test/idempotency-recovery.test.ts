@@ -538,4 +538,47 @@ describe('Idempotency crash recovery', () => {
     expect(Object.keys(after.usageRevertReceipts)).toHaveLength(1);
     expect(await consumed()).toBe(1);
   });
+
+  it.each(['consume', 'increment'] as const)('refuses an unapplied prepared %s after its service is paused', async kind => {
+    expect((await create()).status).toBe(201);
+    const repository: any = container.resolve('idempotencyContractRepository');
+    vi.spyOn(repository, 'apply').mockRejectedValueOnce(new Error('Injected failure before the prepared usage effect'));
+    const key = uuidv4();
+    const call = () => kind === 'consume' ? consume(key) : increment(key);
+    failed(await call());
+    expect(await consumed()).toBe(0);
+    const pending = await journal(key);
+    expect(pending.plan.kind).toBe(kind === 'consume' ? 'consume' : 'usage');
+    expect(Object.keys(pending.steps ?? {})).toHaveLength(0);
+    await request(app).delete(`${baseUrl}/services/${SERVICE}`).set('x-api-key', apiKey).expect(204);
+
+    const retry = await call();
+    expect(retry.status, JSON.stringify(retry.body)).toBe(409);
+    expect(retry.body.code).toBe('SERVICE_DISABLED');
+    expect(await consumed()).toBe(0);
+    const unchanged: any = await Contract.findOne({ organizationId: organization.id, 'userContact.userId': userId })
+      .select('+idempotencyReceipt').lean();
+    expect(unchanged.idempotencyReceipt).toBeUndefined();
+    expect((await journal(key)).operationId).toBe(pending.operationId);
+  });
+
+  it('recovers the original successful consumption after its applied effect is followed by a service pause', async () => {
+    expect((await create()).status).toBe(201);
+    const key = uuidv4(); interruptAfterApply();
+    failed(await consume(key));
+    expect(await consumed()).toBe(1);
+    const pending = await journal(key);
+    const consumptionId = pending.plan.consumption.id;
+    expect(Object.keys(pending.steps ?? {})).toHaveLength(0);
+    await request(app).delete(`${baseUrl}/services/${SERVICE}`).set('x-api-key', apiKey).expect(204);
+
+    const recovered = await recoverAndReplay(() => consume(key));
+    expect(recovered.body.eval).toBe(true);
+    expect(recovered.body.consumptionId).toBe(consumptionId);
+    expect(recovered.body.used['petclinic-maxPets']).toBe(1);
+    expect(await consumed()).toBe(1);
+    expect(await UsageConsumption.countDocuments({ organizationId: organization.id, userId })).toBe(1);
+    expect((await UsageConsumption.findById(consumptionId).lean())?.state).toBe('applied');
+    expect((await journal(key)).operationId).toBe(pending.operationId);
+  });
 });

@@ -25,7 +25,7 @@ export class IdempotencyStepBusyError extends Error {
 
 class IdempotencyContractRepository {
   async apply(write: IdempotentContractWrite, stepId: string, validUntil: Date,
-    owner?: { operationId: string; key: string; organizationId: string }): Promise<any | null> {
+    owner?: { operationId: string; key: string; organizationId: string }, validate?: (current: any) => Promise<void>): Promise<any | null> {
     const identity = { _id: new mongoose.Types.ObjectId(write.contractId), organizationId: write.organizationId, 'userContact.userId': write.userId };
     const previous: any = await Contract.findOne(identity).select('+idempotencyReceipt').lean();
     if (previous?.idempotencyReceipt?.stepId === stepId) return previous.idempotencyReceipt.result;
@@ -36,6 +36,7 @@ class IdempotencyContractRepository {
       if (!recovered) throw new IdempotencyStepBusyError();
       await this.acknowledge(write, receipt.stepId);
     }
+    await validate?.(previous);
     if (write.create) {
       if (write.create.organizationId !== write.organizationId || write.create.userContact?.userId !== write.userId) throw new Error('CONFLICT: Prepared contract identity does not match its scope');
       // A stable preallocated _id and immutable document also fence an ambiguous
@@ -85,6 +86,10 @@ class IdempotencyContractRepository {
       if (write.consume) filter[`usageLevels.${path}.resetTimeStamp`] = write.consume.resetTimeStamps[path] ?? null;
     }
     const prune: Record<string, any> = {};
+    for (const field of ['usageConsumptionReceipts', 'usageRevertReceipts']) {
+      prune[field] = { $cond: [{ $eq: [{ $type: `$${field}` }, 'missing'] }, '$$REMOVE',
+        { $arrayToObject: { $filter: { input: { $objectToArray: `$${field}` }, as: 'receipt', cond: { $gt: ['$$receipt.v', '$$NOW'] } } } }] };
+    }
     const { createHash } = await import('node:crypto');
     if (write.refund) {
       const refund = write.refund;

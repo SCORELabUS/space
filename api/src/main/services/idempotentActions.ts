@@ -1,3 +1,5 @@
+import type { DormantReason } from './ServiceService';
+import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import container from '../config/container';
 import type { IdempotentContractWrite } from '../repositories/mongoose/IdempotencyContractRepository';
@@ -54,7 +56,7 @@ export async function executeIdempotentAction(proposed: IdempotentAction): Promi
         const applied = await contracts.hasUsageRevert(action.consumption.userId, action.organizationId, action.consumption.id, action.consumption.contractId);
         if (!applied) {
           const service = action.consumption.featureId.split('-')[0];
-          const dormant = await container.resolve('serviceService').dormantServices([service], action.organizationId);
+          const dormant: Record<string, DormantReason> = await container.resolve('serviceService').dormantServices([service], action.organizationId);
           if (dormant[service]) {
             const { DormantServiceError } = await import('./ServiceService');
             throw new DormantServiceError(service, dormant[service]);
@@ -75,7 +77,25 @@ export async function executeIdempotentAction(proposed: IdempotentAction): Promi
         const stepId = createHash('sha256').update(`${execution.operationId}:${index}`).digest('hex');
         let step = execution.record.steps?.[stepId];
         if (!step) {
-          const result = await receipts.apply(write, stepId, new Date(execution.record.lockedUntil), { operationId: execution.operationId, key: execution.key, organizationId: execution.organizationId });
+          const result = await receipts.apply(write, stepId, new Date(execution.record.lockedUntil), { operationId: execution.operationId, key: execution.key, organizationId: execution.organizationId }, async (current: any) => {
+            // Revalidate availability only for a NEW effect. apply() returns its
+            // own persisted receipt before invoking this callback, so a paused
+            // service cannot hide a mutation that already succeeded.
+            const names = ['create', 'novate', 'group'].includes(action.kind)
+              ? Object.keys(write.create?.contractedServices ?? write.set?.contractedServices ?? {})
+              : [...Object.keys(write.increments ?? {}).map(path => path.split('.')[0]),
+                ...Object.keys(write.set ?? {}).filter(path => path.startsWith('usageLevels.')).map(path => path.split('.')[1]),
+                ...(write.refund?.services ?? [])];
+            const dormant: Record<string, DormantReason> = await container.resolve('serviceService').dormantServices([...new Set(names)], action.organizationId);
+            for (const [service, reason] of Object.entries(dormant)) {
+              if (['novate', 'group'].includes(action.kind)) {
+                const value = (map: any) => Object.entries(map ?? {}).find(([name]) => name.toLowerCase() === service)?.[1];
+                if (['contractedServices', 'subscriptionPlans', 'subscriptionAddOns'].every(field => isDeepStrictEqual(value(write.set?.[field]), value(current?.[field])))) continue;
+              }
+              const { DormantServiceError } = await import('./ServiceService');
+              throw new DormantServiceError(service, reason);
+            }
+          });
           await execution.repository.checkpoint(execution.organizationId, execution.key, execution.owner, stepId, { result });
           step = { result };
         }

@@ -225,30 +225,18 @@ describe('Consumption revert recovery', () => {
       expect((await appliedRecord()).revertedAt).toBeInstanceOf(Date);
     });
 
-    it('does not refund an expired legacy row while TTL cleanup has not removed it', async () => {
+    it('does not refund a database-expired legacy row before TTL cleanup', async () => {
       const response = await apply();
       expect(response.status, JSON.stringify(response.body)).toBe(200);
       const id = response.body.consumptionId;
-      const now = Date.now();
-      await UsageConsumption.updateOne({ _id: id }, {
-        $unset: { state: '', contractId: '' }, $set: { expiresAt: new Date(now + 30_000) },
-      });
-      // Advance only the application's Date. MongoDB's real TTL clock still
-      // sees an unexpired row, while it is expired and recent enough for the
-      // legacy selector in SPACE. Real HTTP/Redis timers remain running.
-      vi.setSystemTime(new Date(now + 60_000));
-      try {
-        expect(await UsageConsumption.findById(id).lean()).not.toBeNull();
-        const legacy = await request(app).post(`${baseUrl}/features/${userId}/${FEATURE}?revert=true&latest=true`).set('x-api-key', key);
-        expect(legacy.status, JSON.stringify(legacy.body)).toBe(204);
-        expect(await consumed()).toBe(1);
-        const explicit = await revert(id);
-        expect(explicit.status, JSON.stringify(explicit.body)).toBe(404);
-        expect(await consumed()).toBe(1);
-        expect(await UsageConsumption.findById(id).lean()).not.toBeNull();
-      } finally {
-        vi.useRealTimers();
-      }
+      await UsageConsumption.updateOne({ _id: id }, { $unset: { state: '', contractId: '' }, $set: { expiresAt: new Date(0) } });
+      const legacy = await request(app).post(`${baseUrl}/features/${userId}/${FEATURE}?revert=true&latest=true`).set('x-api-key', key);
+      expect(legacy.status, JSON.stringify(legacy.body)).toBe(204);
+      expect(await consumed()).toBe(1);
+      expect((await revert(id)).status).toBe(404);
+      expect(await consumed()).toBe(1);
+      const retained: any = await UsageConsumption.findById(id).lean();
+      if (retained) expect(retained.revertedAt).toBeUndefined();
     });
   });
 

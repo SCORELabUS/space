@@ -278,6 +278,7 @@ class ContractController {
       const contract = await this.contractService.create(contractData, { rejectPrivate });
       sendContract(req, res, 201, contract);
     } catch (err: any) {
+      if (err instanceof DormantServiceError) return res.status(409).json({ error: err.message, code: err.code, service: err.service });
       if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err instanceof SubscriptionValidationError) {
         sendInvalidSubscription(res, err);
@@ -305,6 +306,7 @@ class ContractController {
       });
       sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (err instanceof DormantServiceError) return res.status(409).json({ error: err.message, code: err.code, service: err.service });
       if (err instanceof IdempotencyStateChangedError) return res.status(409).json({ code: err.code, error: err.message, contractVersion: err.contractVersion, ...(err.novated ? { novated: err.novated } : {}) });
       if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
@@ -377,6 +379,7 @@ class ContractController {
       });
       res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
+      if (err instanceof DormantServiceError) return res.status(409).json({ error: err.message, code: err.code, service: err.service });
       if (err instanceof IdempotencyStateChangedError) return res.status(409).json({ code: err.code, error: err.message, contractVersion: err.contractVersion, ...(err.novated ? { novated: err.novated } : {}) });
       if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;

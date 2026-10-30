@@ -154,6 +154,9 @@ info:
     - Completed keys are kept for `IDEMPOTENCY_KEY_TTL_SECONDS` (default 24 hours), starting at completion;
       after that the same key starts a new request. Unfinished prepared operations do not expire by TTL:
       deleting their journal could duplicate a previously applied effect.
+    - Availability is checked again before a still-unapplied effect: a service paused in the meantime
+      cannot receive new consumption or counter changes. Replaying an already applied operation still
+      returns its historical result. Consumption expiry and receipt pruning use the same database clock.
     - Prepared novations and counter resets also keep internal version/period guards. If a later change
       makes an unapplied step unsafe, it returns `409 IDEMPOTENCY_STATE_CHANGED` with current contract
       versions and, for a group, `novated` members already applied. Re-read current state before issuing
@@ -5447,6 +5450,7 @@ components:
           description: Current version(s) for an unsafe prepared mutation, like a contract precondition response.
           oneOf:
             - type: string
+              nullable: true
             - type: object
               additionalProperties:
                 type: string
