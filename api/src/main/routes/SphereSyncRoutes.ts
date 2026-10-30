@@ -1,6 +1,8 @@
 import express from 'express';
 import container from '../config/container';
 import { memberRole, hasPermission } from '../middlewares/AuthMiddleware';
+import { SphereAuthError, SphereResourceUnavailableError } from '../services/sphere/errors';
+import { SphereCredentialError } from '../services/sphere/credentials';
 
 export default function loadRoutes(app: express.Application) {
   const invoke = (action: string) => async (req: any, res: any) => {
@@ -9,7 +11,7 @@ export default function loadRoutes(app: express.Application) {
     try {
       const sync = container.resolve('sphereSyncService');
       let result;
-      if (action === 'preview') result = await sync.preview(req.body);
+      if (action === 'preview') result = await sync.preview(req.body, organizationId, req.body?.serviceName);
       else if (action === 'get') result = await sync.get(organizationId, req.params.serviceName);
       else if (action === 'configure') result = await sync.configure(organizationId, req.params.serviceName, req.body);
       else {
@@ -21,6 +23,21 @@ export default function loadRoutes(app: express.Application) {
       }
       return res.status(action === 'run' ? 202 : 200).json(result);
     } catch (error) {
+      if (error instanceof SphereAuthError || error instanceof SphereResourceUnavailableError) {
+        const suppliedKey = typeof req.body?.sphereApiKey === 'string' && req.body.sphereApiKey.length > 0;
+        return res.status(400).json({
+          code: suppliedKey ? 'SPHERE_KEY_REJECTED' : 'SPHERE_ACCESS_REQUIRED',
+          error: suppliedKey
+            ? 'This SPHERE API key cannot access the pricing. Check the link and the key permissions, then try again.'
+            : 'This pricing may be private or unavailable. Provide a SPHERE API key with access to continue.',
+        });
+      }
+      if (error instanceof SphereCredentialError) {
+        return res.status(400).json({
+          code: 'SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE',
+          error: 'SPHERE credentials cannot be used or saved right now. Ask your SPACE administrator to check credential storage.',
+        });
+      }
       const message = (error as Error).message;
       res.status(/not found/i.test(message) ? 404 : /busy|applying|lock/i.test(message) ? 409 : 400).json({ error: message });
     }

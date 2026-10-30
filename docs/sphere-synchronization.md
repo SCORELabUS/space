@@ -6,6 +6,7 @@ SPACE can create a service from a public SPHERE pricing permanent link. Existing
 
 1. Deploy SPHERE's permanent-identity migration and public pricing API first. Pause pricing writes while running its migration. Existing versions must receive a `pricingId`; never regenerate those IDs after sharing links.
 2. Configure SPACE's `SPHERE_PUBLIC_URL` (for example `https://sphere.score.us.es`). Optional `SPHERE_API_URL` must use the same protocol and host and include the API prefix, normally `/api/v1`. In local development its port may differ, such as UI `http://localhost:5173` and API `http://localhost:8080/api/v1`.
+   `SPHERE_EDITOR_FRAGMENT=true` additionally offers **View in SPHERE** for uploaded pricings, once that SPHERE's editor reads `#pricing=` (see [Opening pricings in SPHERE](#opening-pricings-in-sphere)).
 3. Initially use `SPHERE_SYNC_ENABLED=false`. Create a linked service and use **Synchronize now** to verify connectivity and permissions.
 4. Set `SPHERE_SYNC_ENABLED=true` and restart SPACE to enable periodic processing. The worker checks each service on a staggered five-minute schedule, with bounded sequential processing. Slow remote calls or a backlog can delay completion.
 5. Disable periodic processing using the same flag without deleting services, contracts or snapshots. Manual synchronization remains available. Graceful SIGTERM/SIGINT shutdown waits for the current worker and closes events, Redis and MongoDB without deleting the database.
@@ -48,11 +49,11 @@ By default SPACE reads only the public versions of a SPHERE pricing. To link pri
 
 Each stored key is bound to the service, to its SPHERE pricing and to the SPHERE API origin it was entered for (`SPHERE_API_URL`, or the origin of `SPHERE_PUBLIC_URL`). If that origin changes, SPACE does not send the key to the new origin: synchronization of the service reports `degraded` with an explicit error until the key is entered again for the new SPHERE.
 
-Private snapshots are not stored under `public/` (which is served without authorisation, like uploaded pricings) but under the private files directory, `SPACE_PRIVATE_FILES_DIR` (default `./private`, `/usr/src/server/private` in the container images). They are only served through `GET .../pricings/{version}?format=yaml`, with the same authorisation as the pricing, and have no public URL (`.../public-url` answers `404`). Persist that directory like `public/` (the Docker Compose files and the Kubernetes manifests mount a `space-private` volume there); if it is lost, `format=yaml` of those versions answers `404 PRICING_YAML_UNAVAILABLE` (the parsed pricing and contracts are not affected).
+All SPHERE snapshots, public and private, are stored outside `public/`, under `SPACE_PRIVATE_FILES_DIR` (default `./private`). They are served through the authorized `GET .../pricings/{version}?format=yaml` route. The legacy `public-url` endpoint returns that authenticated download route, with `requiresAuthentication: true`; it never exposes a static public file. Persist the private directory (the Docker Compose and Kubernetes manifests mount it). Missing files answer `404 PRICING_YAML_UNAVAILABLE` while parsed pricing and contracts remain available.
 
 Rotating `SPHERE_KEY_ENCRYPTION_KEY`: set the new key and keep the old one as `SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS`. A stored key that only the previous key decrypts is re-encrypted with the new one the next time the service uses it (synchronization runs every poll interval); remove `SPHERE_KEY_ENCRYPTION_KEY_PREVIOUS` afterwards. If `SPHERE_KEY_ENCRYPTION_KEY` changes without the previous key, stored keys can no longer be decrypted: synchronization of those services reports `degraded` with an explicit error until the key is entered again. Removing the key does not delete private versions already imported; new versions are then chosen from the public ones only.
 
-Known limitations: SPACE does not move a snapshot when SPHERE changes the visibility of a version it has already imported (a version imported while public stays under `public/`); publish a new version instead. The `/private/sphere/...` `yamlPath` of a private snapshot is a storage path, not a URL.
+The `/private/sphere/...` `yamlPath` is a storage reference, not a public URL. A visibility change in SPHERE cannot expose an already imported snapshot: all copies use protected storage.
 
 Organization keys need ALL or MANAGEMENT to mutate synchronization. EVALUATION may read status. User keys use organization routes with membership checks; OWNER, ADMIN and MANAGER may manage settings, and EVALUATOR may read them. The global permission table and route membership middleware both apply.
 
@@ -62,16 +63,28 @@ The frontend's **Add New Service** form offers file, YAML URL and SPHERE sources
 
 | API value | Existing bindings | New bindings | Target |
 | --- | --- | --- | --- |
-| `all_last` | Migrate | Forced target | Latest public pricing date |
-| `new_last` | Keep version | Forced target | Latest public pricing date |
-| `all_pick` | Migrate | Forced target | Selected public version ID |
-| `new_pick` | Keep version | Forced target | Selected public version ID |
+| `all_last` | Migrate | Forced target | Latest accessible pricing date |
+| `new_last` | Keep version | Forced target | Latest accessible pricing date |
+| `all_pick` | Migrate | Forced target | Selected accessible version ID |
+| `new_pick` | Keep version | Forced target | Selected accessible version ID |
 
 Adding a service to an existing contract is a new binding. The server enforces the target even when a client sends a different version. Invalid newly requested subscriptions fail validation; the automatic replacement rule applies only to migrations of existing subscriptions.
 
 All migrations first try to preserve the exact plan/add-ons/quantities. If invalid, the fallback is the cheapest public plan with a finite nonnegative numeric price and a valid subscription without add-ons. Numeric strings are accepted; expressions and commercial text are not evaluated. Ties are resolved by plan ID. The interface warns about this behavior before selecting an All policy. If any required replacement is impossible, no contracts are migrated.
 
 Billing dates remain unchanged during synchronization. Compatible usage counters and reset dates are preserved, including consumption above a new lower limit. New counters start with normal SPACE defaults; removed limits leave active state. Incompatible period, type, tracking or unit changes block migration. Other services in the same contract remain unchanged.
+
+## Opening pricings in SPHERE
+
+The SPACE UI links to SPHERE without ever handing it a SPACE file or credential:
+
+- SPHERE snapshots open SPHERE's permanent link for their pricing on the version SPACE copied (`/p/{pricingId}?version={versionId}`, from the pricing's `sphere` field), so SPHERE resolves it and applies its own permissions. A SPHERE without version links ignores `version`, and SPHERE also ignores it when that user may not see the version: its pricing page then opens on the latest version it shows to that user.
+- Pricings defined by an external URL open in SPHERE's editor, which fetches that URL (`/editor?pricingUrl=...`).
+- Pricings uploaded to SPACE are offered only when `SPHERE_EDITOR_FRAGMENT=true`. Their YAML is only readable with the organization's credentials, so SPACE reads it with the signed-in user's API key and opens SPHERE's editor with the content in the URL fragment: `/editor#pricing=<YAML compressed with lz-string compressToEncodedURIComponent>`, the encoding of SPHERE's own share links. Browsers never send the fragment to a server, so the content reaches no SPHERE server or log; no YAML or credential goes in the query string. A pricing whose encoded content exceeds 512 KiB (524,288 characters) is not opened: SPACE says it is too large and suggests downloading the YAML and using **Import** in SPHERE's editor. It is never truncated. The largest real pricings measured encode to about 20,000 characters.
+
+The links use `SPHERE_PUBLIC_URL`, the address of SPHERE reachable by the browser.
+
+`SPHERE_EDITOR_FRAGMENT` (default `false`) tells the frontend that the SPHERE at `SPHERE_PUBLIC_URL` reads `#pricing=` in its editor. Set it to `true` only for a SPHERE release with that support: an editor without it ignores the fragment and shows its default template instead of the pricing. Like `SPHERE_PUBLIC_URL`, it is read when the frontend is built (from `frontend/.env`, the root `.env` or the Docker build argument), so rebuild the frontend after changing it.
 
 ## Recovery and retention
 
@@ -81,9 +94,9 @@ The worker persists run state and obtains a renewable organization lease. Bindin
 
 The only retained snapshots are currently contracted versions plus the applied target. Expired contracts still count while their current binding exists. History alone does not retain YAML. Removed local historical pricing details can be read through the existing pricing-detail endpoint, which fetches public SPHERE content without persisting it. If SPHERE no longer exposes it, retrieval reports unavailability.
 
-If the target disappears, becomes private, or SPHERE fails, SPACE keeps the applied target and permits new contracts with that copy. Last policies never automatically downgrade; they can advance to a later public version. Functional edits under an imported version ID are blocked. Renaming the SaaS or changing YAML mapping order does not change the functional fingerprint.
+If the target disappears, becomes private, or SPHERE fails, SPACE keeps the applied target and permits new contracts with that copy. Last policies never automatically downgrade; they can advance to a later accessible version. Functional edits under an imported version ID are blocked. Renaming the SaaS or changing YAML mapping order does not change the functional fingerprint.
 
-Cleanup rechecks bindings and removes obsolete database documents, YAML files and caches. Staged copies may briefly exist during an unfinished run. Periodic reconciliation also removes database-backed initial imports whose service was never created, using the organization lease to avoid racing service creation. Cache invalidation includes pricing, service, contract, feature evaluations and pricing tokens. Redis distributes pricing events across instances. JWTs already held by clients retain their existing refresh/expiration semantics; clearing server cache does not revoke them.
+Snapshots are stored outside `public/`, under the private files directory (`SPACE_PRIVATE_FILES_DIR`, default `./private`, at `sphere/<serviceId>/<versionId>.yaml`; `yamlPath` `/private/sphere/...`), like uploaded pricing files. They are not served as static files: the owning organization reads them with `GET .../pricings/{version}?format=yaml`. Snapshots that earlier versions stored under `public/static/pricings/sphere/` are moved there at startup. Cleanup rechecks bindings and removes obsolete database documents, YAML files and caches. Staged copies may briefly exist during an unfinished run. Periodic reconciliation also removes database-backed initial imports whose service was never created, using the organization lease to avoid racing service creation. Cache invalidation includes pricing, service, contract, feature evaluations and pricing tokens. Redis distributes pricing events across instances. JWTs already held by clients retain their existing refresh/expiration semantics; clearing server cache does not revoke them.
 
 ## Tests
 
@@ -111,3 +124,12 @@ SPHERE_SYNC_TEST_REDIS=true pnpm --dir api exec vitest run src/test/sphere-redis
 ### Verification performed for this change
 
 Both production builds and changed-file lint checks passed (existing hook/chunk-size warnings remain). The isolated suites passed 198 SPHERE tests and 76 SPACE tests. A separate cross-project HTTP smoke check used real SPHERE routes, real SPACE import/migration code and disposable MongoDB databases: private-version filtering, publishing a new public target, migration with preserved consumption/billing, retention, permanent-link renaming and offline operation passed. Cache and event effects were stubbed in that HTTP smoke check. Two additional tests against a disposable Redis instance verified contract/evaluation/pricing-token invalidation and event delivery between two API instances. Browser checks covered desktop/mobile, dark mode, the SPHERE form, All-policy warning, Escape dismissal and the service panel. The full legacy API suites were not run because they require their separate seeded test environment.
+
+
+### Linking private pricings in the interface
+
+In Add service → Link to SPHERE, enter the permanent link and select Check pricing. An accessible public pricing unlocks synchronization settings immediately. If SPHERE answers 401/403/404, SPACE offers a masked API-key field: “This pricing may be private. Enter a SPHERE API key with access to continue.” SPHERE deliberately gives the same 404 for missing and unreadable resources, so the interface does not claim that every 404 proves privacy. A valid key unlocks the policy/version controls and Link service; rejected keys keep them blocked. Public pricings also offer Use a SPHERE API key to discover permitted private versions of mixed-visibility families.
+
+The form discards validation after a link/key change, ignores cancelled or stale requests, and clears the key when closed. Keys are sent in request bodies, never URLs or browser storage. The server checks access again when creating the service and saves the key encrypted. A server must have `SPHERE_KEY_ENCRYPTION_KEY` configured before credentials can be saved.
+
+Edit synchronization uses the saved credential on the server without returning it. Managers can replace or remove it; each change must be validated before Save synchronization. The preview body accepts optional `serviceName` in the authenticated organization: the stored permanent-link identity must match. Omitting `sphereApiKey` then uses the saved key, null previews public access, and a string previews a replacement without saving it. Access errors have safe codes `SPHERE_ACCESS_REQUIRED`/`SPHERE_KEY_REJECTED`; transport/upstream 500 errors are kept distinct.

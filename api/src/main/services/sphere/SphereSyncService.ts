@@ -13,9 +13,9 @@ import SphereClient, { functionalHash } from './SphereClient';
 import { SphereConfiguration, SphereManifest, SphereVersion, SyntaxUpgrade, isSphereSyncEnabled, publicSphereSource, sameSnapshotCreatedAt, selectVersion, validateConfiguration } from './types';
 import { decryptSphereApiKey, encryptSphereApiKey, isValidSphereApiKey } from './credentials';
 import { migrateSubscription, migrateUsage } from './migration';
+import { isSphereSnapshotYamlPath, pricingYamlFile, removePricingYaml, sphereSnapshotYamlPath } from '../pricingFiles';
 import { withOrganizationLock } from './lock';
 import { SphereVersionNotListedError } from './errors';
-import { PUBLIC_SNAPSHOT_PREFIX, isPrivateSnapshotPath, snapshotYamlPath, storedYamlFile } from './snapshots';
 import { contractCacheKeys } from '../../utils/contracts/cacheKeys';
 
 export default class SphereSyncService {
@@ -29,11 +29,24 @@ export default class SphereSyncService {
   /**
    * `config.sphereApiKey` (optional) is used for this request only: preview
    * never stores it, so private versions can be inspected before linking.
+   * A scoped service preview may reuse its stored credential without exposing
+   * it to the caller. Explicit null still previews anonymous access.
    */
-  async preview(config: SphereConfiguration) {
+  async preview(config: SphereConfiguration, organizationId?: string, serviceName?: string) {
     const link = this.client.parseLink(config.permanentUrl);
     if (config.sphereApiKey != null && !isValidSphereApiKey(config.sphereApiKey)) throw new Error('Invalid sphereApiKey');
-    const apiKey = config.sphereApiKey ?? undefined;
+    let apiKey = config.sphereApiKey ?? undefined;
+    if (serviceName !== undefined) {
+      if (typeof serviceName !== 'string' || !serviceName.trim()) throw new Error('Invalid serviceName');
+      if (typeof organizationId !== 'string' || !organizationId) throw new Error('Organization ID is required');
+      const service: any = await this.repository.service({ organizationId, name: serviceName, source: 'sphere', disabled: false });
+      if (!service) throw new Error('Linked service not found');
+      const storedLink = this.client.parseLink(service.sphere.permanentUrl);
+      if (link.pricingId !== service.sphere.pricingId || link.permanentUrl !== storedLink.permanentUrl) {
+        throw new Error('Changing pricing identity is not supported');
+      }
+      if (config.sphereApiKey === undefined) apiKey = await this.apiKey(service);
+    }
     const manifest = await this.client.manifest(link.pricingId, apiKey);
     const target = selectVersion(manifest, config);
     return { ...manifest, ...link, syntaxUpgrade: await this.inspectSyntaxUpgrade(link.pricingId, target, apiKey) };
@@ -287,10 +300,10 @@ export default class SphereSyncService {
     const data = parsePricingToSpacePricingObject(parsed);
     const errors = validatePricingData(data);
     if (errors.length) throw new Error(`Invalid pricing: ${errors.join(', ')}`);
-    // Private versions are stored outside public/ (see snapshots.ts).
-    const yamlPath = snapshotYamlPath(String(service._id), version.versionId, version.private === true);
-    const file = storedYamlFile(yamlPath);
-    if (!file) throw new Error('Invalid SPHERE snapshot path');
+    // Outside public/: snapshots are read only through GET .../pricings/{version}?format=yaml.
+    const yamlPath = sphereSnapshotYamlPath(String(service._id), version.versionId);
+    const file = pricingYamlFile(yamlPath);
+    if (!file) throw new Error(`Invalid SPHERE snapshot path ${yamlPath}`);
     await fs.mkdir(path.dirname(file), { recursive: true });
     // Persist the parsed Pricing2Yaml model, not the remote source text. This
     // makes a confirmed legacy-syntax upgrade explicit and reproducible.
@@ -425,10 +438,7 @@ export default class SphereSyncService {
     }
   }
   private async removeCopy(copy: any) {
-    if (copy.yamlPath?.startsWith(PUBLIC_SNAPSHOT_PREFIX) || isPrivateSnapshotPath(copy.yamlPath)) {
-      const file = storedYamlFile(copy.yamlPath);
-      if (file) await fs.rm(file, { force: true });
-    }
+    if (isSphereSnapshotYamlPath(copy.yamlPath)) removePricingYaml(copy.yamlPath);
     await this.repository.deletePricing({ _id: copy._id });
     await container.resolve('cacheService').del(`pricing.id.${copy._id}`);
   }

@@ -17,6 +17,7 @@ import { SphereLease, SphereRun } from '../main/repositories/mongoose/models/Sph
 import { enforceSpherePolicy } from '../main/services/sphere/contractPolicy';
 import { withOrganizationLock } from '../main/services/sphere/lock';
 import { featuresCachePattern } from '../main/utils/contracts/cacheKeys';
+import { pricingYamlFile } from '../main/services/pricingFiles';
 const id = '111111111111111111111111', one = '222222222222222222222222', two = '333333333333333333333333';
 const origin = 'https://sphere.score.us.es';
 const yaml = (version: string, plan = 'basic', price: number | string = 0, syntaxVersion = '3.1') => `saasName: Demo\nversion: '${version}'\ncreatedAt: '${version === '1.0' ? '2024' : '2025'}-01-01'\nsyntaxVersion: '${syntaxVersion}'\ncurrency: USD\nfeatures:\n  enabled:\n    valueType: BOOLEAN\n    defaultValue: true\n    type: DOMAIN\nusageLimits:\n  calls:\n    valueType: NUMERIC\n    defaultValue: 10\n    type: NON_RENEWABLE\n    trackable: true\nplans:\n  ${plan}:\n    price: ${price}\n    unit: /month\n    features:\n      enabled: true\n    usageLimits:\n      calls: 10\n`;
@@ -47,7 +48,7 @@ describe('SPHERE synchronization with isolated MongoDB', () => {
   });
   afterAll(async () => {
     for (const copy of await Pricing.find({}).lean()) if (copy.yamlPath) files.add(copy.yamlPath);
-    for (const file of files) await fs.rm(`public${file}`, { force: true });
+    for (const file of files) { const stored = pricingYamlFile(file); if (stored) await fs.rm(stored, { force: true }); }
     await mongoose.connection.dropDatabase(); await mongoose.disconnect(); nock.cleanAll();
   });
   async function create(policy: any = 'new_last') {
@@ -80,7 +81,8 @@ describe('SPHERE synchronization with isolated MongoDB', () => {
     remote([v(one, '1.0', legacy)], { [one]: legacy });
     const service = await sync.create({ permanentUrl: `${origin}/p/${id}`, policy: 'new_last', acceptedSyntaxUpgradeVersionId: one }, 'org');
     const snapshot: any = await Pricing.findOne({ 'sphere.serviceId': String(service.id) }).lean();
-    expect(await fs.readFile(`public${snapshot.yamlPath}`, 'utf8')).toMatch(/syntaxVersion: ['"]?3\.1/);
+    expect(snapshot.yamlPath).toMatch(/^\/private\/sphere\//);
+    expect(await fs.readFile(pricingYamlFile(snapshot.yamlPath)!, 'utf8')).toMatch(/syntaxVersion: ['"]?3\.1/);
   });
   it('New preserves current bindings and retains old versions only while used', async () => {
     const service = await create(); await contract(); await update(service);
@@ -120,7 +122,7 @@ describe('SPHERE synchronization with isolated MongoDB', () => {
       expect(configuration.status).toBe('ready');
       const stored = await Pricing.findOne({ 'sphere.versionId': two }).lean();
       expect(stored?.createdAt.toISOString()).toBe('2025-03-04T10:20:30.456Z');
-      expect(await fs.readFile(`public${stored!.yamlPath}`, 'utf8')).toContain('2025-03-04T10:20:30.456Z');
+      expect(await fs.readFile(pricingYamlFile(stored!.yamlPath!)!, 'utf8')).toContain('2025-03-04T10:20:30.456Z');
     });
     it('still accepts a date-only YAML published on the same UTC day as SPHERE lists', async () => {
       expect((await publishSecond('2025-03-04', '2025-03-04T10:20:30.456Z')).status).toBe('ready');

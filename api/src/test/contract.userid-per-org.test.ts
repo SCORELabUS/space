@@ -15,6 +15,7 @@ import {
   deleteTestOrganization,
 } from './utils/organization/organizationTestUtils';
 import { generateOrganizationApiKey } from '../main/utils/users/helpers';
+import type { LeanContract } from '../main/types/models/Contract';
 import { LeanUser } from '../main/types/models/User';
 import { LeanOrganization } from '../main/types/models/Organization';
 import ContractMongoose from '../main/repositories/mongoose/models/ContractMongoose';
@@ -681,6 +682,36 @@ describe('Contract userId unique per organization', function () {
   });
 
   describe('moving a service to another organization', function () {
+    it('checks target userId collisions beyond the first page before moving anything', async function () {
+      const zoom = await request(app).post(`${baseUrl}/services`).set('x-api-key', keyA).attach('pricing', ZOOM_PRICING_PATH);
+      expect(zoom.status).toBe(201);
+      const zoomName = zoom.body.name.toLowerCase();
+      const zoomVersion = Object.keys(zoom.body.activePricings)[0];
+      const shared = `last-page-${uuidv4()}`;
+      for (let index = 0; index < 25; index++) {
+        const id = index === 24 ? shared : `filler-${uuidv4()}`;
+        const result = await createContract(keyA, id, index === 24 ? 'z-collision' : `a-filler-${index}`, 'BASIC', {
+          contractedServices: { [zoomName]: zoomVersion },
+          subscriptionPlans: { [zoomName]: 'BASIC' },
+        });
+        expect(result.status, JSON.stringify(result.body)).toBe(201);
+      }
+      expect((await createContract(keyB, shared, 'target-contract', 'GOLD')).status).toBe(201);
+      const firstPage = await container.resolve('contractRepository').findByFilters({ filters: { services: [zoomName] }, organizationId: orgA.id });
+      expect(firstPage).toHaveLength(20);
+      expect(firstPage.some((contract: LeanContract) => contract.userContact.userId === shared)).toBe(false);
+
+      const move = await request(app).put(`${baseUrl}/services/${zoomName}`).set('x-api-key', keyA)
+        .send({ organizationId: orgB.id });
+      expect(move.status, JSON.stringify(move.body)).toBe(409);
+      expect(move.body.error).toContain(shared);
+      expect((await ServiceMongoose.findOne({ name: zoom.body.name, organizationId: orgA.id }).lean())).not.toBeNull();
+      expect(await ServiceMongoose.countDocuments({ name: zoom.body.name, organizationId: orgB.id })).toBe(0);
+      expect(await ContractMongoose.countDocuments({ organizationId: orgA.id, [`contractedServices.${zoomName}`]: { $exists: true } })).toBe(25);
+      expect(await PricingMongoose.countDocuments({ name: zoom.body.name, _organizationId: orgB.id })).toBe(0);
+      expect((await stored(orgB.id!, shared)).userContact.username).toBe('target-contract');
+    });
+
     it('is refused with 409 when a contract it would move uses a userId the target organization already has', async function () {
       const zoom = await request(app).post(`${baseUrl}/services`).set('x-api-key', keyA).attach('pricing', ZOOM_PRICING_PATH);
       expect(zoom.status).toBe(201);

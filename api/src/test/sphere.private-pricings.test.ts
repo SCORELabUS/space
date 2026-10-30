@@ -14,6 +14,7 @@ import container from '../main/config/container';
 import Service from '../main/repositories/mongoose/models/ServiceMongoose';
 import Pricing from '../main/repositories/mongoose/models/PricingMongoose';
 import { functionalHash } from '../main/services/sphere/SphereClient';
+import { pricingYamlFile } from '../main/services/pricingFiles';
 
 /**
  * Private SPHERE pricings: a linked service may hold a SPHERE API key
@@ -99,12 +100,8 @@ describe('Private SPHERE pricings (sphereApiKey)', () => {
 
   afterEach(async () => {
     for (const copy of await Pricing.find({ _organizationId: organization.id }).lean() as any[]) {
-      if (copy.yamlPath?.startsWith('/static/pricings/sphere/')) {
-        fs.rmSync(path.dirname(path.resolve('public', `.${copy.yamlPath}`)), { recursive: true, force: true });
-      }
-      if (copy.yamlPath?.startsWith('/private/sphere/')) {
-        fs.rmSync(path.dirname(path.resolve(`.${copy.yamlPath}`)), { recursive: true, force: true });
-      }
+      const file = copy.yamlPath && pricingYamlFile(copy.yamlPath);
+      if (file) fs.rmSync(file, { force: true });
     }
     process.env.SPHERE_PUBLIC_URL = origin;
     process.env.SPHERE_API_URL = `${origin}/api/v1`;
@@ -179,7 +176,8 @@ describe('Private SPHERE pricings (sphereApiKey)', () => {
       const response = await configure({ sphereApiKey: SPHERE_KEY });
 
       expect(response.status).toBe(400);
-      expect(response.body.error).toContain('SPHERE_KEY_ENCRYPTION_KEY');
+      expect(response.body.code).toBe('SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE');
+      expect(response.body.error).toMatch(/administrator.*credential storage/i);
       expect(response.body.error).not.toContain(SPHERE_KEY);
       const document = await stored();
       expect(document.sphere).not.toHaveProperty('encryptedApiKey');
@@ -193,7 +191,9 @@ describe('Private SPHERE pricings (sphereApiKey)', () => {
       const response = await configure({ sphereApiKey: SPHERE_KEY });
 
       expect(response.status).toBe(400);
-      expect(response.body.error).toContain('SPHERE rejected the API key');
+      expect(response.body.code).toBe('SPHERE_KEY_REJECTED');
+      expect(response.body.error).toMatch(/key.*cannot access/i);
+      expect(response.body.error).not.toContain(SPHERE_KEY);
       expect((await stored()).sphere).not.toHaveProperty('encryptedApiKey');
     });
 
@@ -288,10 +288,16 @@ describe('Private SPHERE pricings (sphereApiKey)', () => {
         });
       expect(authorised.status).toBe(200);
       expect(String(authorised.body)).toContain('saasName');
-      // No public URL for it either (what GET .../public-url answers).
-      await expect(
-        container.resolve('serviceService').showPublicPricingUrl(serviceName, '2.0', organization.id)
-      ).rejects.toThrow(/NOT FOUND: .*private/);
+      // Despite its legacy name, public-url returns an authenticated download route.
+      const download = await request(app)
+        .get(`${baseUrl}/services/${serviceName}/pricings/2.0/public-url`)
+        .set('x-api-key', allKey);
+      expect(download.status).toBe(200);
+      expect(download.body.requiresAuthentication).toBe(true);
+      expect(download.body.path).toBe(`${baseUrl}/services/${serviceName}/pricings/2.0?format=yaml`);
+      const withoutCredential = await request(app).get(download.body.path);
+      expect(withoutCredential.status).toBe(401);
+      expect(String(withoutCredential.text ?? '')).not.toContain('saasName');
     });
 
     it('never sends the key to another SPHERE origin: the service is degraded instead', async () => {
@@ -365,6 +371,111 @@ describe('Private SPHERE pricings (sphereApiKey)', () => {
   });
 
   describe('POST /services/sphere/preview and POST /services (source: sphere)', () => {
+    it.each([401, 403, 404])('asks for access when anonymous SPHERE lookup returns %s', async status => {
+      const sphere = nock(origin, { badheaders: ['x-api-key'] })
+        .get(`/api/v1/public/pricings/${pricingId}`).reply(status, { error: 'unavailable' });
+      const response = await request(app).post(`${baseUrl}/services/sphere/preview`).set('x-api-key', allKey)
+        .send({ permanentUrl, policy: 'new_last' });
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe('SPHERE_ACCESS_REQUIRED');
+      expect(sphere.isDone()).toBe(true);
+      expect(await Service.countDocuments({ organizationId: organization.id })).toBe(0);
+    });
+
+    it.each([401, 403, 404])('reports a supplied key that cannot access SPHERE (%s)', async status => {
+      const sphere = nock(origin, { reqheaders: { 'x-api-key': SPHERE_KEY } })
+        .get(`/api/v1/public/pricings/${pricingId}`).reply(status, { error: 'unavailable' });
+      const response = await request(app).post(`${baseUrl}/services/sphere/preview`).set('x-api-key', allKey)
+        .send({ permanentUrl, policy: 'new_last', sphereApiKey: SPHERE_KEY });
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe('SPHERE_KEY_REJECTED');
+      expect(JSON.stringify(response.body)).not.toContain(SPHERE_KEY);
+      expect(sphere.isDone()).toBe(true);
+      expect(await Service.countDocuments({ organizationId: organization.id })).toBe(0);
+    });
+
+    it('does not treat an upstream outage as a request for a credential', async () => {
+      const sphere = nock(origin).get(`/api/v1/public/pricings/${pricingId}`).reply(500);
+      const response = await request(app).post(`${baseUrl}/services/sphere/preview`).set('x-api-key', allKey)
+        .send({ permanentUrl, policy: 'new_last' });
+      expect(response.status).toBe(400);
+      expect(response.body.code).not.toBe('SPHERE_ACCESS_REQUIRED');
+      expect(response.body.code).not.toBe('SPHERE_KEY_REJECTED');
+      expect(sphere.isDone()).toBe(true);
+    });
+
+    it('previews an existing private service using its saved key without returning it', async () => {
+      await linkService();
+      sphereWithKey();
+      const configured = await configure({ sphereApiKey: SPHERE_KEY });
+      expect(configured.status).toBe(200);
+      const before = (await stored()).sphere.encryptedApiKey;
+      const sphere = sphereWithKey(true);
+      const response = await request(app).post(`${baseUrl}/services/sphere/preview`).set('x-api-key', allKey)
+        .send({ serviceName, permanentUrl, policy: 'new_last' });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(sphere.isDone()).toBe(true);
+      expect(response.body.versions.find((v: any) => v.versionId === privateId).private).toBe(true);
+      expect(JSON.stringify(response.body)).not.toContain(SPHERE_KEY);
+      expect(JSON.stringify(response.body)).not.toContain('encryptedApiKey');
+      expect((await stored()).sphere.encryptedApiKey).toEqual(before);
+    });
+
+    it('previews replacement and removal without changing the saved credential', async () => {
+      await linkService();
+      sphereWithKey();
+      expect((await configure({ sphereApiKey: SPHERE_KEY })).status).toBe(200);
+      const before = (await stored()).sphere.encryptedApiKey;
+      const replacement = 'sk-sphere-replacement-0123456789abcdef';
+      const withReplacement = nock(origin, { reqheaders: { 'x-api-key': replacement } });
+      withReplacement.get(`/api/v1/public/pricings/${pricingId}`).reply(200, manifest(true));
+      withReplacement.get(`/api/v1/public/pricings/${pricingId}/versions/${privateId}/yaml`).reply(200, privateText);
+      const changed = await request(app).post(`${baseUrl}/services/sphere/preview`).set('x-api-key', allKey)
+        .send({ serviceName, permanentUrl, policy: 'new_last', sphereApiKey: replacement });
+      expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+      expect(withReplacement.isDone()).toBe(true);
+      expect(JSON.stringify(changed.body)).not.toContain(replacement);
+
+      const anonymous = sphereAnonymous(true);
+      const removed = await request(app).post(`${baseUrl}/services/sphere/preview`).set('x-api-key', allKey)
+        .send({ serviceName, permanentUrl, policy: 'new_last', sphereApiKey: null });
+      expect(removed.status, JSON.stringify(removed.body)).toBe(200);
+      expect(anonymous.isDone()).toBe(true);
+      expect(removed.body.versions.some((v: any) => v.private)).toBe(false);
+      expect((await stored()).sphere.encryptedApiKey).toEqual(before);
+    });
+
+    it('never uses another organization saved credential for a preview', async () => {
+      await linkService();
+      sphereWithKey();
+      expect((await configure({ sphereApiKey: SPHERE_KEY })).status).toBe(200);
+      const other = await createTestOrganization(owner.username);
+      const otherKey = generateOrganizationApiKey();
+      await addApiKeyToOrganization(other.id!, { key: otherKey, scope: 'ALL' });
+      const leak = nock(origin, { reqheaders: { 'x-api-key': SPHERE_KEY } }).get(() => true).reply(200, manifest(true));
+      try {
+        const response = await request(app).post(`${baseUrl}/services/sphere/preview`).set('x-api-key', otherKey)
+          .send({ serviceName, permanentUrl, policy: 'new_last' });
+        expect(response.status).toBe(404);
+        expect(leak.isDone()).toBe(false);
+        expect(JSON.stringify(response.body)).not.toContain(SPHERE_KEY);
+      } finally {
+        await deleteTestOrganization(other.id!);
+      }
+    });
+
+    it('never uses a saved credential to preview a different pricing', async () => {
+      await linkService();
+      sphereWithKey();
+      expect((await configure({ sphereApiKey: SPHERE_KEY })).status).toBe(200);
+      const leak = nock(origin, { reqheaders: { 'x-api-key': SPHERE_KEY } }).get(() => true).reply(200, manifest(true));
+      const response = await request(app).post(`${baseUrl}/services/sphere/preview`).set('x-api-key', allKey)
+        .send({ serviceName, permanentUrl: `${origin}/p/666666666666666666666666`, policy: 'new_last' });
+      expect(response.status).toBe(400);
+      expect(leak.isDone()).toBe(false);
+      expect(JSON.stringify(response.body)).not.toContain(SPHERE_KEY);
+    });
+
     it('previews private versions with a key without storing it', async () => {
       const sphere = sphereWithKey(true);
 
@@ -396,6 +507,19 @@ describe('Private SPHERE pricings (sphereApiKey)', () => {
       expect((await stored()).sphere.encryptedApiKey).toMatchObject({ v: 1 });
     });
 
+    it.each([401, 403, 404])('safely rejects creation if SPHERE access changes (%s)', async status => {
+      const scope = nock(origin, { reqheaders: { 'x-api-key': SPHERE_KEY } })
+        .get(`/api/v1/public/pricings/${pricingId}`).reply(status, { error: SPHERE_KEY });
+      const response = await request(app).post(`${baseUrl}/services`).set('x-api-key', allKey)
+        .send({ source: 'sphere', permanentUrl, policy: 'new_last', sphereApiKey: SPHERE_KEY });
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe('SPHERE_KEY_REJECTED');
+      expect(JSON.stringify(response.body)).not.toContain(SPHERE_KEY);
+      expect(scope.isDone()).toBe(true);
+      expect(await Service.countDocuments({ organizationId: organization.id })).toBe(0);
+      expect(await Pricing.countDocuments({ _organizationId: organization.id })).toBe(0);
+    });
+
     it('refuses to create with a key when SPHERE_KEY_ENCRYPTION_KEY is not set', async () => {
       delete process.env.SPHERE_KEY_ENCRYPTION_KEY;
       sphereWithKey();
@@ -404,7 +528,8 @@ describe('Private SPHERE pricings (sphereApiKey)', () => {
         .send({ source: 'sphere', permanentUrl, policy: 'new_last', sphereApiKey: SPHERE_KEY });
 
       expect(response.status).toBe(400);
-      expect(response.body.error).toContain('SPHERE_KEY_ENCRYPTION_KEY');
+      expect(response.body.code).toBe('SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE');
+      expect(response.body.error).not.toContain('SPHERE_KEY_ENCRYPTION_KEY');
       expect(await Service.countDocuments({ organizationId: organization.id })).toBe(0);
       expect(await Pricing.countDocuments({ _organizationId: organization.id })).toBe(0);
     });
