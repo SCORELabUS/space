@@ -296,6 +296,21 @@ describe('Uploading a pricing version the service has archived', function () {
       expect(fs.readFileSync(file).equals(bytes)).toBe(true);
     });
 
+    it('distinguishes Infinity and NaN when comparing archived numeric content', async function () {
+      const infinite = vetclinicFile('3.0', pricing => { pricing.plans.GOLD.price = Infinity; });
+      expect((await addVersion(infinite)).status).toBe(201);
+      const archived = await request(app).put(`${baseUrl}/services/Vetclinic/pricings/3.0?availability=archived`)
+        .set('x-api-key', orgKey).send({ subscriptionPlan: 'GOLD', subscriptionAddOns: {} });
+      expect(archived.status, JSON.stringify(archived.body)).toBe(200);
+      const file = await yamlFileOf('3_0'); const bytes = fs.readFileSync(file); const before = await service();
+      const changed = vetclinicFile('3.0', pricing => { pricing.plans.GOLD.price = NaN; });
+      const response = await addVersion(changed);
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(await service()).toEqual(before);
+      expect(await pricingDocs()).toHaveLength(3);
+      expect(fs.readFileSync(file).equals(bytes)).toBe(true);
+    });
+
     it('compares content, not formatting: the same pricing written differently is the same version', async function () {
       const reformatted = path.resolve(path.dirname(vetclinic1()), `reformatted-${uuidv4()}.yaml`);
       const pricing: any = yaml.load(fs.readFileSync(vetclinic1(), 'utf8'));

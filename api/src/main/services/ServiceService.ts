@@ -1,10 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import ServiceRelocationRepository from '../repositories/mongoose/ServiceRelocationRepository';
 import { assertNoPendingRelocation, relocationGlobalLease } from './serviceRelocationState';
 import { withOrganizationLocks, withOrganizationLock } from './sphere/lock';
 import ServiceModel from '../repositories/mongoose/models/ServiceMongoose';
 import PricingModel from '../repositories/mongoose/models/PricingMongoose';
-import { createHash } from 'node:crypto';
 import { retrievePricingFromPath, retrievePricingFromText } from 'pricing4ts/server';
 import container from '../config/container';
 import ServiceRepository, { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository';
@@ -151,19 +150,16 @@ export function pricingContentHash(pricing: any): string {
   const picked = Object.fromEntries(PRICING_CONTENT_FIELDS.map(field => [field, pricing?.[field]]));
   const normalized: any = new PricingModel(picked).toJSON({ flattenMaps: true });
   const canonical = (value: any): any => {
-    if (value instanceof Date) return value.toISOString();
-    if (Array.isArray(value)) return value.map(canonical);
+    if (value instanceof Date) return ['date', value.toISOString()];
+    if (Array.isArray(value)) return ['array', value.map(canonical)];
     if (value && typeof value === 'object') {
-      return Object.fromEntries(
-        Object.keys(value)
-          // Map keys such as features.id and plans.BASIC.features._id are pricing content.
-          // Storage metadata is already excluded by PRICING_CONTENT_FIELDS at the root.
-          .filter(key => value[key] !== undefined)
-          .sort()
-          .map(key => [key, canonical(value[key])])
-      );
+      // Type tags keep numeric sentinels distinct from real string/map content.
+      return ['object', Object.keys(value).filter(key => value[key] !== undefined).sort()
+        .map(key => [key, canonical(value[key])])];
     }
-    return value;
+    if (value === null) return ['null'];
+    if (typeof value === 'number') return ['number', String(value)];
+    return [typeof value, value];
   };
   const material = canonical(Object.fromEntries(PRICING_CONTENT_FIELDS.map(field => [field, normalized[field]])));
   return createHash('sha256').update(JSON.stringify(material)).digest('hex');
