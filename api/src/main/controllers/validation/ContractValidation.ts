@@ -540,6 +540,29 @@ interface SubscriptionValidationOptions {
 const findKey = (record: Record<string, unknown> | undefined, key: string) =>
   Object.keys(record ?? {}).find(candidate => candidate.toLowerCase() === key.toLowerCase());
 
+/** Whether the subscription selects for `serviceName` the same plan and add-ons as `previous`. */
+function sameSelection(
+  subscription: Subscription,
+  previous: NonNullable<SubscriptionValidationOptions['previous']>,
+  serviceName: string
+): boolean {
+  const pick = <T>(record: Record<string, T> | undefined) => {
+    const key = findKey(record, serviceName);
+    return key === undefined ? undefined : record![key];
+  };
+  const plan = pick(subscription.subscriptionPlans);
+  const previousPlan = pick(previous.subscriptionPlans);
+  if ((plan ?? '').toLowerCase() !== (previousPlan ?? '').toLowerCase()) return false;
+
+  const addOns = Object.entries(pick(subscription.subscriptionAddOns) ?? {}).filter(([, quantity]) => quantity !== 0);
+  const previousAddOns = pick(previous.subscriptionAddOns) ?? {};
+  const previousSelected = Object.entries(previousAddOns).filter(([, quantity]) => quantity !== 0);
+  return (
+    addOns.length === previousSelected.length &&
+    addOns.every(([addOn, quantity]) => (previousAddOns as Record<string, number>)[addOn] === quantity)
+  );
+}
+
 /**
  * Every problem of a subscription, with stable codes, and the pricings of the
  * services whose version could be loaded.
@@ -575,7 +598,25 @@ async function collectSubscriptionErrors(
       };
 
       const status = await serviceService.pricingVersionStatus(serviceName, pricingVersion, organizationId);
-      if (status === 'no-service') return { serviceName, error: notFound };
+      if (status === 'no-service') {
+        const dormant = (await serviceService.dormantServices([serviceName], organizationId))[serviceName.toLowerCase()];
+        if (dormant !== 'SERVICE_DISABLED') return { serviceName, error: notFound };
+        // A disabled service is dormant in the contracts that have it: a
+        // novation may keep it exactly as it is (so that it is there again
+        // when the service is enabled), but not subscribe to it or change it.
+        if (previous && unchanged && sameSelection(subscription, previous, serviceName)) {
+          return { serviceName, dormant: true };
+        }
+        return {
+          serviceName,
+          error: {
+            ...notFound,
+            message: previousKey !== undefined
+              ? `Service ${serviceName} is disabled in the request organization: a contract can keep its subscription to it unchanged, but cannot change it`
+              : `Service ${serviceName} is disabled in the request organization and cannot be subscribed to`,
+          },
+        };
+      }
       if (status === 'archived' && !unchanged) {
         return {
           serviceName,
@@ -603,7 +644,7 @@ async function collectSubscriptionErrors(
 
   for (const result of loaded) {
     if (result.error) errors.push(result.error);
-    else pricings[result.serviceName] = result.pricing as LeanPricing;
+    else if (result.pricing) pricings[result.serviceName] = result.pricing as LeanPricing;
   }
 
   const serviceNames = Array.from(

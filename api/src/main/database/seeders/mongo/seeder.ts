@@ -1,3 +1,6 @@
+import IdempotencyKey from '../../../repositories/mongoose/models/IdempotencyKeyMongoose';
+import UsageConsumption from '../../../repositories/mongoose/models/UsageConsumptionMongoose';
+import { ServiceRelocation, ServiceRelocationStep } from '../../../repositories/mongoose/models/ServiceRelocationMongoose';
 import { Seeder } from 'mongo-seeding';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -30,8 +33,11 @@ export const seedDatabase = async () => {
     await Promise.all([
       ServiceModel.syncIndexes(),
       ContractModel.syncIndexes(),
+      UsageConsumption.syncIndexes(),
+      IdempotencyKey.syncIndexes(),
       PricingModel.syncIndexes(),
       UserModel.syncIndexes(),
+      ServiceRelocation.syncIndexes(), ServiceRelocationStep.syncIndexes(),
     ]);
     console.log('All indexes have been (re)built after seeding.');
   } catch (err) {

@@ -111,6 +111,7 @@ describe('Pricing versions of a contract', function () {
           newContractsVersion: '2.0.1',
           plan: 'GOLD',
           addOns: { extraPets: 2 },
+          serviceStatus: 'enabled',
         },
       },
       contractVersion: contract.body.contractVersion,

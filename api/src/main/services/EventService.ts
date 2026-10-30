@@ -1,16 +1,38 @@
-import { Server as SocketIOServer } from 'socket.io';
+import { Server as SocketIOServer, Socket } from 'socket.io';
 import { Server } from 'http';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { createClient } from 'redis';
+import { v7 as uuidv7 } from 'uuid';
 import { LeanOrganization, OrganizationMember } from '../types/models/Organization';
 import { computeContractVersion } from '../utils/contracts/version';
 
 export type ContractEventCode = 'CONTRACT_CREATED' | 'CONTRACT_NOVATED' | 'CONTRACT_DELETED' | 'CONTRACT_RENEWED';
 
+/**
+ * Identity of one event, the same in every copy of it (every connection, every
+ * instance behind the Redis adapter), so that consumers can drop duplicates.
+ *
+ * - `eventId`: UUIDv7 (RFC 9562). Opaque for comparison; it sorts roughly by
+ *   emission time, which is not the order in which changes were stored, so it
+ *   must not be used to order changes.
+ * - `occurredAt`: ISO 8601 (UTC, milliseconds), this server's clock when the
+ *   change was stored (taken when the write returned).
+ */
+export interface EventEnvelope {
+  eventId: string;
+  occurredAt: string;
+}
+
 /** Payload of the `message` events of the `/contracts` namespace. */
-export interface ContractEvent {
+export interface ContractEvent extends EventEnvelope {
   code: ContractEventCode;
   details: { userId: string; organizationId: string; contractVersion: string | null; services: string[] };
+}
+
+/** A new event identity. `occurredAt` defaults to now, for emitters called right after their write. */
+export function eventEnvelope(occurredAt: Date = new Date()): EventEnvelope {
+  const at = Number.isNaN(occurredAt.getTime()) ? new Date() : occurredAt;
+  return { eventId: uuidv7(), occurredAt: at.toISOString() };
 }
 
 /** Socket.IO room of an organization in the `/contracts` namespace. */
@@ -89,6 +111,9 @@ class EventService {
   private io: SocketIOServer | null = null;
   private pubClient?: ReturnType<typeof createClient>;
   private subClient?: ReturnType<typeof createClient>;
+  // Credentials stay in this process; socket.data and Redis carry no API key.
+  private contractAuthorizers = new WeakMap<Socket, () => Promise<string>>();
+  private contractDelivery: Promise<void> = Promise.resolve();
 
   /**
    * Inicializa el servicio de eventos con un servidor HTTP.
@@ -127,12 +152,24 @@ class EventService {
   private setupContractEvents(): void {
     if (!this.io) return;
 
-    const contracts = this.io.of('/contracts');
+    const io = this.io;
+    const contracts = io.of('/contracts');
 
     contracts.use((socket, next) => {
-      authorizeContractEvents(socket.handshake)
+      const header = socket.handshake.headers['x-api-key'];
+      const proof = Object.freeze({ auth: Object.freeze({
+        apiKey: socket.handshake.auth?.apiKey ?? (Array.isArray(header) ? header[0] : header),
+        organizationId: socket.handshake.auth?.organizationId ?? socket.handshake.query?.organizationId,
+      }) });
+      const authorize = () => authorizeContractEvents(proof);
+      authorize()
         .then(organizationId => {
+          if (this.io !== io || socket.conn.readyState !== 'open') {
+            next(new Error('Connection closed during authentication'));
+            return;
+          }
           socket.data.organizationId = organizationId;
+          this.contractAuthorizers.set(socket, authorize);
           next();
         })
         .catch((error: Error) => next(new Error(error.message)));
@@ -140,6 +177,70 @@ class EventService {
 
     contracts.on('connection', socket => {
       socket.join(organizationRoom(socket.data.organizationId));
+      socket.once('disconnect', () => this.contractAuthorizers.delete(socket));
+    });
+
+    // Inter-server messages never bypass the recipient instance's authorization.
+    contracts.on('contract-event', (event: ContractEvent) => this.queueContractEvent(event));
+    contracts.on('contract-access-changed', () => {
+      void this.revalidateLocalContractConnections().catch(error => {
+        console.error('Contract connections could not be revalidated', (error as Error).message);
+      });
+    });
+  }
+
+  private async contractSocketAuthorized(socket: Socket): Promise<boolean> {
+    const authorize = this.contractAuthorizers.get(socket);
+    if (!authorize || !socket.connected || !this.io) return false;
+    try {
+      const organizationId = await authorize();
+      // A concurrent revocation/close may have disconnected it during the read.
+      if (!socket.connected || !this.io || this.contractAuthorizers.get(socket) !== authorize) return false;
+      if (organizationId === socket.data.organizationId) return true;
+    } catch {
+      // Lost authority or an unavailable database: do not deliver private data.
+    }
+    socket.disconnect();
+    return false;
+  }
+
+  private async revalidateLocalContractConnections(): Promise<void> {
+    const contracts = this.io?.of('/contracts');
+    if (!contracts) return;
+    await Promise.all([...contracts.sockets.values()].map(socket => this.contractSocketAuthorized(socket)));
+  }
+
+  /** Called after persisted key, membership, ownership or user authority changes. */
+  async revalidateContractConnections(): Promise<void> {
+    if (!this.io) return;
+    try {
+      if (this.pubClient?.isReady) this.io.of('/contracts').serverSideEmit('contract-access-changed');
+    } catch (error) {
+      console.error('Contract access change could not be broadcast', (error as Error).message);
+    }
+    // A failed control broadcast must still revalidate this instance. Other
+    // instances independently recheck permission before their next delivery.
+    try {
+      await this.revalidateLocalContractConnections();
+    } catch (error) {
+      console.error('Contract connections could not be revalidated', (error as Error).message);
+    }
+  }
+
+  private queueContractEvent(event: ContractEvent): void {
+    const io = this.io;
+    this.contractDelivery = this.contractDelivery.then(async () => {
+      if (!io || this.io !== io) return;
+      const sockets = [...io.of('/contracts').sockets.values()]
+        .filter(socket => socket.data.organizationId === event.details.organizationId);
+      await Promise.all(sockets.map(async socket => {
+        if (await this.contractSocketAuthorized(socket) && this.io === io && socket.connected) {
+          socket.emit('message', event);
+        }
+      }));
+    }).catch(error => {
+      // One failed notification must not poison the queue or fail a mutation.
+      console.error('Contract event could not be delivered', (error as Error).message);
     });
   }
 
@@ -147,8 +248,15 @@ class EventService {
    * Emit a contract event to the connections of the contract's organization.
    * Call it after the change is persisted. It never throws: a notification
    * failure must not fail the change that was already made.
+   *
+   * @param options.occurredAt when the change was stored (taken right after the
+   *        write returned); defaults to now.
    */
-  emitContractEvent(code: ContractEventCode, contract: any, options: { deleted?: boolean } = {}): void {
+  emitContractEvent(
+    code: ContractEventCode,
+    contract: any,
+    options: { deleted?: boolean; occurredAt?: Date } = {}
+  ): void {
     try {
       if (!this.io || !contract?.organizationId || !contract?.userContact?.userId) return;
       const contractedServices = contract.contractedServices instanceof Map
@@ -156,6 +264,7 @@ class EventService {
         : contract.contractedServices ?? {};
       const event: ContractEvent = {
         code,
+        ...eventEnvelope(options.occurredAt),
         details: {
           userId: contract.userContact.userId,
           organizationId: String(contract.organizationId),
@@ -163,15 +272,18 @@ class EventService {
           services: Object.keys(contractedServices),
         },
       };
-      this.io.of('/contracts').to(organizationRoom(event.details.organizationId)).emit('message', event);
+      this.queueContractEvent(event);
+      if (this.pubClient?.isReady) this.io.of('/contracts').serverSideEmit('contract-event', event);
     } catch (error) {
       console.error('Contract event could not be emitted', (error as Error).message);
     }
   }
 
   async close() {
-    if (this.io) await new Promise<void>(resolve => this.io!.close(() => resolve()));
+    const io = this.io;
     this.io = null;
+    this.contractAuthorizers = new WeakMap();
+    if (io) await new Promise<void>(resolve => io.close(() => resolve()));
     if (this.pubClient?.isOpen) await this.pubClient.quit();
     if (this.subClient?.isOpen) await this.subClient.quit();
   }
@@ -207,6 +319,7 @@ class EventService {
 
     this.io.of('/pricings').emit('message', {
       code: 'PRICING_CREATED',
+      ...eventEnvelope(),
       details: {
         serviceName,
         pricingVersion
@@ -222,6 +335,7 @@ class EventService {
 
     this.io.of('/pricings').emit('message', {
       code: 'PRICING_ARCHIVED',
+      ...eventEnvelope(),
       details: {
         serviceName,
         pricingVersion
@@ -237,6 +351,7 @@ class EventService {
 
     this.io.of('/pricings').emit('message', {
       code: 'PRICING_ACTIVED',
+      ...eventEnvelope(),
       details: {
         serviceName,
         pricingVersion
@@ -252,6 +367,7 @@ class EventService {
 
     this.io.of('/pricings').emit('message', {
       code: 'SERVICE_DISABLED',
+      ...eventEnvelope(),
       details: {
         serviceName
       }

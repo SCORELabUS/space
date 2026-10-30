@@ -11,17 +11,21 @@ import { pricingTokenAlgorithm } from './pricingTokenKeys';
 export const SPACE_CAPABILITIES: readonly string[] = Object.freeze([
   'contract-org-scope',
   'contract-version',
+  'atomic-usage-limits',
   'keep-billing-period',
   'reject-private',
   'pricing-yaml',
   'new-contracts-version',
+  'idempotency-key',
   'contract-pricings',
   'novation-preview',
   'token-subscription',
   'pricing-token-jwks',
   'contract-events',
+  'contract-event-ids',
   'sphere-private',
   'contract-userid-per-org',
+  'service-disable-dormant',
 ]);
 
 export const CAPABILITIES_HEADER = 'X-Space-Capabilities';
