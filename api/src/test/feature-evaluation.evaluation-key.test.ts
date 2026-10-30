@@ -204,9 +204,11 @@ describe('EVALUATION-scoped organization API keys', function () {
       const { payload } = await jwtVerify(
         response.body.pricingToken,
         encryptJWTSecret(process.env.JWT_SECRET!),
-        { algorithms: ['HS256'] }
+        { algorithms: ['HS256'], issuer: process.env.JWT_ISSUER || 'space', audience: organization.id! }
       );
-      expect(payload.sub).toEqual(userId);
+      expect(payload.sub).toEqual(`urn:space:${organization.id}:${encodeURIComponent(userId)}`);
+      expect(payload.userId).toEqual(userId);
+      expect(payload.organizationId).toEqual(organization.id);
       expect((payload.features as any)['petclinic-pets'].eval).toBe(true);
     });
 
