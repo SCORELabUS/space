@@ -1,7 +1,9 @@
+import type { DormantReason } from './ServiceService';
+import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import container from '../config/container';
 import type { IdempotentContractWrite } from '../repositories/mongoose/IdempotencyContractRepository';
-import { assertIdempotencyOwnership } from './idempotencyExecution';
+import { assertIdempotencyOwnership, IdempotencyStateChangedError } from './idempotencyExecution';
 import Service from '../repositories/mongoose/models/ServiceMongoose';
 import { assertNoPendingRelocation } from './serviceRelocationState';
 import { withOrganizationLock } from './sphere/lock';
@@ -35,6 +37,7 @@ export function consumptionEvaluation(action: IdempotentAction, outcome: any): a
 /** Execute an immutable domain plan; the HTTP response is a separate final checkpoint. */
 export async function executeIdempotentAction(proposed: IdempotentAction): Promise<any> {
   const execution = await assertIdempotencyOwnership();
+  if (proposed.organizationId !== execution.organizationId) throw new Error('Idempotency action organization mismatch');
   execution.record = await execution.repository.prepare(execution.organizationId, execution.key, execution.owner, proposed);
   const action: IdempotentAction = execution.record.plan;
   if (action.kind !== proposed.kind || action.organizationId !== execution.organizationId) throw new Error('Idempotency action mismatch');
@@ -48,16 +51,7 @@ export async function executeIdempotentAction(proposed: IdempotentAction): Promi
     const receipts: any = container.resolve('idempotencyContractRepository');
     const consumptions: any = container.resolve('usageConsumptionRepository');
     let value: any;
-    if (action.kind === 'revert') {
-      execution.inAction = true;
-      try {
-        // The original legacy selection is frozen in the plan. #84 performs
-        // its atomic refund/receipt and finishes any interrupted acknowledgement.
-        await container.resolve('contractService').revertConsumption(action.consumption.userId,
-          action.consumption.featureId, action.consumption.id, action.organizationId);
-      } finally { execution.inAction = false; }
-      value = action.result ?? null;
-    } else {
+    {
       if (action.kind === 'consume') {
         const consumption = action.consumption;
         const existing = await consumptions.find(consumption.id, consumption);
@@ -72,14 +66,38 @@ export async function executeIdempotentAction(proposed: IdempotentAction): Promi
         const stepId = createHash('sha256').update(`${execution.operationId}:${index}`).digest('hex');
         let step = execution.record.steps?.[stepId];
         if (!step) {
-          const result = await receipts.apply(write, stepId, new Date(execution.record.lockedUntil));
+          const result = await receipts.apply(write, stepId, new Date(execution.record.lockedUntil), { operationId: execution.operationId, key: execution.key, organizationId: execution.organizationId }, async (current: any) => {
+            // Revalidate availability only for a NEW effect. apply() returns its
+            // own persisted receipt before invoking this callback, so a paused
+            // service cannot hide a mutation that already succeeded.
+            const names = ['create', 'novate', 'group'].includes(action.kind)
+              ? Object.keys(write.create?.contractedServices ?? write.set?.contractedServices ?? {})
+              : [...Object.keys(write.increments ?? {}).map(path => path.split('.')[0]),
+                ...Object.keys(write.set ?? {}).filter(path => path.startsWith('usageLevels.')).map(path => path.split('.')[1]),
+                ...(write.refund?.services ?? [])];
+            const dormant: Record<string, DormantReason> = await container.resolve('serviceService').dormantServices([...new Set(names)], action.organizationId);
+            for (const [service, reason] of Object.entries(dormant)) {
+              if (['novate', 'group'].includes(action.kind)) {
+                const value = (map: any) => Object.entries(map ?? {}).find(([name]) => name.toLowerCase() === service)?.[1];
+                if (['contractedServices', 'subscriptionPlans', 'subscriptionAddOns'].every(field => isDeepStrictEqual(value(write.set?.[field]), value(current?.[field])))) continue;
+              }
+              const { DormantServiceError } = await import('./ServiceService');
+              throw new DormantServiceError(service, reason);
+            }
+          });
           await execution.repository.checkpoint(execution.organizationId, execution.key, execution.owner, stepId, { result });
           step = { result };
         }
         await receipts.acknowledge(write, stepId);
         results.push(step.result);
       }
-      if (action.kind === 'consume') {
+      if (action.kind === 'revert') {
+        const applied = results[0] || await contracts.hasUsageRevert(action.consumption.userId, action.organizationId, action.consumption.id, action.consumption.contractId);
+        if (!applied) throw new Error('Consumption not found or changed before its prepared refund');
+        await consumptions.complete(action.consumption.id);
+        await cache.delMany(contractCacheKeys({ organizationId: action.organizationId, userContact: { userId: action.consumption.userId } }));
+        value = results[0] ? action.result ?? null : null;
+      } else if (action.kind === 'consume') {
         const contract = results[0];
         if (contract) {
           await consumptions.applied(action.consumption.id);
@@ -114,15 +132,12 @@ export async function executeIdempotentAction(proposed: IdempotentAction): Promi
             const latest = await contracts.findByUserId(userId, action.organizationId);
             changed[userId] = latest ? computeContractVersion(latest) : null;
           }
-          if (action.expected) {
-            const failure = { error: 'contractChanged', versions: action.kind === 'group' ? changed : changed[rejected[0]],
-              novated: action.kind === 'group' ? action.writes!.filter((_, index) => results[index]).map(write => write.userId) : undefined };
-            for (const write of action.writes!) await cache.delMany(contractCacheKeys({ organizationId: write.organizationId, userContact: { userId: write.userId } }));
-            for (const contract of results.filter(Boolean)) container.resolve('eventService').emitContractEvent('CONTRACT_NOVATED', contract);
-            await execution.repository.saveResult(execution.organizationId, execution.key, execution.owner, failure);
-            return resultOf(failure);
-          }
-          throw new Error('A prepared contract mutation no longer matches; retry after recovery');
+          const failure = { error: action.expected ? 'contractChanged' : 'stateChanged', versions: action.kind === 'group' ? changed : changed[rejected[0]],
+            novated: action.kind === 'group' ? action.writes!.filter((_, index) => results[index]).map(write => write.userId) : undefined };
+          for (const write of action.writes!) await cache.delMany(contractCacheKeys({ organizationId: write.organizationId, userContact: { userId: write.userId } }));
+          for (const contract of results.filter(Boolean)) container.resolve('eventService').emitContractEvent('CONTRACT_NOVATED', contract);
+          await execution.repository.saveResult(execution.organizationId, execution.key, execution.owner, failure);
+          return resultOf(failure);
         }
         for (const contract of results) contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
         value = action.kind === 'group' ? results : results[0];
@@ -140,6 +155,7 @@ export async function executeIdempotentAction(proposed: IdempotentAction): Promi
 }
 
 function resultOf(result: any): any {
+  if (result.error === 'stateChanged') throw new IdempotencyStateChangedError(result.versions, result.novated);
   if (result.error === 'contractChanged') throw new ContractChangedError(result.versions, result.novated);
   return result.value;
 }

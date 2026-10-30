@@ -195,6 +195,57 @@ describe('Idempotency crash recovery', () => {
     expect(String((await stored())._id)).toBe(preparedId); expect((await stored()).history).toHaveLength(0);
   });
 
+  it('returns a deleted creation snapshot on retry without recreating its contract', async () => {
+    const key = uuidv4();
+    interruptAfterApply();
+    const call = () => keyed('post', '/contracts', key, body());
+    failed(await call());
+    const prepared = await journal(key);
+    const originalId = prepared.plan.writes[0].contractId;
+    expect(String((await stored())._id)).toBe(originalId);
+    expect(Object.keys(prepared.steps ?? {})).toHaveLength(0);
+
+    const deleted = await request(app).delete(`${baseUrl}/contracts/${userId}`).set('x-api-key', apiKey);
+    expect(deleted.status, JSON.stringify(deleted.body)).toBe(204);
+    expect(await stored()).toBeNull();
+    const checkpointed = await journal(key);
+    expect(checkpointed.operationId).toBe(prepared.operationId);
+    expect(Object.keys(checkpointed.steps ?? {})).toHaveLength(1);
+
+    const recovered = await recoverAndReplay(call, 201);
+    expect(recovered.body.id).toBe(originalId);
+    expect(recovered.body.userContact.userId).toBe(userId);
+    expect(await stored()).toBeNull();
+    expect(await Contract.countDocuments({ organizationId: organization.id, 'userContact.userId': userId })).toBe(0);
+  });
+
+  it('returns the old increment snapshot after deletion without changing a replacement contract', async () => {
+    expect((await create()).status).toBe(201);
+    const originalId = String((await stored())._id);
+    const key = uuidv4();
+    interruptAfterApply();
+    failed(await increment(key));
+    expect(await consumed()).toBe(2);
+    expect(Object.keys((await journal(key)).steps ?? {})).toHaveLength(0);
+
+    const deleted = await request(app).delete(`${baseUrl}/contracts/${userId}`).set('x-api-key', apiKey);
+    expect(deleted.status, JSON.stringify(deleted.body)).toBe(204);
+    expect(await stored()).toBeNull();
+    const replacement = await create();
+    expect(replacement.status, JSON.stringify(replacement.body)).toBe(201);
+    const replacementId = String((await stored())._id);
+    expect(replacementId).not.toBe(originalId);
+    expect(await consumed()).toBe(0);
+
+    const recovered = await recoverAndReplay(() => increment(key));
+    expect(recovered.body.id).toBe(originalId);
+    expect(recovered.body.usageLevels[SERVICE].maxPets.consumed).toBe(2);
+    expect(String((await stored())._id)).toBe(replacementId);
+    expect(await consumed()).toBe(0);
+    expect((await stored()).history).toHaveLength(0);
+    expect(await Contract.countDocuments({ organizationId: organization.id, 'userContact.userId': userId })).toBe(1);
+  });
+
   it('recovers a conditional novation with the old If-Match without adding history twice', async () => {
     const created = await create(); expect(created.status).toBe(201); const before = await stored();
     const key = uuidv4(); interruptAfterApply();
@@ -207,6 +258,91 @@ describe('Idempotency crash recovery', () => {
     const response = await recoverAndReplay(call);
     expect(response.body.subscriptionPlans[SERVICE]).toBe('PLATINUM');
     expect((await stored()).history).toHaveLength(1); expect((await stored()).billingPeriod).toEqual(before.billingPeriod);
+  });
+
+  it('refuses to replay a prepared unconditioned novation over a later subscription change', async () => {
+    expect((await create()).status).toBe(201);
+    const key = uuidv4();
+    const repository: any = container.resolve('idempotencyContractRepository');
+    vi.spyOn(repository, 'apply').mockRejectedValueOnce(new Error('Injected failure before prepared novation write'));
+    const subscription = (plan: string) => ({ contractedServices: { [SERVICE]: PETCLINIC_BASE_VERSION },
+      subscriptionPlans: { [SERVICE]: plan }, subscriptionAddOns: { [SERVICE]: {} }, keepBillingPeriod: true });
+    const call = () => keyed('put', `/contracts/${userId}`, key, subscription('PLATINUM'));
+    failed(await call());
+    expect((await stored()).subscriptionPlans[SERVICE]).toBe('GOLD');
+    const later = await request(app).put(`${baseUrl}/contracts/${userId}`).set('x-api-key', apiKey).send(subscription('BASIC'));
+    expect(later.status, JSON.stringify(later.body)).toBe(200);
+    const beforeRetry = await stored();
+
+    const recovered = await recoverAndReplay(call, 409);
+    expect(recovered.body.code).toBe('IDEMPOTENCY_STATE_CHANGED');
+    const afterRetry = await stored();
+    expect(afterRetry.subscriptionPlans[SERVICE]).toBe('BASIC');
+    expect(afterRetry.history).toEqual(beforeRetry.history);
+    expect(afterRetry.history).toHaveLength(1);
+    expect(afterRetry.billingPeriod).toEqual(beforeRetry.billingPeriod);
+  });
+
+  it('keeps an intervening group member novation and reports the already applied members on recovery', async () => {
+    const groupId = uuidv4(), ids = [userId, uuidv4()];
+    for (const id of ids) expect((await create(id, { groupId })).status).toBe(201);
+    const key = uuidv4(), repository: any = container.resolve('idempotencyContractRepository');
+    const originalApply = repository.apply.bind(repository);
+    let calls = 0;
+    vi.spyOn(repository, 'apply').mockImplementation(async (...args: any[]) => {
+      if (++calls === 2) throw new Error('Injected failure before second group member write');
+      return originalApply(...args);
+    });
+    const subscription = (plan: string) => ({ contractedServices: { [SERVICE]: PETCLINIC_BASE_VERSION },
+      subscriptionPlans: { [SERVICE]: plan }, subscriptionAddOns: { [SERVICE]: {} }, keepBillingPeriod: true });
+    const call = () => keyed('put', `/contracts?groupId=${groupId}`, key, subscription('PLATINUM'));
+    failed(await call());
+    const prepared = await journal(key);
+    const [appliedId, pendingId] = prepared.plan.writes.map((write: any) => write.userId);
+    expect((await stored(appliedId)).subscriptionPlans[SERVICE]).toBe('PLATINUM');
+    expect((await stored(pendingId)).subscriptionPlans[SERVICE]).toBe('GOLD');
+    const later = await request(app).put(`${baseUrl}/contracts/${pendingId}`).set('x-api-key', apiKey).send(subscription('BASIC'));
+    expect(later.status, JSON.stringify(later.body)).toBe(200);
+    const pendingBeforeRetry = await stored(pendingId);
+
+    const recovered = await recoverAndReplay(call, 409);
+    expect(recovered.body.code).toBe('IDEMPOTENCY_STATE_CHANGED');
+    expect(recovered.body.novated).toEqual([appliedId]);
+    expect((await stored(appliedId)).subscriptionPlans[SERVICE]).toBe('PLATINUM');
+    expect((await stored(appliedId)).history).toHaveLength(1);
+    const pendingAfterRetry = await stored(pendingId);
+    expect(pendingAfterRetry.subscriptionPlans[SERVICE]).toBe('BASIC');
+    expect(pendingAfterRetry.history).toEqual(pendingBeforeRetry.history);
+    expect(pendingAfterRetry.history).toHaveLength(1);
+    expect(pendingAfterRetry.billingPeriod).toEqual(pendingBeforeRetry.billingPeriod);
+  });
+
+  it('checkpoints an abandoned applied receipt before a different key writes the same contract', async () => {
+    expect((await create()).status).toBe(201);
+    const firstKey = uuidv4(), nextKey = uuidv4();
+    interruptAfterApply();
+    failed(await increment(firstKey));
+    expect(await consumed()).toBe(2);
+    const abandoned = await journal(firstKey);
+    expect(abandoned.plan).toBeDefined();
+    expect(Object.keys(abandoned.steps ?? {})).toHaveLength(0);
+    // Use a deterministic expired lease; recovery must not wait for the first client.
+    await IdempotencyKey.updateOne({ organizationId: organization.id, key: firstKey }, { $set: { lockedUntil: new Date(0) } });
+
+    const next = await recoverAndReplay(() => increment(nextKey));
+    expect(next.body.usageLevels[SERVICE].maxPets.consumed).toBe(4);
+    expect(await consumed()).toBe(4);
+    const checkpointed = await journal(firstKey);
+    expect(checkpointed.operationId).toBe(abandoned.operationId);
+    expect(Object.values(checkpointed.steps ?? {})).toEqual([
+      expect.objectContaining({ result: expect.objectContaining({
+        usageLevels: expect.objectContaining({ [SERVICE]: expect.objectContaining({ maxPets: expect.objectContaining({ consumed: 2 }) }) }),
+      }) }),
+    ]);
+    const recovered = await recoverAndReplay(() => increment(firstKey));
+    expect(recovered.body.usageLevels[SERVICE].maxPets.consumed).toBe(2);
+    expect(await consumed()).toBe(4);
+    expect((await stored()).history).toHaveLength(0);
   });
 
   it('freezes group members after a second persisted write and completes each original member once', async () => {
@@ -314,5 +450,136 @@ describe('Idempotency crash recovery', () => {
     expect(completed.plan.consumption.id).toBe(target.body.consumptionId);
     expect(completed.result).toEqual({ value: null });
     expect(await UsageConsumption.countDocuments({ organizationId: organization.id, userId })).toBe(1);
+  });
+
+  it('acknowledges an already applied explicit refund after its service is paused without refunding twice', async () => {
+    expect((await create()).status).toBe(201);
+    const target = await consume(undefined, 2); expect(target.status).toBe(200);
+    const key = uuidv4(); interruptAfterApply();
+    const call = () => keyed('post', `/features/${userId}/${FEATURE}?revert=true&consumptionId=${target.body.consumptionId}`, key);
+    failed(await call()); expect(await consumed()).toBe(0);
+    const pending = await journal(key);
+    expect(pending.plan.consumption.id).toBe(target.body.consumptionId);
+    expect(Object.keys(pending.steps ?? {})).toHaveLength(0);
+    const retainedId = String((await stored())._id);
+    await request(app).delete(`${baseUrl}/services/${SERVICE}`).set('x-api-key', apiKey).expect(204);
+    expect(String((await stored())._id)).toBe(retainedId);
+
+    await recoverAndReplay(call, 204);
+    expect(await consumed()).toBe(0);
+    expect((await UsageConsumption.findById(target.body.consumptionId).lean())?.revertedAt).toBeInstanceOf(Date);
+    expect((await journal(key)).operationId).toBe(pending.operationId);
+    expect((await Service.findOne({ organizationId: organization.id, name: /^petclinic$/i }).lean())?.disabled).toBe(true);
+  });
+
+  it('recovers an applied refund from its generic receipt after consumption TTL and old refund receipts are gone', async () => {
+    expect((await create()).status).toBe(201);
+    const other = await consume(), target = await consume(undefined, 2);
+    expect(other.status).toBe(200); expect(target.status).toBe(200); expect(await consumed()).toBe(3);
+    const key = uuidv4(); interruptAfterApply();
+    const call = () => keyed('post', `/features/${userId}/${FEATURE}?revert=true&consumptionId=${target.body.consumptionId}`, key);
+    failed(await call()); expect(await consumed()).toBe(1);
+    const pending = await journal(key);
+    expect(Object.keys(pending.steps ?? {})).toHaveLength(0);
+    await UsageConsumption.deleteOne({ _id: target.body.consumptionId });
+    await Contract.updateOne({ organizationId: organization.id, 'userContact.userId': userId }, { $unset: { usageRevertReceipts: '' } });
+    const retained: any = await Contract.findOne({ organizationId: organization.id, 'userContact.userId': userId })
+      .select('+idempotencyReceipt +usageRevertReceipts').lean();
+    expect(retained.idempotencyReceipt).toMatchObject({ acknowledged: false, result: expect.any(Object) });
+    expect(retained.usageRevertReceipts).toBeUndefined();
+
+    expect((await request(app).delete(`${baseUrl}/services/${SERVICE}`).set('x-api-key', apiKey)).status).toBe(204);
+    await recoverAndReplay(call, 204);
+    expect(await consumed()).toBe(1);
+    expect(await UsageConsumption.findById(target.body.consumptionId).lean()).toBeNull();
+    expect((await UsageConsumption.findById(other.body.consumptionId).lean())?.revertedAt).toBeUndefined();
+    expect((await journal(key)).result).toEqual({ value: null });
+  });
+
+  it('refuses an unapplied prepared refund after its service is paused and preserves the original consumption', async () => {
+    expect((await create()).status).toBe(201);
+    const target = await consume(undefined, 2); expect(target.status).toBe(200);
+    const repository: any = container.resolve('idempotencyContractRepository');
+    vi.spyOn(repository, 'apply').mockRejectedValueOnce(new Error('Injected failure before prepared refund effect'));
+    const key = uuidv4();
+    const call = () => keyed('post', `/features/${userId}/${FEATURE}?revert=true&consumptionId=${target.body.consumptionId}`, key);
+    failed(await call()); expect(await consumed()).toBe(2);
+    expect((await journal(key)).plan.consumption.id).toBe(target.body.consumptionId);
+    await request(app).delete(`${baseUrl}/services/${SERVICE}`).set('x-api-key', apiKey).expect(204);
+
+    const retry = await call();
+    expect(retry.status, JSON.stringify(retry.body)).toBe(409);
+    expect(retry.body.code).toBe('SERVICE_DISABLED');
+    expect(await consumed()).toBe(2);
+    expect((await UsageConsumption.findById(target.body.consumptionId).lean())?.revertedAt).toBeUndefined();
+    const untouched: any = await Contract.findOne({ organizationId: organization.id, 'userContact.userId': userId })
+      .select('+usageRevertReceipts +idempotencyReceipt').lean();
+    expect(untouched.usageRevertReceipts).toBeUndefined();
+    expect(untouched.idempotencyReceipt).toBeUndefined();
+  });
+
+  it('prunes expired private receipt markers during keyed consumption while retaining fresh markers', async () => {
+    expect((await create()).status).toBe(201);
+    const expiredConsume = 'a'.repeat(64), freshConsume = 'b'.repeat(64);
+    const expiredRefund = 'c'.repeat(64), freshRefund = 'd'.repeat(64);
+    const future = new Date('2100-01-01');
+    await Contract.collection.updateOne({ organizationId: organization.id, 'userContact.userId': userId }, { $set: {
+      usageConsumptionReceipts: { [expiredConsume]: new Date(0), [freshConsume]: future },
+      usageRevertReceipts: { [expiredRefund]: new Date(0), [freshRefund]: future },
+    } });
+    const response = await consume(uuidv4());
+    expect(response.status, JSON.stringify(response.body)).toBe(200); expect(response.body.eval).toBe(true);
+    const after: any = await Contract.findOne({ organizationId: organization.id, 'userContact.userId': userId })
+      .select('+usageConsumptionReceipts +usageRevertReceipts').lean();
+    expect(after.usageConsumptionReceipts).not.toHaveProperty(expiredConsume);
+    expect(after.usageConsumptionReceipts[freshConsume]).toEqual(future);
+    expect(Object.keys(after.usageConsumptionReceipts)).toHaveLength(2);
+    expect(after.usageRevertReceipts).not.toHaveProperty(expiredRefund);
+    expect(after.usageRevertReceipts[freshRefund]).toEqual(future);
+    expect(Object.keys(after.usageRevertReceipts)).toHaveLength(1);
+    expect(await consumed()).toBe(1);
+  });
+
+  it.each(['consume', 'increment'] as const)('refuses an unapplied prepared %s after its service is paused', async kind => {
+    expect((await create()).status).toBe(201);
+    const repository: any = container.resolve('idempotencyContractRepository');
+    vi.spyOn(repository, 'apply').mockRejectedValueOnce(new Error('Injected failure before the prepared usage effect'));
+    const key = uuidv4();
+    const call = () => kind === 'consume' ? consume(key) : increment(key);
+    failed(await call());
+    expect(await consumed()).toBe(0);
+    const pending = await journal(key);
+    expect(pending.plan.kind).toBe(kind === 'consume' ? 'consume' : 'usage');
+    expect(Object.keys(pending.steps ?? {})).toHaveLength(0);
+    await request(app).delete(`${baseUrl}/services/${SERVICE}`).set('x-api-key', apiKey).expect(204);
+
+    const retry = await call();
+    expect(retry.status, JSON.stringify(retry.body)).toBe(409);
+    expect(retry.body.code).toBe('SERVICE_DISABLED');
+    expect(await consumed()).toBe(0);
+    const unchanged: any = await Contract.findOne({ organizationId: organization.id, 'userContact.userId': userId })
+      .select('+idempotencyReceipt').lean();
+    expect(unchanged.idempotencyReceipt).toBeUndefined();
+    expect((await journal(key)).operationId).toBe(pending.operationId);
+  });
+
+  it('recovers the original successful consumption after its applied effect is followed by a service pause', async () => {
+    expect((await create()).status).toBe(201);
+    const key = uuidv4(); interruptAfterApply();
+    failed(await consume(key));
+    expect(await consumed()).toBe(1);
+    const pending = await journal(key);
+    const consumptionId = pending.plan.consumption.id;
+    expect(Object.keys(pending.steps ?? {})).toHaveLength(0);
+    await request(app).delete(`${baseUrl}/services/${SERVICE}`).set('x-api-key', apiKey).expect(204);
+
+    const recovered = await recoverAndReplay(() => consume(key));
+    expect(recovered.body.eval).toBe(true);
+    expect(recovered.body.consumptionId).toBe(consumptionId);
+    expect(recovered.body.used['petclinic-maxPets']).toBe(1);
+    expect(await consumed()).toBe(1);
+    expect(await UsageConsumption.countDocuments({ organizationId: organization.id, userId })).toBe(1);
+    expect((await UsageConsumption.findById(consumptionId).lean())?.state).toBe('applied');
+    expect((await journal(key)).operationId).toBe(pending.operationId);
   });
 });

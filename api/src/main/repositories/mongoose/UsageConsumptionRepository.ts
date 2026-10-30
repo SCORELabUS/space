@@ -101,7 +101,7 @@ class UsageConsumptionRepository {
   /** Claim this consumption for a revert; null when it does not exist (in this scope) or was already completed. */
   async claim(id: string, scope: ConsumptionScope): Promise<UsageConsumption | null> {
     const doc = await UsageConsumptionMongoose.findOneAndUpdate(
-      { _id: id, ...scopeFilter(scope), state: { $ne: 'prepared' }, revertedAt: { $exists: false }, expiresAt: { $gt: new Date() } },
+      { _id: id, ...scopeFilter(scope), state: { $ne: 'prepared' }, revertedAt: { $exists: false }, $expr: { $gt: ['$expiresAt', '$$NOW'] } },
       { $set: { revertRequestedAt: new Date() } },
       { new: true }
     ).lean();
@@ -114,7 +114,7 @@ class UsageConsumptionRepository {
    */
   async claimRecent(scope: ConsumptionScope, since: Date, latest: boolean): Promise<UsageConsumption | null> {
     const doc = await UsageConsumptionMongoose.findOneAndUpdate(
-      { ...scopeFilter(scope), state: { $ne: 'prepared' }, revertedAt: { $exists: false }, expiresAt: { $gt: new Date() }, createdAt: { $gte: since } },
+      { ...scopeFilter(scope), state: { $ne: 'prepared' }, revertedAt: { $exists: false }, $expr: { $gt: ['$expiresAt', '$$NOW'] }, createdAt: { $gte: since } },
       { $set: { revertRequestedAt: new Date() } },
       { new: true, sort: { createdAt: latest ? -1 : 1, _id: latest ? -1 : 1 } }
     ).lean();
@@ -189,7 +189,7 @@ class UsageConsumptionRepository {
       {
         organizationId,
         userId,
-        expiresAt: { $gt: new Date() },
+        $expr: { $gt: ['$expiresAt', '$$NOW'] },
         ...(change.organizationId ? {} : ofServices([serviceName])),
       },
       [{ $set }]

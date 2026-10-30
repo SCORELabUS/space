@@ -702,13 +702,14 @@ class ContractService {
       rejectPrivate: options.rejectPrivate,
     });
 
+    const recoveryGuard = contractVersionGuard(contract);
     const newContract = performNovation(contract, subscription, {
       keepBillingPeriod: options.keepBillingPeriod,
     });
 
     if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'novate', organizationId,
       expected: expected !== undefined, writes: [{ contractId: contract.id!, organizationId, userId,
-        set: novationFields(newContract), guard }] });
+        set: novationFields(newContract), guard: recoveryGuard }] });
 
     const result = await this.contractRepository.update(
       userId,
@@ -786,6 +787,7 @@ class ContractService {
       }
     }
 
+    if (!expected) for (const contract of contracts) guards.set(contract.userContact.userId, contractVersionGuard(contract));
     const updatedContracts: LeanContract[] = [];
     let occurredAt: Date;
 
@@ -1012,6 +1014,9 @@ class ContractService {
     organizationId: string
   ): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
+    const recoveryGuard = contractVersionGuard(contract);
+    const periodGuard = Object.fromEntries(Object.entries(contract.usageLevels ?? {}).flatMap(([service, levels]) =>
+      Object.entries(levels).map(([limit, level]) => [`usageLevels.${service}.${limit}.resetTimeStamp`, level.resetTimeStamp ?? null])));
     // Usage levels of dormant services are kept as they are: they cannot be
     // consumed, and resets leave them alone.
     const dormant = await this.serviceService.dormantServices(
@@ -1045,7 +1050,7 @@ class ContractService {
         }
       }
       if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'usage', organizationId,
-        writes: [{ contractId: contract.id!, organizationId, userId, increments }] });
+        writes: [{ contractId: contract.id!, organizationId, userId, increments, guard: { ...recoveryGuard, ...periodGuard } }] });
       if (
         Object.keys(increments).length > 0 &&
         !(await this.contractRepository.incrementUsageLevels(userId, increments, contract.organizationId))
@@ -1074,7 +1079,7 @@ class ContractService {
         }
       }
       if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'usage', organizationId,
-        writes: [{ contractId: contract.id!, organizationId, userId,
+        writes: [{ contractId: contract.id!, organizationId, userId, guard: { ...recoveryGuard, ...periodGuard },
           set: Object.fromEntries(Object.entries(reset).flatMap(([path, level]) => Object.entries(level).map(([field, value]) => [`usageLevels.${path}.${field}`, value]))) }] });
       if (!(await this.contractRepository.setUsageLevels(userId, contract.organizationId, reset))) {
         throw new Error(`Failed to update contract for userId ${userId}`);
@@ -1412,11 +1417,12 @@ class ContractService {
    */
   private async _takeBackConsumption(consumption: UsageConsumption): Promise<ConsumptionRevertResult | null> {
     const { userId, organizationId } = consumption;
-    if (currentIdempotencyExecution() && !currentIdempotencyExecution()!.inAction) {
+    if (currentIdempotencyExecution()) {
       const contract = await this.contractRepository.findByUserId(userId, organizationId);
       if (!contract) throw new Error('Contract not found');
-      const { present, skipped } = this._resolveConsumption(consumption, contract);
+      const { present, skipped, services } = this._resolveConsumption(consumption, contract);
       return executeIdempotentAction({ kind: 'revert', organizationId, consumption,
+        writes: [{ contractId: consumption.contractId ?? contract.id!, organizationId, userId, refund: { id: consumption.id, expiresAt: consumption.expiresAt, services, absent: skipped.map(level => `${level.serviceName}.${level.usageLimit}`), levels: present.map(level => ({ path: `${level.serviceName}.${level.usageLimit}`, amount: level.amount, resetTimeStamp: level.resetTimeStamp })) } }],
         result: skipped.length === 0 ? null : { consumptionId: consumption.id,
           reverted: Object.fromEntries(present.map(({ serviceName, usageLimit, amount }) => [`${serviceName}-${usageLimit}`, amount])),
           skipped: skipped.map(({ serviceName, usageLimit }) => `${serviceName}-${usageLimit}`) } });

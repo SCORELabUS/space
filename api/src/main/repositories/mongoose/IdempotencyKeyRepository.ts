@@ -172,6 +172,16 @@ class IdempotencyKeyRepository {
     return doc ? toRecord(doc) : null;
   }
 
+  async recoverAppliedStep(organizationId: string, key: string, operationId: string, step: string, result: any, allowLiveOwner = false): Promise<boolean> {
+    // Only acknowledge an already persisted business write, never execute a
+    // remaining action under another caller's authority. An expired owner is
+    // fenced at MongoDB; a live successor makes this conditional update fail.
+    const updated = await IdempotencyKeyMongoose.updateOne({ ...scope(organizationId, key), operationId,
+      state: 'in_progress', plan: { $exists: true }, ...(allowLiveOwner ? {} : { $expr: { $lte: ['$lockedUntil', '$$NOW'] } }) },
+      [{ $set: { steps: { $mergeObjects: [{ $ifNull: ['$steps', {}] }, { $literal: { [step]: { result } } }] } } }]);
+    return updated.matchedCount > 0;
+  }
+
   async renew(organizationId: string, key: string, owner: string, lockSeconds: number): Promise<IdempotencyRecord | null> {
     const doc = await IdempotencyKeyMongoose.findOneAndUpdate(
       owned(organizationId, key, owner),

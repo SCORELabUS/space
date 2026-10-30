@@ -8,7 +8,6 @@ export interface IdempotencyExecution {
   operationId: string;
   repository: IdempotencyKeyRepository;
   record: any;
-  inAction?: boolean;
 }
 const executions = new AsyncLocalStorage<IdempotencyExecution>();
 export const currentIdempotencyExecution = () => executions.getStore();
@@ -19,4 +18,11 @@ export async function assertIdempotencyOwnership(): Promise<IdempotencyExecution
   if (!execution) throw new Error('Missing idempotency execution');
   execution.record = await execution.repository.assertOwned(execution.organizationId, execution.key, execution.owner);
   return execution;
+}
+
+export class IdempotencyStateChangedError extends Error {
+  readonly code = 'IDEMPOTENCY_STATE_CHANGED';
+  constructor(public readonly contractVersion: any, public readonly novated?: string[]) {
+    super('The contract changed before this prepared operation could apply. Review its current state and use a new Idempotency-Key.');
+  }
 }
