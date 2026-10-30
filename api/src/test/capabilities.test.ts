@@ -24,6 +24,7 @@ const EXPECTED = [
   'novation-preview',
   'token-subscription',
   'contract-events',
+  'contract-event-ids',
   'sphere-private',
   'contract-userid-per-org',
   'service-disable-dormant',

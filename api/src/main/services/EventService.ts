@@ -2,15 +2,37 @@ import { Server as SocketIOServer, Socket } from 'socket.io';
 import { Server } from 'http';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { createClient } from 'redis';
+import { v7 as uuidv7 } from 'uuid';
 import { LeanOrganization, OrganizationMember } from '../types/models/Organization';
 import { computeContractVersion } from '../utils/contracts/version';
 
 export type ContractEventCode = 'CONTRACT_CREATED' | 'CONTRACT_NOVATED' | 'CONTRACT_DELETED' | 'CONTRACT_RENEWED';
 
+/**
+ * Identity of one event, the same in every copy of it (every connection, every
+ * instance behind the Redis adapter), so that consumers can drop duplicates.
+ *
+ * - `eventId`: UUIDv7 (RFC 9562). Opaque for comparison; it sorts roughly by
+ *   emission time, which is not the order in which changes were stored, so it
+ *   must not be used to order changes.
+ * - `occurredAt`: ISO 8601 (UTC, milliseconds), this server's clock when the
+ *   change was stored (taken when the write returned).
+ */
+export interface EventEnvelope {
+  eventId: string;
+  occurredAt: string;
+}
+
 /** Payload of the `message` events of the `/contracts` namespace. */
-export interface ContractEvent {
+export interface ContractEvent extends EventEnvelope {
   code: ContractEventCode;
   details: { userId: string; organizationId: string; contractVersion: string | null; services: string[] };
+}
+
+/** A new event identity. `occurredAt` defaults to now, for emitters called right after their write. */
+export function eventEnvelope(occurredAt: Date = new Date()): EventEnvelope {
+  const at = Number.isNaN(occurredAt.getTime()) ? new Date() : occurredAt;
+  return { eventId: uuidv7(), occurredAt: at.toISOString() };
 }
 
 /** Socket.IO room of an organization in the `/contracts` namespace. */
@@ -226,8 +248,15 @@ class EventService {
    * Emit a contract event to the connections of the contract's organization.
    * Call it after the change is persisted. It never throws: a notification
    * failure must not fail the change that was already made.
+   *
+   * @param options.occurredAt when the change was stored (taken right after the
+   *        write returned); defaults to now.
    */
-  emitContractEvent(code: ContractEventCode, contract: any, options: { deleted?: boolean } = {}): void {
+  emitContractEvent(
+    code: ContractEventCode,
+    contract: any,
+    options: { deleted?: boolean; occurredAt?: Date } = {}
+  ): void {
     try {
       if (!this.io || !contract?.organizationId || !contract?.userContact?.userId) return;
       const contractedServices = contract.contractedServices instanceof Map
@@ -235,6 +264,7 @@ class EventService {
         : contract.contractedServices ?? {};
       const event: ContractEvent = {
         code,
+        ...eventEnvelope(options.occurredAt),
         details: {
           userId: contract.userContact.userId,
           organizationId: String(contract.organizationId),
@@ -289,6 +319,7 @@ class EventService {
 
     this.io.of('/pricings').emit('message', {
       code: 'PRICING_CREATED',
+      ...eventEnvelope(),
       details: {
         serviceName,
         pricingVersion
@@ -304,6 +335,7 @@ class EventService {
 
     this.io.of('/pricings').emit('message', {
       code: 'PRICING_ARCHIVED',
+      ...eventEnvelope(),
       details: {
         serviceName,
         pricingVersion
@@ -319,6 +351,7 @@ class EventService {
 
     this.io.of('/pricings').emit('message', {
       code: 'PRICING_ACTIVED',
+      ...eventEnvelope(),
       details: {
         serviceName,
         pricingVersion
@@ -334,6 +367,7 @@ class EventService {
 
     this.io.of('/pricings').emit('message', {
       code: 'SERVICE_DISABLED',
+      ...eventEnvelope(),
       details: {
         serviceName
       }

@@ -20,6 +20,7 @@ export const SPACE_CAPABILITIES: readonly string[] = Object.freeze([
   'novation-preview',
   'token-subscription',
   'contract-events',
+  'contract-event-ids',
   'sphere-private',
   'contract-userid-per-org',
   'service-disable-dormant',
