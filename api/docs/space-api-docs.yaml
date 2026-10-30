@@ -2097,6 +2097,13 @@ paths:
       description: |
         Updates service metadata (name, organization).
 
+        Renames and moves persist private recovery progress. After an interruption, retry the exact original
+        update body through the original organization and service name, even if metadata already moved.
+        Atomic contract markers prevent repeated history; pending cache invalidations and event emission
+        attempts are replayed. Other binding/service changes in affected organizations return 409
+        SERVICE_RELOCATION_PENDING until recovery finishes. Destination authority must still be valid
+        on every retry. Events remain best-effort.
+
         **Authentication**: User API Key
 
         **Permission**: 
@@ -2769,6 +2776,13 @@ paths:
       summary: Update service
       description: |
         Updates service metadata (name, organization).
+
+        Renames and moves persist private recovery progress. After an interruption, retry the exact original
+        update body through the original organization and service name, even if metadata already moved.
+        Atomic contract markers prevent repeated history; pending cache invalidations and event emission
+        attempts are replayed. Other binding/service changes in affected organizations return 409
+        SERVICE_RELOCATION_PENDING until recovery finishes. Destination authority must still be valid
+        on every retry. Events remain best-effort.
 
         **Authentication**: Organization API Key
 

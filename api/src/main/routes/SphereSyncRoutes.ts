@@ -1,3 +1,4 @@
+import { ServiceRelocationPendingError } from '../services/serviceRelocationState';
 import express from 'express';
 import container from '../config/container';
 import { memberRole, hasPermission } from '../middlewares/AuthMiddleware';
@@ -23,6 +24,7 @@ export default function loadRoutes(app: express.Application) {
       }
       return res.status(['run', 'resume'].includes(action) ? 202 : 200).json(result);
     } catch (error) {
+      if (error instanceof ServiceRelocationPendingError) return res.status(409).json({ code: error.code, error: error.message });
       if (error instanceof SphereAuthError || error instanceof SphereResourceUnavailableError) {
         const suppliedKey = typeof req.body?.sphereApiKey === 'string' && req.body.sphereApiKey.length > 0;
         return res.status(400).json({
