@@ -940,6 +940,10 @@ class ServiceService {
       dataToUpdate.name = newServiceData.name;
     }
 
+    if (service.source === 'sphere' && 'defaultVersion' in newServiceData) {
+      throw new Error('INVALID DATA: the version for new contracts of a SPHERE-linked service is decided by its synchronization policy');
+    }
+
     if (newServiceData.defaultVersion === null) {
       dataToUpdate.defaultVersion = undefined; // removes it
     } else if (newServiceData.defaultVersion !== undefined) {
