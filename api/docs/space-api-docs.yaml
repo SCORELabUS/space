@@ -34,7 +34,10 @@ info:
     - **Accessible Scopes**: 
       - `ALL`: Full access to organization resources and management operations
       - `MANAGEMENT`: Full access to organization resources and limited management operations
-      - `EVALUATION`: Read-only access to services/pricings and feature evaluation
+      - `EVALUATION`: Read-only access to services/pricings, plus feature evaluation: `POST /features/{userId}`,
+        `POST /features/{userId}/{featureId}` (including the expected consumption it records and `?revert=true`)
+        and `POST /features/{userId}/pricing-token`. It cannot write contracts, usage levels
+        (`PUT /contracts/{userId}/usageLevels`), services or pricings.
     - **Access Pattern**: Can access `/services/**`, `/contracts/**`, `/features/**` routes
     - **Example Use Cases**: 
       - Programmatically manage services and pricings
@@ -1593,7 +1596,8 @@ paths:
         **Scopes**:
         - `ALL`: Unrestricted access to all organization operations
         - `MANAGEMENT`: Create, update, delete operations (read access included)
-        - `EVALUATION`: Read-only access to services/pricings + feature evaluation
+        - `EVALUATION`: Read-only access to services/pricings + feature evaluation (including the expected
+          consumption of a single-feature evaluation and its revert) and pricing tokens
 
       tags:
         - Organizations
@@ -2080,6 +2084,60 @@ paths:
                 $ref: '#/components/schemas/NewContractsPricing'
         '404':
           description: Service not found in the organization, or it has no active version
+
+  /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}/public-url:
+    get:
+      summary: Get the download URL of a pricing file
+      description: |
+        Returns the URL from which the Pricing2Yaml file of a version can be
+        downloaded. Despite the name of this endpoint, that URL is **not
+        public**: it is the authorised `GET /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}?format=yaml`
+        and needs the same credentials as this request (`x-api-key`).
+        Pricing files are not served as static files.
+
+        **Authentication**: User API Key (member of the organization; same roles as the pricing route)
+
+      tags:
+        - Services
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pricingVersion
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Download URL of the pricing file
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+                    description: Relative URL of the authorised download route.
+                    example: /api/v1/services/zoom/pricings/2025?format=yaml
+                  url:
+                    type: string
+                    format: uri
+                    description: Absolute URL of the authorised download route.
+                  requiresAuthentication:
+                    type: boolean
+                    description: Always true. Send `x-api-key` when downloading.
+        '404':
+          description: Service or pricing version not found
 
   /organizations/{organizationId}/services/{serviceName}/pricings/{pricingVersion}:
     get:
@@ -2632,6 +2690,55 @@ paths:
                 $ref: '#/components/schemas/NewContractsPricing'
         '404':
           description: Service not found in the organization, or it has no active version
+
+  /services/{serviceName}/pricings/{pricingVersion}/public-url:
+    get:
+      summary: Get the download URL of a pricing file
+      description: |
+        Returns the URL from which the Pricing2Yaml file of a version can be
+        downloaded. Despite the name of this endpoint, that URL is **not
+        public**: it is the authorised `GET /services/{serviceName}/pricings/{pricingVersion}?format=yaml`
+        and needs the same credentials as this request (`x-api-key`).
+        Pricing files are not served as static files.
+
+        **Authentication**: Organization API Key (any scope)
+
+      tags:
+        - Services
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pricingVersion
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Download URL of the pricing file
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+                    description: Relative URL of the authorised download route.
+                    example: /api/v1/services/zoom/pricings/2025?format=yaml
+                  url:
+                    type: string
+                    format: uri
+                    description: Absolute URL of the authorised download route.
+                  requiresAuthentication:
+                    type: boolean
+                    description: Always true. Send `x-api-key` when downloading.
+        '404':
+          description: Service or pricing version not found
 
   /services/{serviceName}/pricings/{pricingVersion}:
     get:
@@ -4134,7 +4241,10 @@ paths:
 
         **Authentication**: Organization API Key only
 
-        **Permission**: Org Key with any scope
+        **Permission**: Org Key with any scope (ALL/MANAGEMENT/EVALUATION). Recording the expected
+        consumption and reverting it (`?revert=true`) are part of the evaluation and allowed for every
+        scope; setting or resetting usage levels directly (`PUT /contracts/{userId}/usageLevels`)
+        requires ALL or MANAGEMENT.
 
       tags:
         - Features
@@ -4698,6 +4808,45 @@ components:
         version:
           type: string
           example: "1.0.0"
+        yamlPath:
+          type: string
+          description: |
+            Storage reference of the stored Pricing2Yaml file
+            (`/private/pricings/...` for uploaded pricings,
+            `/private/sphere/...` for SPHERE snapshots). It is **not a URL**:
+            download the file with `GET .../pricings/{pricingVersion}?format=yaml`
+            and the credentials of the owning organization. Versions before this
+            change returned a `/static/pricings/...` path that was served
+            without authentication; such paths now answer 404.
+          example: /private/pricings/63f74bf8eeed64058364b52e-zoom-2025.yaml
+        sphere:
+          type: object
+          readOnly: true
+          description: |
+            Present only on snapshots imported from SPHERE (services with
+            `source: sphere`): the SPHERE pricing and version this pricing copies.
+            Clients can open the pricing in SPHERE through `permanentUrl`
+            (`/p/{pricingId}`), where SPHERE applies its own permissions.
+          properties:
+            serviceId:
+              type: string
+            pricingId:
+              type: string
+              pattern: '^[a-f0-9]{24}$'
+            versionId:
+              type: string
+              pattern: '^[a-f0-9]{24}$'
+            permanentUrl:
+              type: string
+              format: uri
+              example: https://sphere.score.us.es/p/65f0c1a2b3c4d5e6f7a8b9c0
+            version:
+              type: string
+            createdAt:
+              type: string
+              format: date-time
+            contentHash:
+              type: string
         service:
           type: string
         available:
@@ -4911,7 +5060,9 @@ components:
         Opaque version of the contract for optimistic concurrency. It changes with every change of the
         subscription (contracted pricing versions, plans, add-ons), of the billing period, and with every
         novation or SPHERE migration, also when a novation returns to an earlier subscription. Recording usage
-        does not change it. Treat it as an opaque string: compare it for equality and send it back in
+        does not change it. Novations write only their subscription, billing period and history fields,
+        preserving concurrent consumption and contact changes with or without a precondition. Group novations
+        never recreate a contract deleted during the operation. Treat the version as an opaque string: compare it for equality and send it back in
         `If-Match` (or `expectedContractVersion`). Single-contract responses also carry it as
         `ETag: "<contractVersion>"`, which CORS exposes to browser clients.
       example: 3-9f86d081884c7d65

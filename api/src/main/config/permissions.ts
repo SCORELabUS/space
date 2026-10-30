@@ -172,6 +172,12 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
     allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
   },
   {
+    path: '/services/*/pricings/*/public-url',
+    methods: ['GET'],
+    allowedUserRoles: [],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
+  },
+  {
     path: '/services/*/pricings/*',
     methods: ['PUT', 'PATCH'],
     allowedUserRoles: [],
@@ -220,14 +226,13 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
   },
 
   // ============================================
-  // Feature Evaluation Routes
+  // Feature Evaluation Routes (Organization API Keys only)
+  // Evaluating is what EVALUATION keys are for, so every scope may list the
+  // features, evaluate all of a user's features, evaluate one feature (with
+  // the expected consumption that evaluation records, and `?revert=true` to
+  // undo it) and get a pricing token. Changing usage levels directly is
+  // `PUT /contracts/{userId}/usageLevels`, which stays ALL/MANAGEMENT.
   // ============================================
-  {
-    path: '/features/evaluate',
-    methods: ['POST'],
-    allowedUserRoles: [],
-    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
-  },
   {
     path: '/features',
     methods: ['GET'],
@@ -235,6 +240,25 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
     allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
   },
   {
+    path: '/features/*',
+    methods: ['POST'],
+    allowedUserRoles: [],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
+  },
+  {
+    path: '/features/*/pricing-token',
+    methods: ['POST'],
+    allowedUserRoles: [],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
+  },
+  {
+    path: '/features/*/*',
+    methods: ['POST'],
+    allowedUserRoles: [],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
+  },
+  {
+    // Anything else under /features (other methods, deeper paths).
     path: '/features/**',
     methods: ['POST', 'PUT', 'PATCH', 'DELETE'],
     allowedUserRoles: [],
