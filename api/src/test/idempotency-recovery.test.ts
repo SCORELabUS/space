@@ -488,6 +488,7 @@ describe('Idempotency crash recovery', () => {
     expect(retained.idempotencyReceipt).toMatchObject({ acknowledged: false, result: expect.any(Object) });
     expect(retained.usageRevertReceipts).toBeUndefined();
 
+    expect((await request(app).delete(`${baseUrl}/services/${SERVICE}`).set('x-api-key', apiKey)).status).toBe(204);
     await recoverAndReplay(call, 204);
     expect(await consumed()).toBe(1);
     expect(await UsageConsumption.findById(target.body.consumptionId).lean()).toBeNull();

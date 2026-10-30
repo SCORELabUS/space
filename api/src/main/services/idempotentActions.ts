@@ -52,17 +52,6 @@ export async function executeIdempotentAction(proposed: IdempotentAction): Promi
     const consumptions: any = container.resolve('usageConsumptionRepository');
     let value: any;
     {
-      if (action.kind === 'revert' && !Object.values(execution.record.steps ?? {}).some((step: any) => step.result)) {
-        const applied = await contracts.hasUsageRevert(action.consumption.userId, action.organizationId, action.consumption.id, action.consumption.contractId);
-        if (!applied) {
-          const service = action.consumption.featureId.split('-')[0];
-          const dormant: Record<string, DormantReason> = await container.resolve('serviceService').dormantServices([service], action.organizationId);
-          if (dormant[service]) {
-            const { DormantServiceError } = await import('./ServiceService');
-            throw new DormantServiceError(service, dormant[service]);
-          }
-        }
-      }
       if (action.kind === 'consume') {
         const consumption = action.consumption;
         const existing = await consumptions.find(consumption.id, consumption);
