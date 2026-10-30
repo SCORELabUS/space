@@ -124,6 +124,27 @@ describe('Atomic usage limits and revert by consumption', function () {
   });
 
   describe('the limit is enforced by the write', function () {
+    it('matches a renewable period received as an ISO string from a cached contract DTO', async function () {
+      expect((await createContract(keyA, userId)).status).toBe(201);
+      const repository = container.resolve('contractRepository');
+      const contract = await repository.findByUserId(userId, orgA.id!);
+      // Redis round-trips dates through JSON. Mongoose does not cast the
+      // nested Map<Map<usageLevel>> query path back to a BSON Date for us.
+      const cached = JSON.parse(JSON.stringify(contract));
+      const period = cached.usageLevels[service].calendarEventsCreationLimit.resetTimeStamp;
+      expect(period).toBeTypeOf('string');
+      const path = `${service}.calendarEventsCreationLimit`;
+      const updated = await repository.incrementUsageLevels(userId, { [path]: 1 }, orgA.id!, {
+        ceilings: { [path]: 15 },
+        receipt: { id: uuidv4(), expiresAt: new Date(Date.now() + 60000), contractId: cached.id,
+          resetTimeStamps: { [path]: period } },
+      });
+
+      expect(updated).not.toBeNull();
+      expect(updated!.usageLevels[service].calendarEventsCreationLimit.consumed).toBe(1);
+      expect(await consumed('calendarEventsCreationLimit')).toBe(1);
+    });
+
     it('N parallel consumptions against limit L never exceed L', async function () {
       expect((await createContract(keyA, userId)).status).toBe(201);
 

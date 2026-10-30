@@ -402,7 +402,10 @@ class ContractRepository extends RepositoryBase {
       }
       if (options.receipt?.resetTimeStamps && Object.prototype.hasOwnProperty.call(options.receipt.resetTimeStamps, path)) {
         // Null matches a non-renewable level (missing or explicit null).
-        filter[`usageLevels.${path}.resetTimeStamp`] = options.receipt.resetTimeStamps[path] ?? null;
+        const stamp = options.receipt.resetTimeStamps[path];
+        // Nested Map paths are not date-cast by Mongoose. Redis snapshots carry
+        // ISO strings, which must not be compared as strings against BSON dates.
+        filter[`usageLevels.${path}.resetTimeStamp`] = stamp == null ? null : new Date(stamp);
       }
     }
 

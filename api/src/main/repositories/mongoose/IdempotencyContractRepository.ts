@@ -67,6 +67,9 @@ class IdempotencyContractRepository {
       return snapshot;
     }
     const { $expr: guardExpression, ...guard } = write.guard ?? {};
+    for (const path of Object.keys(guard)) {
+      if (path.endsWith('.resetTimeStamp') && guard[path] != null) guard[path] = new Date(guard[path]);
+    }
     const filter: any = { ...guard, ...identity, $and: [
       { $or: [{ idempotencyReceipt: { $exists: false } }, { 'idempotencyReceipt.acknowledged': true }] },
     ] };
@@ -83,7 +86,10 @@ class IdempotencyContractRepository {
       filter[`usageLevels.${path}.consumed`] = { $exists: true };
       set[`usageLevels.${path}.consumed`] = { $add: [`$usageLevels.${path}.consumed`, amount] };
       if (write.consume && write.consume.ceilings[path] !== undefined) expressions.push({ $lte: [{ $add: [`$usageLevels.${path}.consumed`, amount] }, write.consume.ceilings[path]] });
-      if (write.consume) filter[`usageLevels.${path}.resetTimeStamp`] = write.consume.resetTimeStamps[path] ?? null;
+      if (write.consume) {
+        const stamp = write.consume.resetTimeStamps[path];
+        filter[`usageLevels.${path}.resetTimeStamp`] = stamp == null ? null : new Date(stamp);
+      }
     }
     const prune: Record<string, any> = {};
     for (const field of ['usageConsumptionReceipts', 'usageRevertReceipts']) {
