@@ -13,6 +13,7 @@ import { seedDatabase } from './database/seeders/mongo/seeder';
 import loadGlobalMiddlewares from './middlewares/GlobalMiddlewaresLoader';
 import routes from './routes/index';
 import { seedDefaultAdmin } from './database/seeders/common/userSeeder';
+import { initializeIdempotencyJournal } from './database/migrations/idempotencyJournal';
 import { initializeUsageConsumptionRecords } from './database/migrations/usageConsumptionRecords';
 import { initializeServiceRelocationJournal } from './database/migrations/serviceRelocationJournal';
 import { runContractUserIdMigration } from './database/migrations/contractUserIdPerOrganization';
@@ -130,6 +131,7 @@ const initializeDatabase = async (seedDatabaseFlag: boolean = true) => {
         await runContractUserIdMigration();
         await initializeServiceRelocationJournal();
         await initializeUsageConsumptionRecords();
+        await initializeIdempotencyJournal();
         if (['development'].includes(process.env.ENVIRONMENT ?? '')) {
           if (seedDatabaseFlag && process.env.SEED_ON_STARTUP === 'true') {
             await seedDatabase();

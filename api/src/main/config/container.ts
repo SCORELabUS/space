@@ -19,6 +19,7 @@ import MongooseIdempotencyKeyRepository from "../repositories/mongoose/Idempoten
 import CacheService from "../services/CacheService";
 import ServiceService from "../services/ServiceService";
 import UserService from "../services/UserService";
+import IdempotencyContractRepository from "../repositories/mongoose/IdempotencyContractRepository";
 import ContractService from "../services/ContractService";
 import FeatureEvaluationService from "../services/FeatureEvaluationService";
 import EventService from "../services/EventService";
@@ -49,6 +50,7 @@ function initContainer(databaseType: string): AwilixContainer {
     serviceRepository: asValue(serviceRepository),
     pricingRepository: asValue(pricingRepository),
     contractRepository: asValue(contractRepository),
+    idempotencyContractRepository: asClass(IdempotencyContractRepository).singleton(),
     organizationRepository: asValue(organizationRepository),
     analyticsRepository: asValue(analyticsRepository),
     usageConsumptionRepository: asValue(usageConsumptionRepository),

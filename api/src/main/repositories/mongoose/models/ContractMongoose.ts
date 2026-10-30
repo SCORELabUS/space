@@ -29,6 +29,7 @@ const contractSchema = new Schema(
     organizationId: { type: String, ref: "Organization", required: true },
     groupId: { type: String },
     usageConsumptionReceipts: { type: Map, of: Date, select: false, default: undefined },
+    idempotencyReceipt: { type: Schema.Types.Mixed, select: false, default: undefined },
     usageRevertReceipts: { type: Map, of: Date, select: false, default: undefined },
     serviceRelocationOperationId: { type: String, select: false },
     contractedServices: {type: Map, of: String},
@@ -51,6 +52,7 @@ const contractSchema = new Schema(
         delete resultObject.__v;
         delete resultObject.serviceRelocationOperationId;
         delete resultObject.usageRevertReceipts;
+        delete resultObject.idempotencyReceipt;
         delete resultObject.usageConsumptionReceipts;
         return resultObject;
       },

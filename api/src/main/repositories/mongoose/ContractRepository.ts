@@ -175,7 +175,7 @@ class ContractRepository extends RepositoryBase {
 
     pipeline.push({ $skip: offset === 0 ? (page - 1) * limit : offset });
     pipeline.push({ $limit: Math.min(limit, 100) });
-    pipeline.push({ $unset: ['serviceRelocationOperationId', 'usageRevertReceipts', 'usageConsumptionReceipts'] });
+    pipeline.push({ $unset: ['serviceRelocationOperationId', 'usageRevertReceipts', 'usageConsumptionReceipts', 'idempotencyReceipt'] });
 
     const contracts = await ContractMongoose.aggregate(pipeline);
 

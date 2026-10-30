@@ -1,33 +1,30 @@
 import mongoose, { Schema } from 'mongoose';
 
 /**
- * One `Idempotency-Key` of one organization: the request it was first used
- * for (`fingerprint`) and, once that request finished, what to answer when it
- * is repeated (`response`).
- *
- * While the request runs the record is `in_progress` and held by `owner`
- * until `lockedUntil`; a request that finds it so waits or answers
- * `409 IDEMPOTENCY_IN_PROGRESS`. Records expire at `expiresAt` (TTL index;
- * the middleware also ignores expired records the TTL monitor has not removed
- * yet).
+ * Durable request identity and recovery progress. An unfinished operation has
+ * no TTL: losing a worker lease must not erase its plan or permit repetition.
+ * Only completed responses expire, after their configured replay window.
  */
 const idempotencyKeySchema = new Schema(
   {
-    // The organization of the request, or `user:<username>` for a platform
-    // ADMIN on a direct route without organization.
+    // Authenticated organization, or user:<username> for a platform ADMIN's direct route.
     organizationId: { type: String, required: true },
     key: { type: String, required: true },
     fingerprint: { type: String, required: true },
+    operationId: { type: String, required: true },
     state: { type: String, enum: ['in_progress', 'completed'], required: true },
-    owner: { type: String },
-    lockedUntil: { type: Date },
+    owner: String,
+    lockedUntil: Date,
+    plan: { type: Schema.Types.Mixed, default: undefined },
+    steps: { type: Schema.Types.Mixed, default: undefined },
+    result: { type: Schema.Types.Mixed, default: undefined },
     response: {
-      status: { type: Number },
-      headers: { type: Schema.Types.Mixed },
-      body: { type: String },
+      status: Number,
+      headers: Schema.Types.Mixed,
+      body: String,
     },
     createdAt: { type: Date, required: true },
-    expiresAt: { type: Date, required: true },
+    expiresAt: Date,
   },
   { versionKey: false }
 );

@@ -142,10 +142,24 @@ info:
       its response, or answer `409 IDEMPOTENCY_IN_PROGRESS` with `Retry-After` while it is still running.
     - Every response below 500 is stored (except `401`, `403`, `408`, `429`), so a retry gets the answer of
       the first attempt; for example a novation that succeeded with `If-Match` is replayed as `200` even
-      though the version it named is no longer current. A `5xx` is not stored: retrying with the same key
-      runs the request again.
-    - Keys are kept for `IDEMPOTENCY_KEY_TTL_SECONDS` (default 24 hours); after that the same key starts a
-      new request.
+      though the version it named is no longer current. A `5xx` is not replayed as a final response:
+      retry the same key. Before any accepted effect, an unused reservation may be released. Once a
+      domain plan is prepared, it is retained and resumed; a retry does not restart its business writes.
+    - A renewable 60-second worker lease uses MongoDB time. Expired workers cannot apply another
+      contract mutation or complete/release a successor's reservation. Takeover retains the original
+      operation, fingerprint, prepared plan and per-contract checkpoints.
+    - Every contract mutation stores its private receipt and actual public result atomically. Results
+      are checkpointed in the request journal before the contract receipt is acknowledged; completed
+      receipts keep a bounded marker rather than retaining a history of contract snapshots.
+    - Completed keys are kept for `IDEMPOTENCY_KEY_TTL_SECONDS` (default 24 hours), starting at completion;
+      after that the same key starts a new request. Unfinished prepared operations do not expire by TTL:
+      deleting their journal could duplicate a previously applied effect.
+    - Group novations freeze the original member list and prepared changes. Recovery resumes each
+      contract, preserving concurrent usage and contact changes; it is not a multi-contract transaction.
+      Cache invalidation and event delivery are recovered after persistence; events may be attempted again.
+    - If ownership or durable response storage cannot be confirmed, SPACE answers `503` instead of sending
+      an unrecorded success. Retry with the same key. Responses larger than 4 MiB are not reported as a
+      durable success; a prepared operation remains available for recovery.
 
     How hosts should use it: generate a new random key (a UUID) for each operation, before the first
     attempt, and keep it with the operation (for example in the job or outbox row that issues the call).

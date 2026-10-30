@@ -1,8 +1,12 @@
 import { createHash } from 'node:crypto';
+import { STATUS_CODES } from 'node:http';
 import type { NextFunction, Request, Response } from 'express';
 import container from '../config/container';
 import type IdempotencyKeyRepository from '../repositories/mongoose/IdempotencyKeyRepository';
+import { IdempotencyOwnershipError } from '../repositories/mongoose/IdempotencyKeyRepository';
 import type { IdempotencyRecord, StoredResponse } from '../repositories/mongoose/IdempotencyKeyRepository';
+import { runIdempotencyExecution } from '../services/idempotencyExecution';
+import type { IdempotencyExecution } from '../services/idempotencyExecution';
 
 /**
  * `Idempotency-Key` for writes that must not be applied twice when a client
@@ -23,11 +27,12 @@ import type { IdempotencyRecord, StoredResponse } from '../repositories/mongoose
  *   short while (`IDEMPOTENCY_WAIT_MS`, default 2 s) and replay its response,
  *   or answer `409 IDEMPOTENCY_IN_PROGRESS` with `Retry-After` if it is still
  *   running.
- * - Stored: every response below 500 except 401, 403, 408 and 429, so that a
- *   retry gets the same answer as the first attempt. Not stored: 5xx (the
- *   request may not have run; a retry with the same key runs it again) and
- *   responses whose body exceeds `MAX_STORED_BODY_BYTES`.
- * - Records expire after `IDEMPOTENCY_KEY_TTL_SECONDS` (default 24 hours).
+ * - Successful/final responses are persisted before sending. A storage or
+ *   ownership failure answers 503, retaining a prepared operation for recovery.
+ *   Transient responses never discard a prepared plan; a retry resumes it.
+ * - Only completed records expire after `IDEMPOTENCY_KEY_TTL_SECONDS`
+ *   (default 24 hours). In-progress records retain their operation identity,
+ *   plan and checkpoints across lease takeover.
  *
  * Without the header the request is handled exactly as before. The middleware
  * is placed after authentication, permissions and validation, right before
@@ -40,7 +45,7 @@ export const IDEMPOTENT_REPLAYED_HEADER = 'Idempotent-Replayed';
 /** Response headers kept for a replay (besides status and body). */
 const STORED_HEADERS = ['content-type', 'etag', 'x-total-count'];
 
-/** Larger bodies are not stored: a retry runs the request again. */
+/** Larger final responses cannot be acknowledged as safely replayable. */
 export const MAX_STORED_BODY_BYTES = 4 * 1024 * 1024;
 
 /** How long a running request holds its key before another may take it over. */
@@ -133,107 +138,162 @@ export function idempotent(options: { when?: (req: Request) => boolean } = {}) {
     const key = req.get(IDEMPOTENCY_KEY_HEADER);
     if (key === undefined || ['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
     if (options.when && !options.when(req)) return next();
-
     if (key.length < 1 || key.length > 255) {
       return sendProblem(res, 400, 'IDEMPOTENCY_KEY_INVALID', 'Idempotency-Key must have between 1 and 255 characters');
     }
-
     const organizationId = scopeOf(req);
     if (!organizationId) return next();
-
     const fingerprint = requestFingerprint({
       method: req.method,
       route: `${req.baseUrl ?? ''}${req.route?.path ?? req.path}`,
-      params: req.params,
-      query: req.query as Record<string, unknown>,
-      body: req.body,
+      params: req.params, query: req.query as Record<string, unknown>, body: req.body,
       ifMatch: req.get('If-Match'),
     });
-
     const repository: IdempotencyKeyRepository = container.resolve('idempotencyKeyRepository');
 
     try {
       let reservation = await repository.reserve(organizationId, key, fingerprint, {
-        ttlSeconds: idempotencyKeyTtlSeconds(),
-        lockSeconds: LOCK_SECONDS,
+        ttlSeconds: idempotencyKeyTtlSeconds(), lockSeconds: LOCK_SECONDS,
       });
-
       if (!reservation.reserved) {
         let existing: IdempotencyRecord | null = reservation.existing;
-        if (existing.fingerprint !== fingerprint) {
-          return sendProblem(res, 409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used for a different request');
-        }
-        // The same request is running: wait for its response for a while.
         const deadline = Date.now() + waitMilliseconds();
-        while (existing && existing.state === 'in_progress' && Date.now() < deadline) {
+        for (;;) {
+          if (existing && existing.fingerprint !== fingerprint) {
+            return sendProblem(res, 409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used for a different request');
+          }
+          if (existing?.state === 'completed' && existing.response) return replay(res, existing.response);
+          if (!existing || existing.state !== 'in_progress' || Date.now() >= deadline) break;
           await sleep(25);
           existing = await repository.find(organizationId, key);
         }
-        if (existing?.state === 'completed' && existing.response) {
+        // A released key is new work; an expired worker lease resumes the
+        // SAME durable operation. Only reserve decides ownership, using DB time.
+        reservation = await repository.reserve(organizationId, key, fingerprint, {
+          ttlSeconds: idempotencyKeyTtlSeconds(), lockSeconds: LOCK_SECONDS,
+        });
+        if (!reservation.reserved) {
+          existing = reservation.existing;
           if (existing.fingerprint !== fingerprint) {
             return sendProblem(res, 409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used for a different request');
           }
-          return replay(res, existing.response);
-        }
-        if (existing) {
-          return sendProblem(res, 409, 'IDEMPOTENCY_IN_PROGRESS', 'A request with this Idempotency-Key is still being processed; retry later', 1);
-        }
-        // It was released (5xx) or expired meanwhile: this request runs it.
-        reservation = await repository.reserve(organizationId, key, fingerprint, {
-          ttlSeconds: idempotencyKeyTtlSeconds(),
-          lockSeconds: LOCK_SECONDS,
-        });
-        if (!reservation.reserved) {
+          if (existing.state === 'completed' && existing.response) return replay(res, existing.response);
           return sendProblem(res, 409, 'IDEMPOTENCY_IN_PROGRESS', 'A request with this Idempotency-Key is still being processed; retry later', 1);
         }
       }
 
-      const { owner } = reservation;
-      let settled = false;
-      const release = () => {
-        if (settled) return;
-        settled = true;
-        repository.release(organizationId, key, owner).catch(error => console.error('Idempotency key release failed', error));
+      const { owner, record } = reservation;
+      const execution: IdempotencyExecution & { ownershipLost?: boolean } = {
+        organizationId, key, owner, operationId: record.operationId, repository, record,
       };
-
-      // Store the response before it is sent, so that a client that got it
-      // and retries anyway is replayed rather than run again.
-      const send = res.send.bind(res);
-      (res as any).send = (body?: any) => {
-        if (settled || (typeof body !== 'string' && !Buffer.isBuffer(body) && body !== undefined)) {
-          // Objects go through res.json, which calls send again with a string.
-          return send(body);
+      let phase: 'active' | 'finalizing' | 'settled' = 'active';
+      let ownershipLost = false;
+      let renewing = false;
+      const heartbeat = setInterval(() => {
+        if (phase !== 'active' || ownershipLost || renewing) return;
+        renewing = true;
+        void repository.renew(organizationId, key, owner, LOCK_SECONDS).then(updated => {
+          if (phase !== 'active') return;
+          if (updated) execution.record = updated;
+          else { ownershipLost = true; execution.ownershipLost = true; }
+        }).catch(() => {
+          if (phase === 'active') { ownershipLost = true; execution.ownershipLost = true; }
+        }).finally(() => { renewing = false; });
+      }, 20_000);
+      heartbeat.unref();
+      const originalSend = res.send.bind(res);
+      const stopHeartbeat = () => clearInterval(heartbeat);
+      const freshOwnership = async () => {
+        if (ownershipLost) throw new IdempotencyOwnershipError();
+        execution.record = await repository.assertOwned(organizationId, key, owner);
+        return execution.record;
+      };
+      const preserveOrRelease = async () => {
+        // Even after a failed heartbeat, yielding is safe if the database
+        // confirms that this owner still holds the unexpired lease.
+        const current = await repository.assertOwned(organizationId, key, owner);
+        execution.record = current;
+        if (Object.prototype.hasOwnProperty.call(current, 'plan')) {
+          await repository.yieldLease(organizationId, key, owner);
+        } else if (!await repository.release(organizationId, key, owner)) {
+          throw new IdempotencyOwnershipError();
         }
-        settled = true;
+      };
+      const unavailable = (code = 'IDEMPOTENCY_UNAVAILABLE') => {
+        if (res.headersSent || res.writableEnded || res.destroyed) return res;
+        // The original response may have set these before send was intercepted.
+        for (const header of ['content-length', 'content-encoding', 'etag', 'content-disposition', 'content-range', 'x-total-count', IDEMPOTENT_REPLAYED_HEADER]) {
+          res.removeHeader(header);
+        }
+        res.statusCode = 503;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Retry-After', '1');
+        return originalSend(JSON.stringify({ code, error: 'The operation could not be safely acknowledged. Retry with the same Idempotency-Key.' }));
+      };
+      const finalize = async (body: any) => {
         const status = res.statusCode;
-        const text = body === undefined ? '' : Buffer.isBuffer(body) ? body.toString('utf8') : body;
-        if (!isStoredStatus(status) || Buffer.byteLength(text) > MAX_STORED_BODY_BYTES) {
-          repository
-            .release(organizationId, key, owner)
-            .catch(error => console.error('Idempotency key release failed', error))
-            .finally(() => send(body));
-          return res;
+        const text = body == null ? '' : Buffer.isBuffer(body) ? body.toString('utf8') : String(body);
+        const oversized = Buffer.byteLength(text) > MAX_STORED_BODY_BYTES;
+        try {
+          if (!isStoredStatus(status) || oversized) {
+            await preserveOrRelease();
+            if (oversized && status >= 200 && status < 400) unavailable('IDEMPOTENCY_RESPONSE_TOO_LARGE');
+            else if (!res.headersSent && !res.writableEnded && !res.destroyed) originalSend(body);
+            return;
+          }
+          await freshOwnership();
+          const headers: Record<string, string> = {};
+          for (const name of STORED_HEADERS) {
+            const value = res.getHeader(name);
+            if (value !== undefined) headers[name] = String(value);
+          }
+          const completed = await repository.complete(organizationId, key, owner, { status, headers, body: text }, idempotencyKeyTtlSeconds());
+          if (!completed) throw new IdempotencyOwnershipError();
+          if (!res.headersSent && !res.writableEnded && !res.destroyed) originalSend(body);
+        } catch (error) {
+          // Completion may have persisted before its acknowledgement was lost.
+          // Rechecking ownership prevents deleting or yielding another worker's
+          // key, or deleting a record that is already complete.
+          await preserveOrRelease().catch(() => {});
+          unavailable();
+        } finally {
+          phase = 'settled';
+          stopHeartbeat();
         }
-        const headers: Record<string, string> = {};
-        for (const name of STORED_HEADERS) {
-          const value = res.getHeader(name);
-          if (value !== undefined) headers[name] = String(value);
+      };
+      (res as any).send = (body?: any) => {
+        if (phase !== 'active') return res;
+        // Preserve Express 4's deprecated send(status) shorthand without
+        // allowing that primitive response to bypass durable finalization.
+        if (typeof body === 'number') {
+          if (!Number.isInteger(body) || body < 100 || body > 999) throw new RangeError('Invalid status code');
+          res.statusCode = body;
+          if (!res.getHeader('Content-Type')) res.type('txt');
+          body = STATUS_CODES[body];
         }
-        repository
-          .complete(organizationId, key, owner, { status, headers, body: text })
-          .catch(error => console.error('Idempotency key completion failed', error))
-          .finally(() => send(body));
+        // Express sends objects through json(), which re-enters this wrapper
+        // with a serialized string. Null is an empty body in res.send().
+        if (body !== null && body !== undefined && typeof body !== 'string' && !Buffer.isBuffer(body)) {
+          return originalSend(body);
+        }
+        phase = 'finalizing';
+        stopHeartbeat();
+        void finalize(body);
         return res;
       };
-      // A response written without send (Express's own error handler uses
-      // end) is not stored: the key is given back so that a retry runs. A
-      // client that disconnects does not release it: the request goes on and
-      // its response is stored for the retry. A process that dies leaves the
-      // key locked for LOCK_SECONDS, after which a retry takes it over.
-      res.on('finish', release);
+      // end()/streamed errors can finish without calling send. Retain a
+      // prepared operation; only an unused reservation may be deleted.
+      res.once('finish', () => {
+        if (phase !== 'active') return;
+        phase = 'finalizing';
+        stopHeartbeat();
+        void preserveOrRelease().catch(() => {}).finally(() => { phase = 'settled'; });
+      });
+      // No close/disconnect release: work can finish after its client leaves,
+      // and its durable outcome must remain available to a subsequent retry.
+      return runIdempotencyExecution(execution, () => next());
     } catch (error) {
       return next(error);
     }
-    return next();
   };
 }

@@ -101,7 +101,7 @@ async function evaluateFeature(
           options.userId,
           consumptions,
           options.organizationId,
-          { limits: featureEvaluation.limit ?? {}, contract: options.contract, featureId }
+          { limits: featureEvaluation.limit ?? {}, contract: options.contract, featureId, evaluation: featureEvaluation }
         );
 
         if (outcome.status === 'changed') {
