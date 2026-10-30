@@ -4,6 +4,7 @@ import { retrievePricingFromPath, retrievePricingFromText } from 'pricing4ts/ser
 import container from '../config/container';
 import ServiceRepository, { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository';
 import { parsePricingToSpacePricingObject } from '../utils/pricing-yaml2json';
+import { proxyAgentFor } from '../utils/proxy';
 import { Pricing } from 'pricing4ts';
 import fetch from 'node-fetch';
 import https from 'https';
@@ -22,6 +23,15 @@ import { escapeVersion } from '../utils/helpers';
 import { resetEscapeVersionInService } from '../utils/services/helpers';
 import CacheService from './CacheService';
 import OrganizationRepository from '../repositories/mongoose/OrganizationRepository';
+import { pricingYamlFile, readPricingYaml, uploadedPricingYamlPath } from './pricingFiles';
+
+/** A pricing version exists, but SPACE stores no Pricing2Yaml file for it. */
+export class PricingYamlUnavailableError extends Error {
+  constructor(serviceName: string, pricingVersion: string) {
+    super(`PRICING_YAML_UNAVAILABLE: The Pricing2Yaml file of version ${pricingVersion} of service ${serviceName} is not available`);
+    this.name = 'PricingYamlUnavailableError';
+  }
+}
 
 class ServiceService {
   private readonly serviceRepository: ServiceRepository;
@@ -216,6 +226,49 @@ class ServiceService {
 
       return { ...pricing, url: pricingLocator.url };
     }
+  }
+
+  /**
+   * The stored Pricing2Yaml file of a pricing version, byte for byte, read from
+   * its `yamlPath` (outside public/, see pricingFiles.ts). Versions that exist
+   * but whose file SPACE does not store (remote URL pricings, SPHERE versions
+   * SPACE keeps no copy of, lost files) raise `PricingYamlUnavailableError`;
+   * unknown services and versions raise a `NOT FOUND` error.
+   */
+  async showPricingYaml(serviceName: string, pricingVersion: string, organizationId: string): Promise<Buffer> {
+    const cacheKey = `service.${organizationId}.${serviceName}`;
+    let service = await this.cacheService.get(cacheKey);
+
+    if (!service) {
+      service = await this.serviceRepository.findByName(serviceName, organizationId);
+    }
+
+    if (!service) {
+      throw new Error(`NOT FOUND: Service with name ${serviceName}`);
+    }
+
+    const formattedPricingVersion = escapeVersion(pricingVersion);
+    const pricingLocator =
+      service.activePricings?.get(formattedPricingVersion) ??
+      service.archivedPricings?.get(formattedPricingVersion);
+
+    if (!pricingLocator) {
+      if (service.source === 'sphere') {
+        throw new PricingYamlUnavailableError(serviceName, pricingVersion);
+      }
+      throw new Error(`NOT FOUND: Pricing version ${pricingVersion} not found for service ${serviceName}`);
+    }
+
+    const pricing = pricingLocator.id
+      ? await this.showPricing(serviceName, pricingVersion, organizationId)
+      : undefined;
+    const body = pricing?.yamlPath ? readPricingYaml(pricing.yamlPath) : undefined;
+
+    if (!body) {
+      throw new PricingYamlUnavailableError(serviceName, pricingVersion);
+    }
+
+    return body;
   }
 
   async showPublicPricingUrl(serviceName: string, pricingVersion: string, organizationId: string) {
@@ -1169,7 +1222,8 @@ class ServiceService {
     const safeServiceName = this._normalizePricingPathPart(serviceName);
     const safeVersion = this._normalizePricingPathPart(version);
 
-    return `/static/pricings/${safeOrganizationId}-${safeServiceName}-${safeVersion}.yaml`;
+    // Outside public/: read only through GET .../pricings/{version}?format=yaml.
+    return uploadedPricingYamlPath(`${safeOrganizationId}-${safeServiceName}-${safeVersion}.yaml`);
   }
 
   _savePricingYamlContent(
@@ -1179,7 +1233,10 @@ class ServiceService {
     version: string
   ) {
     const relativePath = this._buildPricingYamlRelativePath(organizationId, serviceName, version);
-    const absolutePath = path.resolve('public', `.${relativePath}`);
+    const absolutePath = pricingYamlFile(relativePath);
+    if (!absolutePath) {
+      throw new Error(`Invalid pricing file path ${relativePath}`);
+    }
 
     fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
     fs.writeFileSync(absolutePath, yamlContent, 'utf8');
@@ -1198,7 +1255,7 @@ class ServiceService {
   }
 
   async _fetchRemotePricingYaml(url: string) {
-    const agent = new https.Agent({ rejectUnauthorized: false });
+    const agent = proxyAgentFor(url, { rejectUnauthorized: false }) ?? new https.Agent({ rejectUnauthorized: false });
     const timeoutMs = 5000;
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);

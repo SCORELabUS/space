@@ -166,6 +166,12 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
     allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
   },
   {
+    path: '/services/*/pricings/*/public-url',
+    methods: ['GET'],
+    allowedUserRoles: [],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
+  },
+  {
     path: '/services/*/pricings/*',
     methods: ['PUT', 'PATCH'],
     allowedUserRoles: [],
