@@ -28,6 +28,12 @@ export default function ServicesFilters({ filters, setFilters }: Props) {
           placeholder="Service name..."
         />
       </div>
+      <div className="flex flex-col min-w-[120px] md:w-40">
+        <label htmlFor="service-status" className="mb-1 text-xs font-semibold text-gray-500 dark:text-gray-300">Status</label>
+        <select id="service-status" value={filters.disabled ? 'disabled' : 'active'} onChange={event => setFilters({ ...filters, disabled: event.target.value === 'disabled', page: 1 })} className="cursor-pointer min-h-11 rounded-lg border border-gray-300 bg-white/90 px-3 py-2 text-gray-800 focus-visible:outline-2 focus-visible:outline-indigo-500 dark:border-gray-800 dark:bg-gray-800 dark:text-gray-100">
+          <option value="active">Active</option><option value="disabled">Disabled</option>
+        </select>
+      </div>
       <div className="flex flex-col min-w-[120px] md:w-40 relative">
         <label className="flex items-center gap-1 text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1">
           <FiSliders className="inline-block" /> Order

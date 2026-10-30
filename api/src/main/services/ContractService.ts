@@ -1,5 +1,6 @@
 import ServiceModel from '../repositories/mongoose/models/ServiceMongoose';
 import ContractModel from '../repositories/mongoose/models/ContractMongoose';
+import { assertNoPendingRelocation, relocationGlobalLease } from './serviceRelocationState';
 import { withOrganizationLock } from './sphere/lock';
 import { enforceSpherePolicy } from './sphere/contractPolicy';
 import container from '../config/container';
@@ -21,7 +22,7 @@ import {
   collectSubscriptionErrors,
   validateSubscription,
 } from '../controllers/validation/ContractValidation';
-import { performNovation } from '../utils/contracts/novation';
+import { novationFields, performNovation } from '../utils/contracts/novation';
 import CacheService from './CacheService';
 import type EventService from './EventService';
 import {
@@ -170,8 +171,9 @@ class ContractService {
           }
         }
         const org = method === 'create' ? args[0]?.organizationId : method.endsWith('ByGroupId') ? args[1] : contract?.organizationId;
-        if (!org || !await ServiceModel.exists({ organizationId: org, source: 'sphere' })) return original(...args);
+        if (!org) return original(...args);
         return withOrganizationLock(org, async assertOwned => {
+          await assertNoPendingRelocation(org);
           if (await ServiceModel.exists({ organizationId: org, source: 'sphere', 'sphere.status': 'applying' })) throw new Error('Synchronization is applying; retry shortly');
           if (contract) await this.cacheService.del(contractCacheKey(contract.organizationId, contract.userContact.userId));
           await assertOwned();
@@ -179,9 +181,14 @@ class ContractService {
           const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
           for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
           return result;
-        });
+        }, 2000);
       };
     }
+    const prune = this.prune.bind(this);
+    this.prune = async (organizationId?: string) => withOrganizationLock(organizationId ?? relocationGlobalLease, async () => {
+      await assertNoPendingRelocation(organizationId);
+      return prune(organizationId);
+    }, 2000);
 
   }
 
@@ -609,9 +616,9 @@ class ContractService {
    *        what the version covers (subscription, billing period, histories),
    *        so a novation that lands between the read and the write is not
    *        overwritten. A mismatch throws `ContractChangedError` and writes
-   *        nothing. Usage levels are not part of the version: the write still
-   *        sets the whole contract as read, so consumption recorded in that
-   *        window (`$inc`) can be lost, with or without a precondition.
+   *        nothing. Usage levels are not part of the version; the write only
+   *        sets novation fields, preserving concurrent consumption and contact
+   *        changes with or without a precondition.
    */
   async novate(
     userId: string,
@@ -651,7 +658,7 @@ class ContractService {
 
     const result = await this.contractRepository.update(
       userId,
-      newContract,
+      novationFields(newContract),
       contract.organizationId,
       guard
     );
@@ -671,8 +678,10 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
+    // A consumption may have landed after this write returned. Do not cache
+    // its earlier snapshot over the newer state.
+    await this.cacheService.del(contractCacheKey(organizationId, userId));
+    await this.cacheService.del(featuresCachePattern(organizationId, userId));
     this._events()?.emitContractEvent('CONTRACT_NOVATED', result);
 
     return result;
@@ -768,9 +777,19 @@ class ContractService {
         throw new ContractChangedError(changed, novated);
       }
     } else {
-      const result = await this.contractRepository.bulkUpdate(updatedContracts);
-
-      if (!result) {
+      const rejected = await this.contractRepository.bulkUpdateGuarded(
+        updatedContracts.map(contract => ({ contract, guard: {} }))
+      );
+      if (rejected.length > 0) {
+        for (const contract of updatedContracts) {
+          await this.cacheService.delMany(contractCacheKeys(contract));
+        }
+        for (const contract of updatedContracts) {
+          const userId = contract.userContact.userId;
+          if (rejected.includes(userId)) continue;
+          const written = await this.contractRepository.findByUserId(userId, organizationId);
+          if (written) this._events()?.emitContractEvent('CONTRACT_NOVATED', written);
+        }
         throw new Error(`Failed to update contracts for groupId ${groupId} within organization ${organizationId}`);
       }
     }
@@ -779,8 +798,8 @@ class ContractService {
 
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
-      this.cacheService.set(contractCacheKey(contract.organizationId, contract.userContact.userId), contract, 3600, true); // Cache for 1 hour
-      this.cacheService.del(featuresCachePattern(contract.organizationId, contract.userContact.userId));
+      await this.cacheService.del(contractCacheKey(contract.organizationId, contract.userContact.userId));
+      await this.cacheService.del(featuresCachePattern(contract.organizationId, contract.userContact.userId));
       this._events()?.emitContractEvent('CONTRACT_NOVATED', contract);
     }
 
@@ -1053,7 +1072,9 @@ class ContractService {
       ); // 120 secs = 2 mins
     }
 
-    await this.cacheService.set(contractCacheKey(organizationId, userId), updatedContract, 3600, true); // Cache for 1 hour
+    // A novation may have changed the subscription since the increment. Avoid
+    // restoring its previous plan from this consumption snapshot.
+    await this.cacheService.del(contractCacheKey(organizationId, userId));
   }
 
   /**

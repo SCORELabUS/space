@@ -8,6 +8,7 @@ import { LeanPricing } from '../../types/models/Pricing';
 const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 export type ServiceQueryFilters = {
+  disabled?: boolean;
   name?: string;
   page?: number;
   offset?: number;
@@ -17,11 +18,11 @@ export type ServiceQueryFilters = {
 
 class ServiceRepository extends RepositoryBase {
   async findAll(organizationId?: string, queryFilters?: ServiceQueryFilters, disabled = false) {
-    const { name, page = 1, offset = 0, limit = 20, order = 'asc' } = queryFilters || {};
+    const { name, page = 1, offset = 0, limit = 20, order = 'asc', disabled: selectedDisabled = disabled } = queryFilters || {};
 
     const query: any = {
       ...(name ? { name: { $regex: name, $options: 'i' } } : {}),
-      disabled: disabled,
+      disabled: selectedDisabled,
       ...(organizationId ? { organizationId: organizationId } : {}),
     };
 
@@ -114,8 +115,8 @@ class ServiceRepository extends RepositoryBase {
   }
 
   async update(name: string, data: any, organizationId: string) {
-    // Exact, case-insensitive: another service whose name contains this one must not match.
-    const query: any = { name: { $regex: `^${escapeRegex(name)}$`, $options: 'i' } };
+    // Exact, case-insensitive and organization-bound.
+    const query: any = { name: { $regex: `^${escapeRegex(name)}$`, $options: 'i' }, organizationId };
     if (organizationId) {
       query.organizationId = organizationId;
     }

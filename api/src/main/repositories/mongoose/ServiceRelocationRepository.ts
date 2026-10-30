@@ -81,7 +81,7 @@ export default class ServiceRelocationRepository {
     const id = `${operation}:${String(contractId)}`;
     return ServiceRelocationStep.findOneAndUpdate(
       { _id: id },
-      { $setOnInsert: { operationId: operation, contractId, before, applied: false, effectsDone: false } },
+      { $setOnInsert: { operationId: operation, contractId, before: { id: String(contractId), organizationId: before.organizationId, userContact: { userId: before.userContact.userId }, contractedServices: before.contractedServices }, applied: false, effectsDone: false } },
       { upsert: true, new: true, runValidators: true }
     ).lean().exec();
   }
@@ -90,8 +90,8 @@ export default class ServiceRelocationRepository {
     return ServiceRelocationStep.find({ operationId: required(operationId, 'operation id') }).lean().exec();
   }
 
-  applied(stepId: string) {
-    return ServiceRelocationStep.updateOne({ _id: required(stepId, 'step id') }, { $set: { applied: true } });
+  applied(stepId: string, changed = true) {
+    return ServiceRelocationStep.updateOne({ _id: required(stepId, 'step id') }, { $set: { applied: true, changed } });
   }
 
   effectsDone(stepId: string) {

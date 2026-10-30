@@ -35,6 +35,7 @@ const step = new Schema({
   contractId: { type: Schema.Types.ObjectId, required: true },
   before: { type: Schema.Types.Mixed, required: true },
   applied: { type: Boolean, default: false, required: true },
+  changed: { type: Boolean, default: true, required: true },
   effectsDone: { type: Boolean, default: false, required: true },
 });
 
