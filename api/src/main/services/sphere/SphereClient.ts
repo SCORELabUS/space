@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import yaml from 'js-yaml';
 import { SphereManifest } from './types';
 import { escapeVersion } from '../../utils/helpers';
+import { proxyAgentFor } from '../../utils/proxy';
 
 export function functionalHash(text: string): string {
   const value = yaml.load(text) as Record<string, unknown>;
@@ -47,8 +48,9 @@ export default class SphereClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
     try {
-      const response = await fetch(`${apiBase.replace(/\/$/, '')}${path}`, {
-        signal: controller.signal, redirect: 'error', size: 5 * 1024 * 1024,
+      const url = `${apiBase.replace(/\/$/, '')}${path}`;
+      const response = await fetch(url, {
+        agent: proxyAgentFor(url), signal: controller.signal, redirect: 'error', size: 5 * 1024 * 1024,
       });
       if (!response.ok) throw new Error(`SPHERE unavailable (${response.status}); keeping local copies`);
       return await response.text();
