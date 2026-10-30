@@ -4506,7 +4506,9 @@ components:
         Opaque version of the contract for optimistic concurrency. It changes with every change of the
         subscription (contracted pricing versions, plans, add-ons), of the billing period, and with every
         novation or SPHERE migration, also when a novation returns to an earlier subscription. Recording usage
-        does not change it. Treat it as an opaque string: compare it for equality and send it back in
+        does not change it. Novations write only their subscription, billing period and history fields,
+        preserving concurrent consumption and contact changes with or without a precondition. Group novations
+        never recreate a contract deleted during the operation. Treat the version as an opaque string: compare it for equality and send it back in
         `If-Match` (or `expectedContractVersion`). Single-contract responses also carry it as
         `ETag: "<contractVersion>"`, which CORS exposes to browser clients.
       example: 3-9f86d081884c7d65
