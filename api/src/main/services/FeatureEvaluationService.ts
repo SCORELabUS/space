@@ -28,7 +28,8 @@ import {
 } from '../utils/feature-evaluation/featureEvaluation';
 import ContractService from './ContractService';
 import ServiceService from './ServiceService';
-import { generateTokenFromEvalResult } from '../utils/jwt';
+import { PricingTokenSubscription, generateTokenFromEvalResult } from '../utils/jwt';
+import { computeContractVersion } from '../utils/contracts/version';
 import { escapeVersion } from '../utils/helpers';
 import CacheService from './CacheService';
 
@@ -89,11 +90,12 @@ class FeatureEvaluationService {
         pricingContext: PricingContext;
         subscriptionContext: SubscriptionContext;
         result: SimpleFeatureEvaluation | DetailedFeatureEvaluation;
+        contract: LeanContract;
       }
   > {
 
     // Step 1: Retrieve contexts
-    const { subscriptionContext, pricingContext, evaluationContext } =
+    const { subscriptionContext, pricingContext, evaluationContext, contract } =
       await this._retrieveContextsByUserId(userId, options.server, reqOrg);
 
     // Step 2: Perform the evaluation
@@ -112,6 +114,7 @@ class FeatureEvaluationService {
           pricingContext,
           subscriptionContext,
           result: evaluationResults,
+          contract,
         }
       : evaluationResults;
   }
@@ -135,13 +138,26 @@ class FeatureEvaluationService {
       pricingContext: PricingContext;
       subscriptionContext: SubscriptionContext;
       result: DetailedFeatureEvaluation;
+      contract: LeanContract;
+    };
+
+    // The contract the contexts were built from (after a renewal, if any), so
+    // the claim always matches the features of the token. A second read could
+    // see a novation made in between. Pricing versions are unescaped.
+    const evaluated = result.contract;
+    const subscription: PricingTokenSubscription = {
+      contractedServices: { ...evaluated.contractedServices },
+      subscriptionPlans: { ...(evaluated.subscriptionPlans ?? {}) },
+      subscriptionAddOns: { ...(evaluated.subscriptionAddOns ?? {}) },
+      contractVersion: computeContractVersion(evaluated),
     };
 
     const token = await generateTokenFromEvalResult(
       contract.userContact.userId,
       result.pricingContext,
       result.subscriptionContext,
-      result.result
+      result.result,
+      subscription
     );
 
     await this.cacheService.set(`features.${userId}.pricingToken`, token, 3600, true);
@@ -166,7 +182,7 @@ class FeatureEvaluationService {
       return evaluation as FeatureEvaluationResult;
     }
 
-    await this.cacheService.del(`features.${userId}.pricingToken`)
+    await this.cacheService.del(`features.${userId}.pricingToken`);
 
     // Step 1: Retrieve contexts
     const { subscriptionContext, pricingContext, evaluationContext } =
@@ -327,8 +343,8 @@ class FeatureEvaluationService {
       pricingsToReturn[serviceName] = {};
 
       // Step 2: Given the show parameter, discover all pricings that must be identified by id, and do the same for url
-      let pricingsWithIdToCheck: string[] = [];
-      let pricingsWithUrlToCheck: string[] = [];
+      const pricingsWithIdToCheck: string[] = [];
+      const pricingsWithUrlToCheck: string[] = [];
 
       if (show === 'active' || show === 'all') {
         for (const [version, pricing] of service.activePricings) {
@@ -411,6 +427,8 @@ class FeatureEvaluationService {
     subscriptionContext: SubscriptionContext;
     pricingContext: PricingContext;
     evaluationContext: Record<string, string>;
+    /** The contract the contexts were built from. */
+    contract: LeanContract;
   }> {
     // Step 1.1: Retrieve the user contract, within the caller's organization
     let contract: LeanContract = await this.contractService.show(userId, reqOrg.id);
@@ -423,7 +441,7 @@ class FeatureEvaluationService {
         'Invalid subscription: Your susbcription has expired and it is not set to renew automatically. To continue accessing the features, please purchase any subscription.'
       );
     } else if (isContractExpired) {
-      await this.contractService.renew(userId, reqOrg.id);
+      contract = await this.contractService.renew(userId, reqOrg.id);
     }
 
     // Step 1.3: Reset all expired renewable usage levels
@@ -481,7 +499,7 @@ class FeatureEvaluationService {
     const evaluationContext: Record<string, string> =
       flattenFeatureEvaluationsIntoEvaluationContext(evaluationExpressionsByService);
 
-    return { subscriptionContext, pricingContext, evaluationContext };
+    return { subscriptionContext, pricingContext, evaluationContext, contract };
   }
 }
 

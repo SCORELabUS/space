@@ -843,6 +843,15 @@ class ContractService {
 
     const contractsToReturn = await this.index({ groupId: groupId }, organizationId);
 
+    // The billing period is part of contractVersion: drop cached contracts,
+    // evaluations and pricing tokens (they carry the version).
+    await this.cacheService.delMany(
+      contractsToReturn.flatMap(contract => [
+        `contracts.${contract.userContact.userId}`,
+        `features.${contract.userContact.userId}.*`,
+      ])
+    );
+
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
     }
