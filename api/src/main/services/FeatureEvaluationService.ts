@@ -32,6 +32,7 @@ import { PricingTokenSubscription, generateTokenFromEvalResult } from '../utils/
 import { computeContractVersion } from '../utils/contracts/version';
 import { escapeVersion } from '../utils/helpers';
 import CacheService from './CacheService';
+import { contractCacheKey, featuresCacheKey } from '../utils/contracts/cacheKeys';
 
 class FeatureEvaluationService {
   private readonly serviceService: ServiceService;
@@ -106,7 +107,7 @@ class FeatureEvaluationService {
       !options.details
     );
 
-    await this.cacheService.set(`features.${userId}.eval`, evaluationResults, 3600, true); // Cache for 1 hour
+    await this.cacheService.set(featuresCacheKey(contract.organizationId, userId, 'eval'), evaluationResults, 3600, true); // Cache for 1 hour
 
     // Step 3: Return appropriate response based on options
     return options.returnContexts
@@ -124,7 +125,8 @@ class FeatureEvaluationService {
     // cached under this userId is returned.
     const contract = await this.contractService.show(userId, reqOrg.id);
 
-    const cachedToken = await this.cacheService.get(`features.${userId}.pricingToken`);
+    const tokenKey = featuresCacheKey(contract.organizationId, userId, 'pricingToken');
+    const cachedToken = await this.cacheService.get(tokenKey);
 
     if (cachedToken) {
       return cachedToken;
@@ -157,10 +159,11 @@ class FeatureEvaluationService {
       result.pricingContext,
       result.subscriptionContext,
       result.result,
-      subscription
+      subscription,
+      evaluated.organizationId
     );
 
-    await this.cacheService.set(`features.${userId}.pricingToken`, token, 3600, true);
+    await this.cacheService.set(tokenKey, token, 3600, true);
 
     return token;
   }
@@ -174,15 +177,16 @@ class FeatureEvaluationService {
   ): Promise<boolean | FeatureEvaluationResult> {
     // Resolve the contract within the caller's organization before anything
     // cached under this userId is returned.
-    await this.contractService.show(userId, reqOrg.id);
+    const { organizationId } = await this.contractService.show(userId, reqOrg.id);
+    const evaluationKey = featuresCacheKey(organizationId, userId, `eval.${featureId}`);
 
-    const evaluation = await this.cacheService.get(`features.${userId}.eval.${featureId}`);
+    const evaluation = await this.cacheService.get(evaluationKey);
 
     if (evaluation && !options.revert && !expectedConsumption) {
       return evaluation as FeatureEvaluationResult;
     }
 
-    await this.cacheService.del(`features.${userId}.pricingToken`);
+    await this.cacheService.del(featuresCacheKey(organizationId, userId, 'pricingToken'));
 
     // Step 1: Retrieve contexts
     const { subscriptionContext, pricingContext, evaluationContext } =
@@ -212,7 +216,7 @@ class FeatureEvaluationService {
       );
       if (!(evaluationResults as FeatureEvaluationResult).limit) {
         await this.cacheService.set(
-          `features.${userId}.eval.${featureId}`,
+          evaluationKey,
           evaluationResults,
           3600,
           true
@@ -453,7 +457,7 @@ class FeatureEvaluationService {
         const usageLevel = usageLevels[level];
         if (usageLevel.resetTimeStamp && isAfter(new Date(), usageLevel.resetTimeStamp)) {
           usageLevelsToRenew.push(`${serviceName}-${level}`);
-          this.cacheService.del(`contracts.${userId}`);
+          this.cacheService.del(contractCacheKey(contract.organizationId, userId));
         }
       }
     }

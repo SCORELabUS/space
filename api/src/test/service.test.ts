@@ -209,7 +209,8 @@ describe('Services API Test Suite', function () {
   });
 
   describe('PUT /services/{serviceName}', function () {
-    let contractsToCleanup: Set<string> = new Set();
+    // userId -> organization that holds the contract at the end of the test.
+    let contractsToCleanup: Map<string, string> = new Map();
 
     afterEach(async function () {
       // Reset service name if it was changed
@@ -220,8 +221,8 @@ describe('Services API Test Suite', function () {
         .catch(() => {}); // Ignore errors if service was deleted
 
       // Cleanup contracts
-      for (const userId of contractsToCleanup) {
-        await deleteTestContract(userId, app);
+      for (const [userId, organizationId] of contractsToCleanup) {
+        await deleteTestContract(userId, organizationId, app);
       }
       contractsToCleanup.clear();
     });
@@ -269,7 +270,7 @@ describe('Services API Test Suite', function () {
 
       expect(createResponse.status).toEqual(201);
       const contractBefore = createResponse.body as LeanContract;
-      contractsToCleanup.add(contractBefore.userContact.userId);
+      contractsToCleanup.set(contractBefore.userContact.userId, contractBefore.organizationId);
       
       // Verify contract has the service
       expect(contractBefore.contractedServices).toHaveProperty(testService.name.toLowerCase());
@@ -284,7 +285,7 @@ describe('Services API Test Suite', function () {
       expect(updateResponse.body.name).toEqual(newServiceName);
 
       // Verify contract was updated with new service name
-      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, app);
+      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, contractBefore.organizationId, app);
       expect(contractAfter.contractedServices).toHaveProperty(newServiceName.toLowerCase());
       expect(contractAfter.contractedServices).not.toHaveProperty(testService.name.toLowerCase());
       expect(contractAfter.subscriptionPlans).toHaveProperty(newServiceName.toLowerCase());
@@ -340,7 +341,7 @@ describe('Services API Test Suite', function () {
 
       expect(createResponse.status).toEqual(201);
       const contractBefore = createResponse.body as LeanContract;
-      contractsToCleanup.add(contractBefore.userContact.userId);
+      contractsToCleanup.set(contractBefore.userContact.userId, contractBefore.organizationId);
       expect(Object.keys(contractBefore.contractedServices).length).toEqual(1);
       expect(contractBefore.organizationId).toEqual(testOrganization.id);
 
@@ -354,7 +355,8 @@ describe('Services API Test Suite', function () {
       expect(updateResponse.body.organizationId).toEqual(newOrganization.id);
 
       // Verify contract was moved to new organization
-      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, app);
+      contractsToCleanup.set(contractBefore.userContact.userId, newOrganization.id!);
+      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, newOrganization.id!, app);
       expect(contractAfter.organizationId).toEqual(newOrganization.id);
       expect(contractAfter.contractedServices).toHaveProperty(testService.name.toLowerCase());
 
@@ -386,7 +388,7 @@ describe('Services API Test Suite', function () {
 
       expect(createResponse.status).toEqual(201);
       const contractBefore = createResponse.body as LeanContract;
-      contractsToCleanup.add(contractBefore.userContact.userId);
+      contractsToCleanup.set(contractBefore.userContact.userId, contractBefore.organizationId);
       expect(Object.keys(contractBefore.contractedServices).length).toEqual(2);
       expect(contractBefore.organizationId).toEqual(testOrganization.id);
       const orgBefore = contractBefore.organizationId;
@@ -402,7 +404,7 @@ describe('Services API Test Suite', function () {
       expect(updateResponse.body.organizationId).toEqual(newOrganization.id);
 
       // Verify contract STILL in original organization but service was removed
-      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, app);
+      const contractAfter = await getContractByUserId(contractBefore.userContact.userId, orgBefore, app);
       expect(contractAfter.organizationId).toEqual(orgBefore);
       expect(contractAfter.contractedServices).not.toHaveProperty(testService.name.toLowerCase());
       expect(contractAfter.contractedServices).toHaveProperty(additionalService.name.toLowerCase());
@@ -473,7 +475,7 @@ describe('Services API Test Suite', function () {
 
       expect(singleContractResponse.status).toEqual(201);
       const singleContractBefore = singleContractResponse.body as LeanContract;
-      contractsToCleanup.add(singleContractBefore.userContact.userId);
+      contractsToCleanup.set(singleContractBefore.userContact.userId, singleContractBefore.organizationId);
 
       // Contract with multiple services
       const multiContractData = await generateContract(
@@ -493,7 +495,7 @@ describe('Services API Test Suite', function () {
 
       expect(multiContractResponse.status).toEqual(201);
       const multiContractBefore = multiContractResponse.body as LeanContract;
-      contractsToCleanup.add(multiContractBefore.userContact.userId);
+      contractsToCleanup.set(multiContractBefore.userContact.userId, multiContractBefore.organizationId);
 
       const updateResponse = await request(app)
         .put(`${baseUrl}/services/${testService.name.toLowerCase()}`)
@@ -504,8 +506,10 @@ describe('Services API Test Suite', function () {
       expect(updateResponse.body.name).toEqual(newName);
       expect(updateResponse.body.organizationId).toEqual(newOrganization.id);
 
+      contractsToCleanup.set(singleContractBefore.userContact.userId, newOrganization.id!);
       const singleContractAfter = await getContractByUserId(
         singleContractBefore.userContact.userId,
+        newOrganization.id!,
         app
       );
       expect(singleContractAfter.organizationId).toEqual(newOrganization.id);
@@ -516,6 +520,7 @@ describe('Services API Test Suite', function () {
 
       const multiContractAfter = await getContractByUserId(
         multiContractBefore.userContact.userId,
+        multiContractBefore.organizationId,
         app
       );
       expect(multiContractAfter.organizationId).toEqual(testOrganization.id);

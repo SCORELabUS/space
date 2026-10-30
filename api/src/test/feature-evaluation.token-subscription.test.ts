@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { jwtVerify } from 'jose';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import container from '../main/config/container';
+import { contractCacheKey } from '../main/utils/contracts/cacheKeys';
 import { baseUrl, getApp, shutdownApp } from './utils/testApp';
 import { createTestUser, deleteTestUser } from './utils/users/userTestUtils';
 import {
@@ -101,7 +102,9 @@ describe('Pricing token subscription', function () {
       subscriptionAddOns: { [serviceName]: { extraPets: 2 } },
       contractVersion: await contractVersion(),
     });
-    expect(payload.sub).toBe(userId);
+    expect(payload.sub).toBe(`urn:space:${organization.id}:${encodeURIComponent(userId)}`);
+    expect(payload.userId).toBe(userId);
+    expect(payload.organizationId).toBe(organization.id);
     expect(payload.features).toBeDefined();
     expect(payload.pricingContext).toBeDefined();
     expect(payload.subscriptionContext).toBeDefined();
@@ -155,7 +158,7 @@ describe('Pricing token subscription', function () {
       });
     // A novation that lands after the contexts were read: later reads see another plan.
     const show = vi.spyOn(contractService, 'show').mockImplementation(async (...args: any[]) => {
-      const contract: any = await originalShow(...(args as [string, string?]));
+      const contract: any = await originalShow(...(args as [string, string]));
       return contextsRead ? { ...contract, subscriptionPlans: { [serviceName]: 'PLATINUM' } } : contract;
     });
     try {
@@ -171,7 +174,7 @@ describe('Pricing token subscription', function () {
   it('follows billing period changes, also of groups (the cached token is invalidated)', async function () {
     const groupId = `group-${uuidv4()}`;
     await ContractMongoose.updateOne({ 'userContact.userId': userId }, { $set: { groupId } });
-    await container.resolve('cacheService').del(`contracts.${userId}`);
+    await container.resolve('cacheService').del(contractCacheKey(organization.id!, userId));
 
     const first = await token();
     const single = await request(app)

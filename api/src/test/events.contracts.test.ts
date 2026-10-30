@@ -19,6 +19,7 @@ import ContractMongoose from '../main/repositories/mongoose/models/ContractMongo
 import ServiceMongoose from '../main/repositories/mongoose/models/ServiceMongoose';
 import PricingMongoose from '../main/repositories/mongoose/models/PricingMongoose';
 import container from '../main/config/container';
+import { contractCacheKey, featuresCacheKey } from '../main/utils/contracts/cacheKeys';
 import { PETCLINIC_BASE_VERSION, uploadPetclinicService } from './utils/services/petclinicVersions';
 
 /**
@@ -370,6 +371,14 @@ describe('Contract events', function () {
         versions[userId] = created.body.contractVersion;
       }
       const [written, skipped] = Object.keys(versions);
+      const cache = container.resolve('cacheService');
+      const oldToken = featuresCacheKey(organization.id!, written, 'pricingToken');
+      const oldEvaluation = featuresCacheKey(organization.id!, written, 'eval');
+      const otherToken = featuresCacheKey(otherOrganization.id!, written, 'pricingToken');
+      await cache.set(oldToken, 'stale-own-token');
+      await cache.set(oldEvaluation, { stale: true });
+      await cache.set(otherToken, 'other-organization-token');
+      expect(await cache.get(contractCacheKey(organization.id!, written))).not.toBeNull();
       // Reject the second write after the first succeeds, with or without preconditions.
       const repository: any = container.resolve('contractRepository');
       const original = repository.bulkUpdateGuarded.bind(repository);
@@ -392,6 +401,13 @@ describe('Contract events', function () {
         guarded.mockRestore();
       }
 
+      expect(await cache.get(contractCacheKey(organization.id!, written))).toBeNull();
+      expect(await cache.get(oldToken)).toBeNull();
+      expect(await cache.get(oldEvaluation)).toBeNull();
+      expect(await cache.get(otherToken)).toBe('other-organization-token');
+      const shown = await request(app).get(`${baseUrl}/contracts/${written}`).set('x-api-key', allKey);
+      expect(shown.status).toBe(200);
+      expect(shown.body.subscriptionPlans[serviceName]).toBe('BASIC');
       const novated = await waitFor(events, e => e.code === 'CONTRACT_NOVATED' && e.details.userId === written);
       expect(novated.details.contractVersion).not.toBe(versions[written]);
       await new Promise(resolve => setTimeout(resolve, 200));
@@ -422,7 +438,7 @@ describe('Contract events', function () {
       const contract = await createContract();
       const groupId = `group-${uuidv4()}`;
       await ContractMongoose.updateOne({ 'userContact.userId': contract.userContact.userId }, { $set: { groupId } });
-      await container.resolve('cacheService').del(`contracts.${contract.userContact.userId}`);
+      await container.resolve('cacheService').del(contractCacheKey(contract.organizationId, contract.userContact.userId));
 
       const single = await request(app)
         .put(`${baseUrl}/contracts/${contract.userContact.userId}/billingPeriod`)
@@ -460,7 +476,7 @@ describe('Contract events', function () {
         { 'userContact.userId': contract.userContact.userId },
         { $set: { 'billingPeriod.endDate': new Date(Date.now() - 60_000) } }
       );
-      await container.resolve('cacheService').del(`contracts.${contract.userContact.userId}`);
+      await container.resolve('cacheService').del(contractCacheKey(contract.organizationId, contract.userContact.userId));
 
       await request(app).post(`${baseUrl}/features/${contract.userContact.userId}`).set('x-api-key', allKey);
 

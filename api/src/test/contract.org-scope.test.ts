@@ -260,8 +260,8 @@ describe('Contract organization scoping', function () {
       };
       delete forged._id;
 
-      // The filter includes the organization: nothing of org A matches, and the
-      // upsert then collides with the globally unique userId instead of writing.
+      // The filter includes the organization: nothing of org A matches, and
+      // bulk writes never upsert, so nothing is created in org B either.
       await container
         .resolve('contractRepository')
         .bulkUpdate([forged])
@@ -270,15 +270,25 @@ describe('Contract organization scoping', function () {
       const after = await storedContract();
       expect(after.organizationId).toBe(orgA.id);
       expect(after.subscriptionPlans[serviceName]).toBe('GOLD');
+      expect(await ContractMongoose.countDocuments({ 'userContact.userId': userId })).toBe(1);
     });
   });
 
   describe('platform ADMIN on the direct routes', function () {
-    it('keeps its cross-organization access', async function () {
-      const response = await request(app).get(`${baseUrl}/contracts/${userId}`).set('x-api-key', adminUser.apiKey);
+    it('keeps its cross-organization access, naming the organization with ?organizationId=', async function () {
+      const response = await request(app)
+        .get(`${baseUrl}/contracts/${userId}?organizationId=${orgA.id}`)
+        .set('x-api-key', adminUser.apiKey);
 
       expect(response.status).toBe(200);
       expect(response.body.organizationId).toBe(orgA.id);
+    });
+
+    it('must name the organization', async function () {
+      const response = await request(app).get(`${baseUrl}/contracts/${userId}`).set('x-api-key', adminUser.apiKey);
+
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe('ORGANIZATION_ID_REQUIRED');
     });
   });
 });

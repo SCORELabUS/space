@@ -120,7 +120,7 @@ describe('Applying expected consumption', () => {
     await service._applyExpectedConsumptions('user1', {
       'petclinic-maxPets': 1,
       'petclinic-maxVisits': 3,
-    });
+    }, 'org1');
 
     expect(stubs.consumed().maxPets.consumed).toBe(1);
     expect(stubs.consumed().maxVisits.consumed).toBe(3);
@@ -134,8 +134,8 @@ describe('Applying expected consumption', () => {
     const service = await aService();
 
     await Promise.all([
-      service._applyExpectedConsumption('user1', 'petclinic-maxPets', 1),
-      service._applyExpectedConsumption('user1', 'petclinic-maxPets', 1),
+      service._applyExpectedConsumption('user1', 'petclinic-maxPets', 1, 'org1'),
+      service._applyExpectedConsumption('user1', 'petclinic-maxPets', 1, 'org1'),
     ]);
 
     expect(stubs.consumed().maxPets.consumed).toBe(2);
@@ -147,7 +147,7 @@ describe('Applying expected consumption', () => {
 
     await Promise.all(
       Array.from({ length: 20 }, () =>
-        service._applyExpectedConsumption('user1', 'petclinic-maxPets', 1)
+        service._applyExpectedConsumption('user1', 'petclinic-maxPets', 1, 'org1')
       )
     );
 
@@ -159,8 +159,8 @@ describe('Applying expected consumption', () => {
     const service = await aService();
 
     await Promise.all([
-      service._applyExpectedConsumption('user1', 'petclinic-maxPets', 1),
-      service._applyExpectedConsumption('user1', 'petclinic-maxVisits', 1),
+      service._applyExpectedConsumption('user1', 'petclinic-maxPets', 1, 'org1'),
+      service._applyExpectedConsumption('user1', 'petclinic-maxVisits', 1, 'org1'),
     ]);
 
     expect(stubs.consumed().maxPets.consumed).toBe(1);
@@ -176,7 +176,7 @@ describe('Applying expected consumption', () => {
     await service._applyExpectedConsumptions('user1', {
       'petclinic-maxPets': 1,
       'petclinic-maxVisits': 1,
-    });
+    }, 'org1');
 
     expect(stubs.counts()).toEqual({ reads: 0, writes: 0, increments: 1 });
   });
@@ -185,7 +185,7 @@ describe('Applying expected consumption', () => {
     const stubs = withStubs(aContract());
     const service = await aService();
 
-    await service._applyExpectedConsumption('user1', 'petclinic-maxPets', 2);
+    await service._applyExpectedConsumption('user1', 'petclinic-maxPets', 2, 'org1');
 
     expect(stubs.consumed().maxPets.consumed).toBe(2);
   });
@@ -194,7 +194,7 @@ describe('Applying expected consumption', () => {
     const stubs = withStubs(aContract());
     const service = await aService();
 
-    await service._applyExpectedConsumptions('user1', {});
+    await service._applyExpectedConsumptions('user1', {}, 'org1');
 
     expect(stubs.counts()).toEqual({ reads: 0, writes: 0, increments: 0 });
   });
@@ -210,7 +210,7 @@ describe('Applying expected consumption', () => {
       service._applyExpectedConsumptions('user1', {
         'petclinic-maxPets': 1,
         'petclinic-nosuchlimit': 1,
-      })
+      }, 'org1')
     ).rejects.toThrow(/not found in contract/);
 
     expect(stubs.consumed().maxPets.consumed).toBe(0);
@@ -223,7 +223,7 @@ describe('Applying expected consumption', () => {
     const service = await aService();
 
     await expect(
-      service._applyExpectedConsumptions('user1', { 'petclinic-maxPets': 1 })
+      service._applyExpectedConsumptions('user1', { 'petclinic-maxPets': 1 }, 'org1')
     ).rejects.toThrow(/Contract with userId user1 not found/);
   });
 
@@ -234,7 +234,7 @@ describe('Applying expected consumption', () => {
     await service._applyExpectedConsumptions('user1', {
       'petclinic-maxPets': 1,
       'petclinic-maxVisits': 1,
-    });
+    }, 'org1');
 
     const cachedKeys = stubs.cacheService.set.mock.calls.map((call: any[]) => call[0]);
     expect(cachedKeys.some((key: string) => key.includes('maxPets'))).toBe(true);
@@ -251,7 +251,7 @@ describe('Applying expected consumption', () => {
     const stubs = withStubs(contract);
     const service = await aService();
 
-    await service._applyExpectedConsumptions('user1', { 'petclinic-maxPets': 3 });
+    await service._applyExpectedConsumptions('user1', { 'petclinic-maxPets': 3 }, 'org1');
 
     const snapshot = (stubs.cacheService.set.mock.calls as any[][]).find(call =>
       String(call[0]).includes('maxPets')

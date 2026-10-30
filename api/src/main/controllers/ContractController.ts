@@ -13,6 +13,7 @@ import {
   computeContractVersion,
   parseIfMatch,
 } from '../utils/contracts/version';
+import { OrganizationRequiredError } from '../utils/contracts/scope';
 
 /** Add `contractVersion` to a contract response (see `computeContractVersion`). */
 function withVersion<T extends object>(contract: T): T & { contractVersion: string } {
@@ -96,6 +97,29 @@ function expectedVersionOf(req: any): string[] | undefined {
   return header;
 }
 
+/**
+ * Answer the errors of resolving the organization of a request (see
+ * `ContractController._scope`): 400 `ORGANIZATION_ID_REQUIRED` when a platform
+ * ADMIN does not name one, 403 for an `organizationId` parameter that is not the
+ * caller's, 400 for a malformed one. Returns whether it answered.
+ */
+function sendScopeError(res: any, err: any): boolean {
+  if (err instanceof OrganizationRequiredError) {
+    res.status(400).send({ error: err.message, code: err.code });
+    return true;
+  }
+  const message = String(err?.message ?? '');
+  if (message.startsWith('PERMISSION ERROR: organizationId')) {
+    res.status(403).send({ error: message });
+    return true;
+  }
+  if (message.startsWith('INVALID DATA: organizationId')) {
+    res.status(400).send({ error: message });
+    return true;
+  }
+  return false;
+}
+
 class ContractController {
   private readonly contractService: ContractService;
 
@@ -118,15 +142,45 @@ class ContractController {
   }
 
   /**
-   * Organization a request may address contracts in.
+   * The organization named by the `organizationId` query parameter, if any.
+   *
+   * It only selects an organization for a platform ADMIN on the direct routes.
+   * Any other caller already has one (its API key's, or the route's, whose
+   * membership `memberRole` checked): the parameter may repeat it and is
+   * refused otherwise, never used to reach another organization.
+   */
+  _requestedOrganization(req: any): string | undefined {
+    const requested = req.query?.organizationId;
+    if (requested === undefined) return undefined;
+    if (typeof requested !== 'string' || requested.length === 0) {
+      throw new Error('INVALID DATA: organizationId must be one organization id');
+    }
+    const fixed = req.org?.id ?? req.params.organizationId;
+    if (fixed && requested !== fixed) {
+      throw new Error('PERMISSION ERROR: organizationId does not match the organization of this request');
+    }
+    return requested;
+  }
+
+  /**
+   * Organization in which a request addresses contracts by `userId` (the
+   * route's `:userId`) or by `groupId`.
    *
    * Organization API keys are confined to their own organization, and the
-   * organization-scoped routes to the organization in the path (membership is
-   * checked by `memberRole`). Only a platform ADMIN using the direct routes is
-   * not confined, as before.
+   * organization-scoped routes to the organization in the path. A platform
+   * ADMIN on the direct routes has none and must name it with
+   * `?organizationId=` (a `userId` or `groupId` is only unique within an
+   * organization): without it, `OrganizationRequiredError` (400). It runs
+   * before the request reads, locks or writes anything.
    */
-  _scope(req: any): string | undefined {
-    return req.org?.id ?? req.params.organizationId;
+  _scope(req: any, groupId?: string): string {
+    const requested = this._requestedOrganization(req);
+    const fixed = req.org?.id ?? req.params.organizationId;
+    if (fixed) return fixed;
+    if (requested) return requested;
+    throw groupId === undefined
+      ? new OrganizationRequiredError('userId', req.params.userId)
+      : new OrganizationRequiredError('groupId', groupId);
   }
 
   async index(req: any, res: any) {
@@ -134,11 +188,8 @@ class ContractController {
       const queryParams = this._transformIndexQueryParams(req.query);
       const filters = req.body?.filters;
       const merged = filters ? { ...queryParams, filters } : queryParams;
-      let organizationId = req.org?.id ?? req.params.organizationId;
-
-      if (!req.params.organizationId && req.user && req.user.role === 'ADMIN' && !req.org?.id) {
-        organizationId = undefined;
-      }
+      // A platform ADMIN on the direct route lists every organization, or the one named with ?organizationId=.
+      const organizationId = this._requestedOrganization(req) ?? req.org?.id ?? req.params.organizationId;
 
       const [contracts, total] = await Promise.all([
         this.contractService.index(merged, organizationId),
@@ -148,6 +199,7 @@ class ContractController {
       res.set('X-Total-Count', total.toString());
       res.json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('validation of query params')) {
         res.status(400).send({ error: err.message });
       } else {
@@ -162,6 +214,7 @@ class ContractController {
       const contract = await this.contractService.show(userId, this._scope(req));
       sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -183,6 +236,7 @@ class ContractController {
       res.set('ETag', `"${contractVersion}"`);
       res.json({ services, contractVersion });
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -244,6 +298,7 @@ class ContractController {
       });
       sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err instanceof SubscriptionValidationError) {
         sendInvalidSubscription(res, err, true);
       } else if (err instanceof ContractChangedError) {
@@ -269,6 +324,7 @@ class ContractController {
       const preview = await this.contractService.previewNovation(req.params.userId, req.body, this._scope(req), options);
       res.status(200).json(preview);
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (/applying|busy/i.test(err.message)) {
@@ -282,7 +338,6 @@ class ContractController {
   async novateByGroupId(req: any, res: any) {
     try {
       const groupId = req.query.groupId;
-      const organizationId = req.org?.id ?? req.params.organizationId;
       if (!groupId) {
         res.status(400).send({ error: 'Missing groupId query parameter' });
         return;
@@ -305,12 +360,14 @@ class ContractController {
       if (req.body && 'expectedContractVersions' in req.body) delete req.body.expectedContractVersions;
       const options = novationOptionsOf(req);
       const newSubscription: Subscription = req.body;
+      const organizationId = this._scope(req, groupId);
       const contracts = await this.contractService.novateByGroupId(groupId, organizationId, newSubscription, {
         ...options,
         expectedContractVersions,
       });
       res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err instanceof SubscriptionValidationError) {
         sendInvalidSubscription(res, err, true);
       } else if (err instanceof ContractChangedError) {
@@ -339,6 +396,7 @@ class ContractController {
       );
       sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -359,6 +417,7 @@ class ContractController {
       );
       sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('invalid data:')) {
@@ -372,17 +431,18 @@ class ContractController {
   async novateBillingPeriodByGroupId(req: any, res: any) {
     try {
       const groupId = req.query.groupId;
-      const organizationId = req.org?.id ?? req.params.organizationId;
       const billingPeriod = req.body;
 
       if (!groupId) {
         res.status(400).send({ error: 'Missing groupId query parameter' });
         return;
       }
+      const organizationId = this._scope(req, groupId);
 
       const contracts = await this.contractService.novateBillingPeriodByGroupId(groupId, organizationId, billingPeriod);
       res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (
         err.message.toLowerCase().includes('not found') ||
         err.message.toLowerCase().includes('no contracts found')
@@ -409,6 +469,7 @@ class ContractController {
       );
       sendContract(req, res, 200, novatedContract);
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('invalid query:')) {
@@ -421,11 +482,13 @@ class ContractController {
 
   async prune(req: any, res: any) {
     try {
-      const organizationId = req.org?.id ?? req.params.organizationId;
+      // A platform ADMIN on the direct route prunes every organization, or the one named with ?organizationId=.
+      const organizationId = this._requestedOrganization(req) ?? req.org?.id ?? req.params.organizationId;
 
       const result: number = await this.contractService.prune(organizationId, req.user);
       res.status(204).json({ message: `Deleted ${result} contracts successfully` });
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('permission error')) {
@@ -442,6 +505,7 @@ class ContractController {
       await this.contractService.destroy(userId, this._scope(req));
       res.status(204).json({ message: `Deleted contract with userId ${userId} successfully` });
     } catch (err: any) {
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {

@@ -16,6 +16,7 @@ import Contract from '../main/repositories/mongoose/models/ContractMongoose';
 import { SphereLease, SphereRun } from '../main/repositories/mongoose/models/SphereSyncMongoose';
 import { enforceSpherePolicy } from '../main/services/sphere/contractPolicy';
 import { withOrganizationLock } from '../main/services/sphere/lock';
+import { featuresCachePattern } from '../main/utils/contracts/cacheKeys';
 import { pricingYamlFile } from '../main/services/pricingFiles';
 const id = '111111111111111111111111', one = '222222222222222222222222', two = '333333333333333333333333';
 const origin = 'https://sphere.score.us.es';
@@ -99,7 +100,7 @@ describe('SPHERE synchronization with isolated MongoDB', () => {
     expect(current.billingPeriod.startDate).toEqual(new Date('2024-01-01'));
     expect(current.synchronizationHistory).toHaveLength(1);
     expect(await Pricing.countDocuments()).toBe(1);
-    expect(mocks.cache.del).toHaveBeenCalledWith('features.user.*');
+    expect(mocks.cache.del).toHaveBeenCalledWith(featuresCachePattern('org', 'user'));
   });
   it('blocks an impossible fallback before modifying contracts and removes staged copies', async () => {
     const service = await create('all_last'); await contract(); await update(service, yaml('2.0', 'sales', 'Contact sales'));

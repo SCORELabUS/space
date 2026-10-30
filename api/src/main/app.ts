@@ -13,6 +13,7 @@ import { seedDatabase } from './database/seeders/mongo/seeder';
 import loadGlobalMiddlewares from './middlewares/GlobalMiddlewaresLoader';
 import routes from './routes/index';
 import { seedDefaultAdmin } from './database/seeders/common/userSeeder';
+import { runContractUserIdMigration } from './database/migrations/contractUserIdPerOrganization';
 import { movePricingFilesOutOfPublic } from './database/migrations/movePricingFilesOutOfPublic';
 
 const green = '\x1b[32m';
@@ -123,6 +124,8 @@ const initializeDatabase = async (seedDatabaseFlag: boolean = true) => {
     switch (process.env.DATABASE_TECHNOLOGY ?? 'mongoDB') {
       case 'mongoDB':
         connection = await initMongoose();
+        // Idempotent; see the migration for what it changes.
+        await runContractUserIdMigration();
         if (['development'].includes(process.env.ENVIRONMENT ?? '')) {
           if (seedDatabaseFlag && process.env.SEED_ON_STARTUP === 'true') {
             await seedDatabase();

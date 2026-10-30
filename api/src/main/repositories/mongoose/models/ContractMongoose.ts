@@ -52,8 +52,11 @@ const contractSchema = new Schema(
   }
 );
 
-// Adding unique index for [name, owner, version]
-contractSchema.index({ 'userContact.userId': 1 }, { unique: true });
+// A userId is chosen by each host application: unique within an organization,
+// not across the server. Existing databases still have the former global
+// index { 'userContact.userId': 1 }; it is replaced at startup by
+// database/migrations/contractUserIdPerOrganization.ts.
+contractSchema.index({ organizationId: 1, 'userContact.userId': 1 }, { unique: true });
 
 // Binding changes and synchronization share a renewable organization lease.
 for (const operation of ['save', 'updateOne', 'updateMany', 'findOneAndUpdate', 'deleteOne', 'deleteMany', 'findOneAndDelete'] as const) {

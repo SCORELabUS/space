@@ -16,6 +16,7 @@ import { migrateSubscription, migrateUsage } from './migration';
 import { isSphereSnapshotYamlPath, pricingYamlFile, removePricingYaml, sphereSnapshotYamlPath } from '../pricingFiles';
 import { withOrganizationLock } from './lock';
 import { SphereVersionNotListedError } from './errors';
+import { contractCacheKeys } from '../../utils/contracts/cacheKeys';
 
 export default class SphereSyncService {
   private client = new SphereClient();
@@ -268,8 +269,7 @@ export default class SphereSyncService {
           'sphere.lastSyncedAt': new Date(), 'sphere.nextCheckAt': this.nextCheck(id, service.sphere.pollIntervalMinutes ?? 5),
           'sphere.migrated': counts.migrated, 'sphere.replaced': counts.replaced } });
         for (const changed of await this.repository.contracts({ 'synchronizationHistory.runId': String(run._id) })) {
-          await container.resolve('cacheService').del(`contracts.${changed.userContact!.userId}`);
-          await container.resolve('cacheService').del(`features.${changed.userContact!.userId}.*`);
+          for (const key of contractCacheKeys(changed)) await container.resolve('cacheService').del(key);
         }
         await this.repository.updateRun({ _id: run._id }, { $set: { status: 'ready', finishedAt: new Date(), ...counts } });
         await this.invalidate(service);
@@ -375,8 +375,7 @@ export default class SphereSyncService {
         [usagePath]: contract.usageLevels?.[service.name] ?? { $exists: false } }, update);
       if (result.modifiedCount) {
         await this.repository.updateRun({ _id: run._id }, { $inc: { migrated: 1, replaced: migrated.replaced ? 1 : 0 } });
-        await container.resolve('cacheService').del(`contracts.${contract.userContact.userId}`);
-        await container.resolve('cacheService').del(`features.${contract.userContact.userId}.*`);
+        for (const key of contractCacheKeys(contract)) await container.resolve('cacheService').del(key);
         await this.emitNovated(contract._id);
         return;
       }
@@ -411,8 +410,7 @@ export default class SphereSyncService {
           fromVersion: resetEscapeVersion(contract.contractedServices[service.name]), reason: 'service_removed', at: new Date() } } };
       if (Object.keys(contract.contractedServices).length === 1) update.$set = { 'billingPeriod.endDate': new Date(), 'billingPeriod.autoRenew': false };
       const removed = await this.repository.updateContract({ _id: contract._id, contractedServices: contract.contractedServices }, update);
-      await container.resolve('cacheService').del(`contracts.${contract.userContact.userId}`);
-      await container.resolve('cacheService').del(`features.${contract.userContact.userId}.*`);
+      for (const key of contractCacheKeys(contract)) await container.resolve('cacheService').del(key);
       if (removed?.modifiedCount) await this.emitNovated(contract._id);
     }
     await assertOwned();
