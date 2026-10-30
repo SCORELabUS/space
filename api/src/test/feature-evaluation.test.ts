@@ -620,6 +620,7 @@ describe('Features API Test Suite', function () {
         },
         eval: true,
         error: null,
+        consumptionId: expect.any(String),
       });
 
       const contractAfter = (
@@ -698,6 +699,7 @@ describe('Features API Test Suite', function () {
         },
         eval: true,
         error: null,
+        consumptionId: expect.any(String),
       });
 
       const contractAfter = (
@@ -766,6 +768,7 @@ describe('Features API Test Suite', function () {
         },
         eval: true,
         error: null,
+        consumptionId: expect.any(String),
       });
 
       const contractAfter = (

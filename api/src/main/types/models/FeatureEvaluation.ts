@@ -43,6 +43,25 @@ export interface FeatureEvaluationResult {
     code: string;
     message: string;
   } | null;
+  /**
+   * Id of the consumption this evaluation applied (single-feature evaluation
+   * with an expected consumption that was applied), for reverting it with
+   * `?revert=true&consumptionId=`. Absent otherwise.
+   */
+  consumptionId?: string;
 }
 
-export type SingleFeatureEvalQueryParams = Omit<FeatureEvalQueryParams, "details"> & {revert?: boolean, latest?: boolean};
+/**
+ * A revert that skipped usage levels which their service no longer has (for
+ * example, after its pricing version was archived with a fallback without that
+ * limit): the levels it gave back, with the
+ * amounts recorded, and those it skipped, both as usage limit ids
+ * (`<service>-<limit>`, as in the expected consumption).
+ */
+export interface ConsumptionRevertResult {
+  consumptionId: string;
+  reverted: Record<string, number>;
+  skipped: string[];
+}
+
+export type SingleFeatureEvalQueryParams = Omit<FeatureEvalQueryParams, "details"> & {revert?: boolean, latest?: boolean, consumptionId?: string};

@@ -14,10 +14,12 @@ import { SPACE_CAPABILITIES } from '../main/utils/capabilities';
 const EXPECTED = [
   'contract-org-scope',
   'contract-version',
+  'atomic-usage-limits',
   'keep-billing-period',
   'reject-private',
   'pricing-yaml',
   'new-contracts-version',
+  'idempotency-key',
   'contract-pricings',
   'novation-preview',
   'token-subscription',
@@ -25,6 +27,7 @@ const EXPECTED = [
   'contract-event-ids',
   'sphere-private',
   'contract-userid-per-org',
+  'service-disable-dormant',
 ];
 
 const tokens = (response: request.Response) =>

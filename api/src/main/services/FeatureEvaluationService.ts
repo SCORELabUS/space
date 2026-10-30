@@ -1,8 +1,12 @@
+import { executeIdempotentAction, consumptionEvaluation } from './idempotentActions';
+import { currentIdempotencyExecution } from './idempotencyExecution';
 import { isAfter } from 'date-fns';
+import { decodeJwt } from 'jose';
 import container from '../config/container';
 import ServiceRepository from '../repositories/mongoose/ServiceRepository';
 import { LeanContract } from '../types/models/Contract';
 import {
+  ConsumptionRevertResult,
   DetailedFeatureEvaluation,
   FeatureEvalQueryParams,
   FeatureEvaluationResult,
@@ -23,16 +27,18 @@ import {
   mapSubscriptionsToConfigurationsByService,
 } from '../utils/feature-evaluation/evaluationContextsManagement';
 import {
+  ConsumptionRetryError,
   evaluateAllFeatures,
   evaluateFeature,
 } from '../utils/feature-evaluation/featureEvaluation';
 import ContractService from './ContractService';
-import ServiceService from './ServiceService';
+import ServiceService, { DormantReason, dormantServiceMessage } from './ServiceService';
 import { PricingTokenSubscription, generateTokenFromEvalResult } from '../utils/jwt';
 import { computeContractVersion } from '../utils/contracts/version';
 import { escapeVersion } from '../utils/helpers';
 import CacheService from './CacheService';
 import { contractCacheKey, featuresCacheKey } from '../utils/contracts/cacheKeys';
+import { withoutServices } from '../utils/contracts/helpers';
 
 class FeatureEvaluationService {
   private readonly serviceService: ServiceService;
@@ -92,11 +98,12 @@ class FeatureEvaluationService {
         subscriptionContext: SubscriptionContext;
         result: SimpleFeatureEvaluation | DetailedFeatureEvaluation;
         contract: LeanContract;
+        dormantServices: Record<string, DormantReason>;
       }
   > {
 
     // Step 1: Retrieve contexts
-    const { subscriptionContext, pricingContext, evaluationContext, contract } =
+    const { subscriptionContext, pricingContext, evaluationContext, contract, dormantServices } =
       await this._retrieveContextsByUserId(userId, options.server, reqOrg);
 
     // Step 2: Perform the evaluation
@@ -116,6 +123,7 @@ class FeatureEvaluationService {
           subscriptionContext,
           result: evaluationResults,
           contract,
+          dormantServices,
         }
       : evaluationResults;
   }
@@ -129,7 +137,21 @@ class FeatureEvaluationService {
     const cachedToken = await this.cacheService.get(tokenKey);
 
     if (cachedToken) {
-      return cachedToken;
+      // An evaluation started before a pause/resume may finish after its cache
+      // invalidation. Recheck availability before reusing that late token.
+      const dormant = Object.keys(await this.serviceService.dormantServices(
+        Object.keys(contract.contractedServices ?? {}), contract.organizationId
+      )).sort();
+      try {
+        const claim = decodeJwt(cachedToken).dormantServices;
+        const cachedDormant = claim === undefined ? [] : claim;
+        if (Array.isArray(cachedDormant) && cachedDormant.every(service => typeof service === 'string') &&
+            JSON.stringify([...cachedDormant].sort()) === JSON.stringify(dormant)) {
+          return cachedToken;
+        }
+      } catch {
+        // Invalid cached payloads are regenerated rather than served.
+      }
     }
 
     const result = (await this.eval(userId, reqOrg, {
@@ -141,6 +163,7 @@ class FeatureEvaluationService {
       subscriptionContext: SubscriptionContext;
       result: DetailedFeatureEvaluation;
       contract: LeanContract;
+      dormantServices: Record<string, DormantReason>;
     };
 
     // The contract the contexts were built from (after a renewal, if any), so
@@ -154,13 +177,17 @@ class FeatureEvaluationService {
       contractVersion: computeContractVersion(evaluated),
     };
 
+    // Services of the contract whose features are left out (see `_retrieveContextsByUserId`).
+    const dormant = Object.keys(result.dormantServices);
+
     const token = await generateTokenFromEvalResult(
       contract.userContact.userId,
       result.pricingContext,
       result.subscriptionContext,
       result.result,
       subscription,
-      evaluated.organizationId
+      evaluated.organizationId,
+      dormant
     );
 
     await this.cacheService.set(tokenKey, token, 3600, true);
@@ -174,56 +201,88 @@ class FeatureEvaluationService {
     expectedConsumption: Record<string, number>,
     reqOrg: any,
     options: SingleFeatureEvalQueryParams
-  ): Promise<boolean | FeatureEvaluationResult> {
+  ): Promise<boolean | FeatureEvaluationResult | ConsumptionRevertResult> {
+    const prepared = currentIdempotencyExecution()?.record.plan;
+    if (prepared && ['consume', 'revert'].includes(prepared.kind)) {
+      const result = await executeIdempotentAction(prepared);
+      if (prepared.kind !== 'consume' || result.status !== 'changed') return prepared.kind === 'consume' ? consumptionEvaluation(prepared, result) : result ?? true;
+    }
     // Resolve the contract within the caller's organization before anything
     // cached under this userId is returned.
     const { organizationId } = await this.contractService.show(userId, reqOrg.id);
     const evaluationKey = featuresCacheKey(organizationId, userId, `eval.${featureId}`);
 
-    const evaluation = await this.cacheService.get(evaluationKey);
-
-    if (evaluation && !options.revert && !expectedConsumption) {
-      return evaluation as FeatureEvaluationResult;
-    }
-
     await this.cacheService.del(featuresCacheKey(organizationId, userId, 'pricingToken'));
 
-    // Step 1: Retrieve contexts
-    const { subscriptionContext, pricingContext, evaluationContext } =
-      await this._retrieveContextsByUserId(userId, options.server, reqOrg);
-
     if (options.revert) {
-      await this.contractService._revertExpectedConsumption(
-        userId,
-        featureId,
-        options.latest,
-        reqOrg.id
-      );
-      return true;
-    } else {
-      // Step 2: Perform the evaluation
-      const evaluationResults = await evaluateFeature(
-        featureId,
-        pricingContext,
-        subscriptionContext,
-        evaluationContext,
-        {
-          simple: false,
-          expectedConsumption: expectedConsumption,
-          userId: userId,
-          organizationId: reqOrg.id,
-        }
-      );
-      if (!(evaluationResults as FeatureEvaluationResult).limit) {
-        await this.cacheService.set(
-          evaluationKey,
-          evaluationResults,
-          3600,
-          true
-        );
+      // As before: the contract is checked (expired, renewals) before reverting.
+      // A revert on a dormant service is refused by `revertConsumption` and
+      // `_revertExpectedConsumption`, before the consumption is claimed.
+      // A revert that skipped usage levels (gone from their service) says so.
+      await this._retrieveContextsByUserId(userId, options.server, reqOrg);
+      const reverted = options.consumptionId
+        ? await this.contractService.revertConsumption(userId, featureId, options.consumptionId, reqOrg.id)
+        : // Deprecated: the oldest (or latest) recent consumption of the feature.
+          await this.contractService._revertExpectedConsumption(userId, featureId, options.latest, reqOrg.id);
+      return reverted ?? true;
+    }
+
+    // A consumption is only written to the subscription it was evaluated
+    // against. When that changed in between (a novation, a renewal), evaluate
+    // again on the stored contract; this is rare, so a few attempts suffice.
+    for (let attempt = 1; ; attempt++) {
+      // Step 1: Retrieve contexts
+      const { subscriptionContext, pricingContext, evaluationContext, contract, dormantServices } =
+        await this._retrieveContextsByUserId(userId, options.server, reqOrg);
+
+      // A feature of a dormant service is not available, and nothing is
+      // consumed: no usage level is incremented and no consumption recorded.
+      const dormant =
+        pricingContext.features[featureId] === undefined
+          ? Object.entries(dormantServices).find(([service]) => featureId.toLowerCase().startsWith(`${service}-`))
+          : undefined;
+      if (dormant) {
+        const [service, reason] = dormant;
+        return { eval: false, limit: null, used: null, error: { code: reason, message: dormantServiceMessage(service, reason) } };
       }
-      // Step 3: Return appropriate response based on options
-      return evaluationResults as FeatureEvaluationResult;
+
+      // Cache invalidation can race an in-flight evaluation. Availability is
+      // authoritative even when an older result was written back afterwards.
+      const evaluation = await this.cacheService.get(evaluationKey);
+      if (evaluation && !expectedConsumption) {
+        return evaluation as FeatureEvaluationResult;
+      }
+
+      try {
+        // Step 2: Perform the evaluation
+        const evaluationResults = await evaluateFeature(
+          featureId,
+          pricingContext,
+          subscriptionContext,
+          evaluationContext,
+          {
+            simple: false,
+            expectedConsumption: expectedConsumption,
+            userId: userId,
+            organizationId: reqOrg.id,
+            contract,
+          }
+        );
+        if (!(evaluationResults as FeatureEvaluationResult).limit) {
+          await this.cacheService.set(
+            evaluationKey,
+            evaluationResults,
+            3600,
+            true
+          );
+        }
+        // Step 3: Return appropriate response based on options
+        return evaluationResults as FeatureEvaluationResult;
+      } catch (error) {
+        if (!(error instanceof ConsumptionRetryError) || attempt >= 3) throw error;
+        // The cached contract may be the stale one.
+        await this.cacheService.del(contractCacheKey(organizationId, userId));
+      }
     }
   }
 
@@ -347,8 +406,8 @@ class FeatureEvaluationService {
       pricingsToReturn[serviceName] = {};
 
       // Step 2: Given the show parameter, discover all pricings that must be identified by id, and do the same for url
-      let pricingsWithIdToCheck: string[] = [];
-      let pricingsWithUrlToCheck: string[] = [];
+      const pricingsWithIdToCheck: string[] = [];
+      const pricingsWithUrlToCheck: string[] = [];
 
       if (show === 'active' || show === 'all') {
         for (const [version, pricing] of service.activePricings) {
@@ -433,6 +492,8 @@ class FeatureEvaluationService {
     evaluationContext: Record<string, string>;
     /** The contract the contexts were built from. */
     contract: LeanContract;
+    /** Services of the contract that are dormant (lowercased), left out of the contexts. */
+    dormantServices: Record<string, DormantReason>;
   }> {
     // Step 1.1: Retrieve the user contract, within the caller's organization
     let contract: LeanContract = await this.contractService.show(userId, reqOrg.id);
@@ -448,10 +509,20 @@ class FeatureEvaluationService {
       contract = await this.contractService.renew(userId, reqOrg.id);
     }
 
-    // Step 1.3: Reset all expired renewable usage levels
+    // Step 1.3: Services of the contract that are disabled (or gone) are
+    // dormant: their features are left out and their usage levels are kept as
+    // they are, so that everything is there again when the service is enabled.
+    // The rest of the contract is evaluated normally.
+    const dormantServices = await this.serviceService.dormantServices(
+      Object.keys(contract.contractedServices ?? {}),
+      contract.organizationId
+    );
+
+    // Step 1.4: Reset all expired renewable usage levels (of services that are not dormant)
     const usageLevelsToRenew = [];
 
     for (const serviceName in contract.usageLevels) {
+      if (dormantServices[serviceName.toLowerCase()]) continue;
       const usageLevels = contract.usageLevels[serviceName];
       for (const level in usageLevels) {
         const usageLevel = usageLevels[level];
@@ -470,19 +541,21 @@ class FeatureEvaluationService {
       );
     }
 
-    // Step 1.4: Build the subscription context
+    const live = withoutServices(contract, Object.keys(dormantServices));
+
+    // Step 1.5: Build the subscription context
     const subscriptionContext: SubscriptionContext = flattenUsageLevelsIntoSubscriptionContext(
-      contract.usageLevels
+      live.usageLevels
     );
 
     // Step 2.1: Retrieve all pricings to which the user is subscribed
-    const userPricings = await this._getPricingsByContract(contract, reqOrg);
+    const userPricings = await this._getPricingsByContract(live, reqOrg);
 
     // Step 2.2: Get User Subscriptions
     const userSubscriptionByService: Record<
       string,
       { plan?: string; addOns?: Record<string, number> }
-    > = getUserSubscriptionsFromContract(contract);
+    > = getUserSubscriptionsFromContract(live);
 
     // Step 2.3: Build user configurations by service using the information of subscriptions and pricings
     const userConfigurationsByService: Record<string, PricingContext> =
@@ -503,7 +576,7 @@ class FeatureEvaluationService {
     const evaluationContext: Record<string, string> =
       flattenFeatureEvaluationsIntoEvaluationContext(evaluationExpressionsByService);
 
-    return { subscriptionContext, pricingContext, evaluationContext, contract };
+    return { subscriptionContext, pricingContext, evaluationContext, contract, dormantServices };
   }
 }
 

@@ -1,5 +1,5 @@
 import SphereFields from './services/SphereFields';
-import { createSphereService, sphereError } from '@/api/services/sphereApi';
+import { createSphereService, sphereAccessRequired, sphereError } from '@/api/services/sphereApi';
 import type { SphereConfig, SyntaxUpgrade } from '@/api/services/sphereApi';
 import { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -20,6 +20,7 @@ export default function AddServiceModal({ open, onClose }: AddServiceModalProps)
   const [source, setSource] = useState<'file' | 'url' | 'sphere'>('file');
   const [sphere, setSphere] = useState<SphereConfig>({ permanentUrl: '', policy: 'new_last', pollIntervalMinutes: 5 });
   const [validated, setValidated] = useState(false);
+  const [accessRevision, setAccessRevision] = useState(0);
   const [syntaxUpgrade, setSyntaxUpgrade] = useState<SyntaxUpgrade>();
   const [busy, setBusy] = useState(false);
   const dialog = useRef<HTMLDivElement>(null);
@@ -35,14 +36,16 @@ export default function AddServiceModal({ open, onClose }: AddServiceModalProps)
 
   const { user } = useAuth();
   const { currentOrganization } = useOrganization();
-
-
+  useEffect(() => {
+    setSphere({ permanentUrl: '', policy: 'new_last', pollIntervalMinutes: 5 });
+    setValidated(false); setSyntaxUpgrade(undefined); setError('');
+  }, [open, currentOrganization?.id]);
 
   const handleUpload = async () => {
     if (!currentOrganization) { setError('Please select an organization first.'); return; }
     if (busy) return;
     if (source === 'sphere' && (!validated || (sphere.policy.endsWith('_pick') && !sphere.selectedVersionId))) {
-      setError('Check the SPHERE pricing and select a public version.'); return;
+      setError('Validate access to the SPHERE pricing and select a version.'); return;
     }
     if (source === 'sphere' && syntaxUpgrade && sphere.acceptedSyntaxUpgradeVersionId !== syntaxUpgrade.versionId) {
       setError('Confirm the Pricing2Yaml update before linking this service.'); return;
@@ -57,7 +60,12 @@ export default function AddServiceModal({ open, onClose }: AddServiceModalProps)
       const service = source === 'sphere' ? await createSphereService(user.apiKey, currentOrganization.id, sphere)
         : await createService(user.apiKey, currentOrganization.id, source === 'file' ? file! : url);
       setFile(null); setUrl(''); setValidated(false); setSyntaxUpgrade(undefined); setSphere({ permanentUrl: '', policy: 'new_last', pollIntervalMinutes: 5 }); onClose(service);
-    } catch (error) { setError(sphereError(error)); } finally { setBusy(false); }
+    } catch (error) {
+      if (source === 'sphere' && sphereAccessRequired(error)) {
+        setValidated(false); setSyntaxUpgrade(undefined); setAccessRevision(revision => revision + 1);
+      }
+      setError(sphereError(error));
+    } finally { setBusy(false); }
   };
 
   return (
@@ -78,13 +86,13 @@ export default function AddServiceModal({ open, onClose }: AddServiceModalProps)
             onKeyDown={event => {
               if (event.key === 'Escape' && !busy) onClose(undefined);
               if (event.key === 'Tab') {
-                const controls = [...(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input, select, a[href]') ?? [])];
+                const controls = [...(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), a[href]') ?? [])];
                 const first = controls[0], last = controls[controls.length - 1];
                 if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog.current)) { event.preventDefault(); last?.focus(); }
                 else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
               }
             }}
-            className="h-[90vh] max-h-[90vh] overflow-hidden bg-white dark:bg-gray-900 rounded-2xl shadow-2xl p-6 sm:p-8 max-w-lg w-[calc(100%-2rem)] flex flex-col items-center border border-indigo-100 dark:border-gray-800"
+            className="max-h-[90vh] overflow-hidden bg-white dark:bg-gray-900 rounded-2xl shadow-2xl p-5 sm:p-8 max-w-xl w-[calc(100%-2rem)] flex flex-col items-center border border-indigo-100 dark:border-gray-800"
           >
             <div className="min-h-0 flex-1 w-full overflow-y-auto pr-1">
               <h2 id="add-service-title" className="text-xl font-bold text-indigo-700 dark:text-gray-100 mb-2 text-center">Add New Service</h2>
@@ -92,11 +100,11 @@ export default function AddServiceModal({ open, onClose }: AddServiceModalProps)
                 Add a pricing file, a YAML URL, or a live link to SPHERE.
               </p>
               <label className="w-full mb-4 text-gray-700 dark:text-gray-200">Pricing source
-                <CustomSelect className="mt-1 min-h-11 w-full rounded-lg border border-indigo-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-2 text-gray-800 dark:text-gray-100 shadow-sm hover:border-indigo-400 dark:hover:border-indigo-500" value={source} onChange={e => { setSource(e.target.value as typeof source); setError(''); setValidated(false); setSyntaxUpgrade(undefined); }}>
+                <CustomSelect disabled={busy} className="mt-1 min-h-11 w-full rounded-lg border border-indigo-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-2 text-gray-800 dark:text-gray-100 shadow-sm hover:border-indigo-400 dark:hover:border-indigo-500" value={source} onChange={e => { setSource(e.target.value as typeof source); setSphere({ permanentUrl: '', policy: 'new_last', pollIntervalMinutes: 5 }); setError(''); setValidated(false); setSyntaxUpgrade(undefined); }}>
                   <option value="file">Upload YAML file</option><option value="url">YAML URL</option><option value="sphere">Link to SPHERE</option>
                 </CustomSelect>
               </label>
-              {source === 'sphere' ? <><SphereFields value={sphere} onChange={setSphere} apiKey={user.apiKey} organizationId={currentOrganization?.id ?? ''} onValidated={setValidated} onSyntaxUpgrade={setSyntaxUpgrade} />
+              {source === 'sphere' ? <><SphereFields key={`${currentOrganization?.id}:${accessRevision}`} value={sphere} onChange={setSphere} apiKey={user.apiKey} organizationId={currentOrganization?.id ?? ''} onValidated={setValidated} onSyntaxUpgrade={setSyntaxUpgrade} disabled={busy} />
                 {syntaxUpgrade && <section role="alert" className="w-full rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
                   <p className="font-semibold">Pricing2Yaml update required</p>
                   <p className="mt-1">The selected pricing uses syntax {syntaxUpgrade.from}. SPACE will update it to {syntaxUpgrade.to} before linking it. Review the resulting pricing after creation.</p>
@@ -118,9 +126,9 @@ export default function AddServiceModal({ open, onClose }: AddServiceModalProps)
                 : <label className="w-full text-gray-700 dark:text-gray-200">YAML URL<input type="url" className="mt-1 min-h-11 w-full rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 p-2" value={url} onChange={e => setUrl(e.target.value)} /></label>}
               {error && <p role="alert" className="mt-3 text-sm text-red-700 dark:text-red-300">{error}</p>}
             </div>
-            <div className="flex-shrink-0 z-10 bg-white dark:bg-gray-900 flex gap-3 mt-4 pt-4 border-t border-gray-200 dark:border-gray-800 w-full">
+            <div className="flex-shrink-0 z-10 bg-white dark:bg-gray-900 flex justify-end gap-3 mt-5 pt-4 border-t border-gray-200 dark:border-gray-800 w-full">
               <button
-                className="cursor-pointer flex-1 px-4 py-2 rounded bg-gray-200 dark:bg-gray-800 text-gray-700 dark:text-gray-200 font-semibold hover:bg-gray-300 dark:hover:bg-gray-700 transition"
+                type="button" className="cursor-pointer min-h-11 rounded-xl px-5 py-2.5 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-200 font-semibold hover:bg-gray-200 dark:hover:bg-gray-700 transition focus-visible:outline-2 focus-visible:outline-indigo-500"
                 disabled={busy} onClick={() => {
                   onClose(undefined);
                 }}
@@ -128,8 +136,8 @@ export default function AddServiceModal({ open, onClose }: AddServiceModalProps)
                 Cancel
               </button>
               <button
-                className="cursor-pointer flex-1 px-4 py-2 rounded bg-indigo-600 text-white font-semibold hover:bg-indigo-700 dark:hover:bg-indigo-800 transition"
-                disabled={busy} onClick={handleUpload}
+                type="button" className="cursor-pointer min-h-11 rounded-xl px-5 py-2.5 bg-indigo-600 text-white font-semibold hover:bg-indigo-700 dark:hover:bg-indigo-800 transition focus-visible:outline-2 focus-visible:outline-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={busy || (source === 'sphere' && (!validated || Boolean(syntaxUpgrade && sphere.acceptedSyntaxUpgradeVersionId !== syntaxUpgrade.versionId)))} onClick={handleUpload}
               >
                 {busy ? 'Adding…' : source === 'sphere' ? 'Link service' : 'Add service'}
               </button>

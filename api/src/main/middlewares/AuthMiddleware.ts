@@ -297,4 +297,85 @@ const hasPermission = (requiredRoles: (OrganizationApiKeyRole | OrganizationUser
   };
 };
 
-export { authenticateApiKeyMiddleware, memberRole, hasPermission, rejectionOrOutage, InvalidApiKeyError };
+/**
+ * Organization roles that may move a service out of an organization (for it, a
+ * move is like deleting the service, which needs OWNER or ADMIN) and into one
+ * (the roles that may create services there).
+ */
+const SERVICE_MOVE_SOURCE_ROLES: OrganizationUserRole[] = ['OWNER', 'ADMIN'];
+const SERVICE_MOVE_TARGET_ROLES: OrganizationUserRole[] = ['OWNER', 'ADMIN', 'MANAGER'];
+
+const SERVICE_MOVE_FORBIDDEN =
+  'Forbidden: moving a service to another organization requires the OWNER or ADMIN role in its organization and ' +
+  'the OWNER, ADMIN or MANAGER role in the target organization';
+
+const SERVICE_MOVE_ORGANIZATION_KEY =
+  'Forbidden: an organization API key cannot move services to another organization. Moving a service requires a ' +
+  'user API key with the OWNER or ADMIN role in its organization and the OWNER, ADMIN or MANAGER role in the target ' +
+  'organization (PUT /organizations/{organizationId}/services/{serviceName})';
+
+/**
+ * Authorize moving a service to another organization (`organizationId` in the
+ * body of `PUT .../services/{serviceName}`), before anything is read or
+ * written for the move. A move takes the service and its contracts out of one
+ * organization (like deleting it there, which needs OWNER or ADMIN) and into
+ * another (where the caller must be allowed to create services), so:
+ * - organization API keys are refused: a key is a credential of one
+ *   organization only;
+ * - users need OWNER or ADMIN in the source organization (the route already
+ *   checked membership) and OWNER, ADMIN or MANAGER in the target organization;
+ * - platform ADMIN users may move any service.
+ * A target organization that does not exist gets the same 403 as one the
+ * caller has no rights in, so the answer does not tell which organization ids
+ * exist. Requests that do not change the organization pass through.
+ */
+const authorizeServiceMove = async (req: Request, res: Response, next: NextFunction) => {
+  const target = req.body?.organizationId;
+  const source = req.org ? req.org.id : req.params.organizationId;
+
+  if (target === undefined || target === null || String(target) === String(source)) {
+    return next();
+  }
+
+  if (req.authType !== 'user' || !req.user) {
+    return res.status(403).json({ error: SERVICE_MOVE_ORGANIZATION_KEY });
+  }
+
+  if (req.user.role === 'ADMIN') {
+    return next();
+  }
+
+  if (!SERVICE_MOVE_SOURCE_ROLES.includes(req.user.orgRole as OrganizationUserRole)) {
+    return res.status(403).json({ error: SERVICE_MOVE_FORBIDDEN });
+  }
+
+  let targetRole: OrganizationUserRole | undefined;
+  try {
+    const organization: LeanOrganization | null = await container
+      .resolve('organizationService')
+      .findById(String(target));
+    if (organization) {
+      targetRole =
+        organization.owner === req.user.username
+          ? 'OWNER'
+          : (organization.members.find((m: OrganizationMember) => m.username === req.user!.username)?.role as
+              | OrganizationUserRole
+              | undefined);
+    }
+  } catch (error: any) {
+    // An id that is not an ObjectId names no organization; anything else is
+    // the database failing to answer, not a refusal.
+    if (error?.name !== 'CastError') {
+      res.setHeader('Retry-After', '5');
+      return res.status(503).json({ error: 'Space cannot verify the target organization right now.' });
+    }
+  }
+
+  if (!targetRole || !SERVICE_MOVE_TARGET_ROLES.includes(targetRole)) {
+    return res.status(403).json({ error: SERVICE_MOVE_FORBIDDEN });
+  }
+
+  next();
+};
+
+export { authenticateApiKeyMiddleware, memberRole, hasPermission, authorizeServiceMove, rejectionOrOutage, InvalidApiKeyError };
