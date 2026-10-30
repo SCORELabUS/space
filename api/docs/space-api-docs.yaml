@@ -87,6 +87,8 @@ info:
 
     - `contract-org-scope`: `userId` lookups are confined to the caller's organization (see above).
     - `contract-version`: contracts carry `contractVersion` and an `ETag`; novations accept `If-Match` / `expectedContractVersion` and answer `412 CONTRACT_CHANGED`.
+    - `keep-billing-period`: `keepBillingPeriod` on novations, and subscriptions validated strictly against the pricing (`400` with `errors`; archived versions rejected for new contracts and version changes).
+    - `reject-private`: the opt-in `rejectPrivate` option (query or body) of contract creation and novations, which rejects private plans and add-ons.
 
   contact:
     email: agarcia29@us.es
@@ -2924,6 +2926,7 @@ paths:
           required: true
           schema:
             type: string
+        - $ref: '#/components/parameters/RejectPrivate'
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCreation'
       responses:
@@ -2938,6 +2941,8 @@ paths:
                 $ref: '#/components/schemas/Contract'
         '403':
           description: Forbidden
+        '400':
+          $ref: '#/components/responses/InvalidSubscription'
 
     put:
       summary: Update contracts by group ID
@@ -2958,6 +2963,8 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
         - name: userId
           in: path
           required: true
@@ -2982,7 +2989,16 @@ paths:
         '412':
           $ref: '#/components/responses/ContractChanged'
         '400':
-          description: Missing groupId, or an `If-Match` header or `expectedContractVersion` field (use `expectedContractVersions` for groups)
+          description: |
+            Missing groupId; an `If-Match` header or an `expectedContractVersion` field (use
+            `expectedContractVersions` for groups); or an invalid subscription (body `InvalidSubscription`,
+            with `errors[].code`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidSubscription'
+        '404':
+          description: Contract (or group) not found, or every subscription problem is a missing plan, add-on or version (`InvalidSubscription`)
 
     delete:
       summary: Delete all contracts in organization
@@ -3067,6 +3083,8 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
         - $ref: '#/components/parameters/IfMatchContractVersion'
         - name: organizationId
           in: path
@@ -3097,7 +3115,13 @@ paths:
         '412':
           $ref: '#/components/responses/ContractChanged'
         '400':
-          description: Invalid subscription, or `If-Match` and `expectedContractVersion` differ
+          description: |
+            Invalid subscription (body `InvalidSubscription`, with `errors[].code`), or a malformed precondition
+            (see `If-Match` / `expectedContractVersion(s)`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidSubscription'
 
     delete:
       summary: Delete contract
@@ -3325,6 +3349,8 @@ paths:
         - Contracts
       security:
         - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RejectPrivate'
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCreation'
       responses:
@@ -3337,6 +3363,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Contract'
+        '400':
+          $ref: '#/components/responses/InvalidSubscription'
     
     put:
       summary: Update contracts by group ID
@@ -3357,6 +3385,8 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
         - name: groupId
           in: query
           required: true
@@ -3376,7 +3406,16 @@ paths:
         '412':
           $ref: '#/components/responses/ContractChanged'
         '400':
-          description: Missing groupId, or an `If-Match` header or `expectedContractVersion` field (use `expectedContractVersions` for groups)
+          description: |
+            Missing groupId; an `If-Match` header or an `expectedContractVersion` field (use
+            `expectedContractVersions` for groups); or an invalid subscription (body `InvalidSubscription`,
+            with `errors[].code`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidSubscription'
+        '404':
+          description: Contract (or group) not found, or every subscription problem is a missing plan, add-on or version (`InvalidSubscription`)
 
     delete:
       summary: Delete all contracts
@@ -3493,6 +3532,8 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/KeepBillingPeriod'
+        - $ref: '#/components/parameters/RejectPrivate'
         - $ref: '#/components/parameters/IfMatchContractVersion'
         - name: userId
           in: path
@@ -3516,7 +3557,13 @@ paths:
         '412':
           $ref: '#/components/responses/ContractChanged'
         '400':
-          description: Invalid subscription, or `If-Match` and `expectedContractVersion` differ
+          description: |
+            Invalid subscription (body `InvalidSubscription`, with `errors[].code`), or a malformed precondition
+            (see `If-Match` / `expectedContractVersion(s)`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvalidSubscription'
 
     delete:
       summary: Delete contract
@@ -4513,6 +4560,72 @@ components:
         `ETag: "<contractVersion>"`, which CORS exposes to browser clients.
       example: 3-9f86d081884c7d65
 
+    SubscriptionErrorCode:
+      type: string
+      description: |
+        Stable code of a subscription validation problem:
+        - `PLAN_NOT_FOUND`: the plan does not exist in the pricing version. Also reported, with the path
+          `subscriptionPlans.<service>`, when the service has neither a plan nor add-ons selected.
+        - `ADDON_NOT_FOUND`: the add-on does not exist in the pricing version (names are case-sensitive).
+        - `ADDON_NOT_AVAILABLE`: the add-on is not available for the selected plan.
+        - `ADDON_DEPENDENCY_MISSING`: an add-on it depends on is not selected.
+        - `ADDON_EXCLUDED`: it cannot be combined with another selected add-on.
+        - `QUANTITY_OUT_OF_RANGE`: the quantity violates min/max/step.
+        - `VERSION_NOT_FOUND`: the service or its pricing version does not exist in the organization.
+        - `VERSION_ARCHIVED`: the version is archived; new contracts and version changes cannot use it (a
+          contract keeps an archived version it already has).
+        - `PRIVATE_PLAN` / `PRIVATE_ADDON`: private, and the contract does not already have it. Only reported
+          when the request opts in with `rejectPrivate`.
+        Limits below the current consumption are not an error.
+      enum:
+        - PLAN_NOT_FOUND
+        - ADDON_NOT_FOUND
+        - ADDON_NOT_AVAILABLE
+        - ADDON_DEPENDENCY_MISSING
+        - ADDON_EXCLUDED
+        - QUANTITY_OUT_OF_RANGE
+        - VERSION_NOT_FOUND
+        - VERSION_ARCHIVED
+        - PRIVATE_PLAN
+        - PRIVATE_ADDON
+
+    SubscriptionError:
+      type: object
+      required: [code, service, path, message]
+      properties:
+        code:
+          $ref: '#/components/schemas/SubscriptionErrorCode'
+        service:
+          type: string
+          example: petclinic
+        path:
+          type: string
+          description: Location of the offending value in the request body.
+          example: subscriptionAddOns.petclinic.extraVisits
+        message:
+          type: string
+          description: Human-readable; may change between releases (switch on `code`).
+
+    InvalidSubscription:
+      type: object
+      required: [error, errors]
+      properties:
+        error:
+          type: string
+          description: '`Invalid subscription: ` followed by the first message.'
+        errors:
+          type: array
+          description: Every problem found.
+          items:
+            $ref: '#/components/schemas/SubscriptionError'
+      example:
+        error: 'Invalid subscription: Add-on extraVisits quantity 4 is not valid. It must be between 3 and Infinity, and a multiple of 3 in the request organization'
+        errors:
+          - code: QUANTITY_OUT_OF_RANGE
+            service: petclinic
+            path: subscriptionAddOns.petclinic.extraVisits
+            message: Add-on extraVisits quantity 4 is not valid. It must be between 3 and Infinity, and a multiple of 3 in the request organization
+
     ContractChanged:
       type: object
       description: The novation was conditional on a contract version that is no longer current. Nothing was written.
@@ -4743,6 +4856,13 @@ components:
                 $ref: '#/components/schemas/ContractedService'
               subscriptionPlans:
                 $ref: '#/components/schemas/SubscriptionPlans'
+              rejectPrivate:
+                type: boolean
+                default: false
+                description: |
+                  Opt-in: reject private plans and add-ons (`PRIVATE_PLAN` / `PRIVATE_ADDON`), for contracts a
+                  customer configures. Without it they are accepted, as before. Same as the query parameter
+                  `rejectPrivate=true`; not stored.
               subscriptionAddOns:
                 $ref: '#/components/schemas/SubscriptionAddons'
           example:
@@ -4784,6 +4904,20 @@ components:
                 $ref: '#/components/schemas/SubscriptionPlans'
               subscriptionAddOns:
                 $ref: '#/components/schemas/SubscriptionAddons'
+              keepBillingPeriod:
+                type: boolean
+                default: false
+                description: |
+                  Keep the current billing period (start and end date) instead of starting a new one. The previous
+                  subscription is still added to `history`. Same as the query parameter `keepBillingPeriod=true`.
+              rejectPrivate:
+                type: boolean
+                default: false
+                description: |
+                  Opt-in: reject private plans and add-ons the contract does not have yet (`PRIVATE_PLAN` /
+                  `PRIVATE_ADDON`), for changes a customer makes. Private plans and add-ons the contract already
+                  has can always be kept. Without it they are accepted, as before (operator-assigned deals).
+                  Same as the query parameter `rejectPrivate=true`; not stored.
               expectedContractVersion:
                 type: string
                 description: |
@@ -4881,6 +5015,15 @@ components:
       example: '"3-9f86d081884c7d65"'
 
   responses:
+    InvalidSubscription:
+      description: |
+        The subscription is not valid. `errors` lists every problem with a stable `code`. Contract creation always
+        answers `400`; novations answer `404` when every problem is a missing plan, add-on or version (as before)
+        and `400` otherwise.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InvalidSubscription'
     ContractChanged:
       description: The contract changed since the given version (`If-Match`/`expectedContractVersion`). Nothing was written.
       headers:
@@ -4915,6 +5058,27 @@ components:
                   $ref: '#/components/schemas/FieldValidationError'
 
   parameters:
+    RejectPrivate:
+      name: rejectPrivate
+      in: query
+      required: false
+      description: |
+        Opt-in: `true` rejects private plans and add-ons that the contract does not already have
+        (`PRIVATE_PLAN` / `PRIVATE_ADDON`), for subscriptions a customer configures. Default: they are accepted,
+        as before. Same as the body field `rejectPrivate: true`.
+      schema:
+        type: boolean
+        default: false
+    KeepBillingPeriod:
+      name: keepBillingPeriod
+      in: query
+      required: false
+      description: |
+        `true` keeps the current billing period (start and end date) instead of starting a new one; the previous
+        subscription is still added to `history`. Default: the billing period restarts, as before.
+      schema:
+        type: boolean
+        default: false
     IfMatchContractVersion:
       name: If-Match
       in: header

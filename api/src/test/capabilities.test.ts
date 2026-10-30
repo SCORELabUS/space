@@ -14,6 +14,8 @@ import { SPACE_CAPABILITIES } from '../main/utils/capabilities';
 const EXPECTED = [
   'contract-org-scope',
   'contract-version',
+  'keep-billing-period',
+  'reject-private',
 ];
 
 const tokens = (response: request.Response) =>
