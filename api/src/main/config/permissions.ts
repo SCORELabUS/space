@@ -304,6 +304,15 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
   },
 
   // ============================================
+  // Pricing token public keys (Public, also at the root: /.well-known/jwks.json)
+  // ============================================
+  {
+    path: '/.well-known/jwks.json',
+    methods: ['GET'],
+    isPublic: true,
+  },
+
+  // ============================================
   // Health Check (Public)
   // ============================================
   {

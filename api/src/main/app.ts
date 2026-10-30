@@ -17,6 +17,7 @@ import { initializeIdempotencyJournal } from './database/migrations/idempotencyJ
 import { initializeUsageConsumptionRecords } from './database/migrations/usageConsumptionRecords';
 import { initializeServiceRelocationJournal } from './database/migrations/serviceRelocationJournal';
 import { runContractUserIdMigration } from './database/migrations/contractUserIdPerOrganization';
+import { initPricingTokenKeys } from './utils/pricingTokenKeys';
 import { movePricingFilesOutOfPublic } from './database/migrations/movePricingFilesOutOfPublic';
 
 const green = '\x1b[32m';
@@ -33,6 +34,8 @@ const initializeApp = async (seedDatabase: boolean = true) => {
   // fills values that are not already present in the process environment.
   if (existsSync(workspaceEnv)) dotenv.config({ path: workspaceEnv });
   dotenv.config();
+  // Before anything else: a server that cannot sign verifiable pricing tokens must not start.
+  await initPricingTokenKeys();
   const app: Application = express();
   loadGlobalMiddlewares(app);
   await routes(app);
