@@ -13,9 +13,9 @@ import SphereClient, { functionalHash } from './SphereClient';
 import { SphereConfiguration, SphereManifest, SphereVersion, SyntaxUpgrade, isSphereSyncEnabled, publicSphereSource, sameSnapshotCreatedAt, selectVersion, validateConfiguration } from './types';
 import { decryptSphereApiKey, encryptSphereApiKey, isValidSphereApiKey } from './credentials';
 import { migrateSubscription, migrateUsage } from './migration';
+import { isSphereSnapshotYamlPath, pricingYamlFile, removePricingYaml, sphereSnapshotYamlPath } from '../pricingFiles';
 import { withOrganizationLock } from './lock';
 import { SphereVersionNotListedError } from './errors';
-import { PUBLIC_SNAPSHOT_PREFIX, isPrivateSnapshotPath, snapshotYamlPath, storedYamlFile } from './snapshots';
 
 export default class SphereSyncService {
   private client = new SphereClient();
@@ -287,10 +287,10 @@ export default class SphereSyncService {
     const data = parsePricingToSpacePricingObject(parsed);
     const errors = validatePricingData(data);
     if (errors.length) throw new Error(`Invalid pricing: ${errors.join(', ')}`);
-    // Private versions are stored outside public/ (see snapshots.ts).
-    const yamlPath = snapshotYamlPath(String(service._id), version.versionId, version.private === true);
-    const file = storedYamlFile(yamlPath);
-    if (!file) throw new Error('Invalid SPHERE snapshot path');
+    // Outside public/: snapshots are read only through GET .../pricings/{version}?format=yaml.
+    const yamlPath = sphereSnapshotYamlPath(String(service._id), version.versionId);
+    const file = pricingYamlFile(yamlPath);
+    if (!file) throw new Error(`Invalid SPHERE snapshot path ${yamlPath}`);
     await fs.mkdir(path.dirname(file), { recursive: true });
     // Persist the parsed Pricing2Yaml model, not the remote source text. This
     // makes a confirmed legacy-syntax upgrade explicit and reproducible.
@@ -427,10 +427,7 @@ export default class SphereSyncService {
     }
   }
   private async removeCopy(copy: any) {
-    if (copy.yamlPath?.startsWith(PUBLIC_SNAPSHOT_PREFIX) || isPrivateSnapshotPath(copy.yamlPath)) {
-      const file = storedYamlFile(copy.yamlPath);
-      if (file) await fs.rm(file, { force: true });
-    }
+    if (isSphereSnapshotYamlPath(copy.yamlPath)) removePricingYaml(copy.yamlPath);
     await this.repository.deletePricing({ _id: copy._id });
     await container.resolve('cacheService').del(`pricing.id.${copy._id}`);
   }

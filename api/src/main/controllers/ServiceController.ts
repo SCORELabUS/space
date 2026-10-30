@@ -124,7 +124,9 @@ class ServiceController {
 
       return res.json(pricing);
     } catch (err: any) {
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err instanceof PricingYamlUnavailableError) {
+        res.status(404).send({ error: 'PRICING_YAML_UNAVAILABLE', message: err.message });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
         res.status(500).send({ error: err.message });
@@ -207,15 +209,17 @@ class ServiceController {
         });
       }
 
-      const pricingPath = await this.serviceService.showPublicPricingUrl(
-        serviceName,
-        pricingVersion,
-        organizationId
-      );
+      // Fails when the version has no stored file.
+      await this.serviceService.showPublicPricingUrl(serviceName, pricingVersion, organizationId);
+
+      // Pricing files are no longer public: the URL is the authorised pricing
+      // route, which needs the same credentials as this request.
+      const pricingPath = `${req.path.replace(/\/public-url\/?$/, '')}?format=yaml`;
 
       return res.json({
         path: pricingPath,
         url: `${req.protocol}://${req.get('host')}${pricingPath}`,
+        requiresAuthentication: true,
       });
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {

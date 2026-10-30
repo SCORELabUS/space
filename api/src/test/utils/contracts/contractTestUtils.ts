@@ -37,7 +37,10 @@ async function createTestContract(organizationId: string, services: LeanService[
         .post(`${baseUrl}/organizations/${organizationId}/contracts`)
         .set('x-api-key', apiKey)
         .send(contractData);
-    
+
+    if (response.status !== 201) {
+      throw new Error(`Failed to create test contract (${response.status}): ${JSON.stringify(response.body)}`);
+    }
     return response.body as unknown as LeanContract;
   }catch(error){
     console.error('Error creating test contract:', error);

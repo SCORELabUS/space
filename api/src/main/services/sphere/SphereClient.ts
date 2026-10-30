@@ -4,6 +4,7 @@ import yaml from 'js-yaml';
 import { SphereManifest } from './types';
 import { escapeVersion } from '../../utils/helpers';
 import { SphereAuthError } from './errors';
+import { proxyAgentFor } from '../../utils/proxy';
 
 export function functionalHash(text: string): string {
   const value = yaml.load(text) as Record<string, unknown>;
@@ -64,8 +65,9 @@ export default class SphereClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
     try {
-      const response = await fetch(`${apiBase.replace(/\/$/, '')}${path}`, {
-        signal: controller.signal, redirect: 'error', size: 5 * 1024 * 1024,
+      const url = `${apiBase.replace(/\/$/, '')}${path}`;
+      const response = await fetch(url, {
+        agent: proxyAgentFor(url), signal: controller.signal, redirect: 'error', size: 5 * 1024 * 1024,
         headers: apiKey ? { 'x-api-key': apiKey, 'cache-control': 'no-store' } : undefined,
       });
       if (apiKey && (response.status === 401 || response.status === 403)) {
