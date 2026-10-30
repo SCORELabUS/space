@@ -4372,6 +4372,34 @@ components:
             change returned a `/static/pricings/...` path that was served
             without authentication; such paths now answer 404.
           example: /private/pricings/63f74bf8eeed64058364b52e-zoom-2025.yaml
+        sphere:
+          type: object
+          readOnly: true
+          description: |
+            Present only on snapshots imported from SPHERE (services with
+            `source: sphere`): the SPHERE pricing and version this pricing copies.
+            Clients can open the pricing in SPHERE through `permanentUrl`
+            (`/p/{pricingId}`), where SPHERE applies its own permissions.
+          properties:
+            serviceId:
+              type: string
+            pricingId:
+              type: string
+              pattern: '^[a-f0-9]{24}$'
+            versionId:
+              type: string
+              pattern: '^[a-f0-9]{24}$'
+            permanentUrl:
+              type: string
+              format: uri
+              example: https://sphere.score.us.es/p/65f0c1a2b3c4d5e6f7a8b9c0
+            version:
+              type: string
+            createdAt:
+              type: string
+              format: date-time
+            contentHash:
+              type: string
         service:
           type: string
         available:
