@@ -11,6 +11,7 @@ export interface SyncState {
   configuration: (SphereConfig & { name: string; status: string; target: SphereVersion; lastCheckedAt?: string;
     lastSyncedAt?: string; error?: string; migrated?: number; replaced?: number }) | null;
   retainedVersions: { version: string }[];
+  contractCounts?: { version: string; count: number }[];
   run?: { status: string; error?: string; migrated?: number; replaced?: number } | null;
 }
 const options = (apiKey: string) => ({ headers: { 'x-api-key': apiKey }, timeout: 30000 });

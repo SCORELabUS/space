@@ -4429,6 +4429,19 @@ components:
       type: object
       properties:
         source: { type: string, enum: [manual, sphere] }
+        contractCounts:
+          type: array
+          description: |
+            Number of contracts currently bound to each pricing version of this service in this organization.
+            Includes expired contracts that still reference the service; excludes historical bindings and other services.
+            Versions are unescaped. Versions with no bindings are omitted; an empty array means no bound contracts.
+            Manual services return an empty array. Computed locally without contacting SPHERE.
+          items:
+            type: object
+            required: [version, count]
+            properties:
+              version: { type: string }
+              count: { type: integer, minimum: 0 }
         configuration:
           allOf:
             - $ref: '#/components/schemas/SphereConfiguration'

@@ -80,7 +80,11 @@ export default class SphereSyncService {
     if (!service) throw new Error('Service not found');
     const retained = await this.repository.pricings({ 'sphere.serviceId': String(service._id) });
     const run = service.sphere?.runId ? await this.repository.run(service.sphere.runId) : null;
-    return { source: service.source ?? 'manual', configuration: service.sphere ?? null, retainedVersions: retained.map((v: any) => ({ ...v, version: v.sphere?.version ?? resetEscapeVersion(v.version) })), run };
+    const contractCounts = service.source === 'sphere'
+      ? (await this.repository.contractCountsByVersion(organizationId, service.name))
+        .map(({ version, count }) => ({ version: resetEscapeVersion(version), count }))
+      : [];
+    return { source: service.source ?? 'manual', configuration: service.sphere ?? null, retainedVersions: retained.map((v: any) => ({ ...v, version: v.sphere?.version ?? resetEscapeVersion(v.version) })), contractCounts, run };
   }
   async configure(organizationId: string, name: string, config: SphereConfiguration) {
     validateConfiguration(config);

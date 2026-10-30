@@ -54,6 +54,7 @@ const contractSchema = new Schema(
 
 // Adding unique index for [name, owner, version]
 contractSchema.index({ 'userContact.userId': 1 }, { unique: true });
+contractSchema.index({ organizationId: 1 });
 
 // Binding changes and synchronization share a renewable organization lease.
 for (const operation of ['save', 'updateOne', 'updateMany', 'findOneAndUpdate', 'deleteOne', 'deleteMany', 'findOneAndDelete'] as const) {

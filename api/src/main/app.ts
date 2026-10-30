@@ -14,6 +14,7 @@ import loadGlobalMiddlewares from './middlewares/GlobalMiddlewaresLoader';
 import routes from './routes/index';
 import { seedDefaultAdmin } from './database/seeders/common/userSeeder';
 import { movePricingFilesOutOfPublic } from './database/migrations/movePricingFilesOutOfPublic';
+import { ensureContractOrganizationIndex } from './database/migrations/contractOrganizationIndex';
 
 const green = '\x1b[32m';
 const blue = '\x1b[36m';
@@ -132,6 +133,7 @@ const initializeDatabase = async (seedDatabaseFlag: boolean = true) => {
             await seedDefaultAdmin();
           }
         }
+        await ensureContractOrganizationIndex();
         break;
       default:
         throw new Error('Unsupported database technology');
