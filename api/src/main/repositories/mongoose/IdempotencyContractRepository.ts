@@ -28,14 +28,15 @@ class IdempotencyContractRepository {
     if (previous?.idempotencyReceipt?.stepId === stepId) return previous.idempotencyReceipt.result;
     if (previous?.idempotencyReceipt && !previous.idempotencyReceipt.acknowledged) throw new IdempotencyStepBusyError();
     if (write.create) {
+      if (write.create.organizationId !== write.organizationId || write.create.userContact?.userId !== write.userId) throw new Error('CONFLICT: Prepared contract identity does not match its scope');
       // A stable preallocated _id and immutable document also fence an ambiguous
       // insert: an abandoned owner and its successor cannot create two contracts.
       const data = { ...write.create, _id: identity._id };
       const document = new Contract(data);
-      const snapshot: any = document.toJSON();
+      const snapshot: any = document.toJSON({ minimize: false });
       document.set('idempotencyReceipt', { stepId, acknowledged: false, result: snapshot });
       await document.validate();
-      const persisted = document.toObject({ flattenMaps: true, virtuals: false, versionKey: false });
+      const persisted = document.toObject({ flattenMaps: true, virtuals: false, versionKey: false, minimize: false });
       try {
         // Upsert queries cannot contain $expr. Keep the lease test inside the
         // atomic replacement instead: its expired branch aborts the write,

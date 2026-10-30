@@ -800,7 +800,7 @@ class ContractService {
     }
 
     if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'group', organizationId,
-      expected: expected !== undefined, writes: updatedContracts.map(contract => ({ contractId: contract.id!, organizationId,
+      expected: expected !== undefined, writes: updatedContracts.map(contract => ({ contractId: contract.id ?? String((contract as any)._id), organizationId,
         userId: contract.userContact.userId, set: novationFields(contract), guard: guards.get(contract.userContact.userId) ?? {} })) });
 
     if (expected) {
