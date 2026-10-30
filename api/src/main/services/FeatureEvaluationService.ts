@@ -1,4 +1,5 @@
 import { isAfter } from 'date-fns';
+import { decodeJwt } from 'jose';
 import container from '../config/container';
 import ServiceRepository from '../repositories/mongoose/ServiceRepository';
 import { LeanContract } from '../types/models/Contract';
@@ -134,7 +135,21 @@ class FeatureEvaluationService {
     const cachedToken = await this.cacheService.get(tokenKey);
 
     if (cachedToken) {
-      return cachedToken;
+      // An evaluation started before a pause/resume may finish after its cache
+      // invalidation. Recheck availability before reusing that late token.
+      const dormant = Object.keys(await this.serviceService.dormantServices(
+        Object.keys(contract.contractedServices ?? {}), contract.organizationId
+      )).sort();
+      try {
+        const claim = decodeJwt(cachedToken).dormantServices;
+        const cachedDormant = claim === undefined ? [] : claim;
+        if (Array.isArray(cachedDormant) && cachedDormant.every(service => typeof service === 'string') &&
+            JSON.stringify([...cachedDormant].sort()) === JSON.stringify(dormant)) {
+          return cachedToken;
+        }
+      } catch {
+        // Invalid cached payloads are regenerated rather than served.
+      }
     }
 
     const result = (await this.eval(userId, reqOrg, {
@@ -190,12 +205,6 @@ class FeatureEvaluationService {
     const { organizationId } = await this.contractService.show(userId, reqOrg.id);
     const evaluationKey = featuresCacheKey(organizationId, userId, `eval.${featureId}`);
 
-    const evaluation = await this.cacheService.get(evaluationKey);
-
-    if (evaluation && !options.revert && !expectedConsumption) {
-      return evaluation as FeatureEvaluationResult;
-    }
-
     await this.cacheService.del(featuresCacheKey(organizationId, userId, 'pricingToken'));
 
     if (options.revert) {
@@ -228,6 +237,13 @@ class FeatureEvaluationService {
       if (dormant) {
         const [service, reason] = dormant;
         return { eval: false, limit: null, used: null, error: { code: reason, message: dormantServiceMessage(service, reason) } };
+      }
+
+      // Cache invalidation can race an in-flight evaluation. Availability is
+      // authoritative even when an older result was written back afterwards.
+      const evaluation = await this.cacheService.get(evaluationKey);
+      if (evaluation && !expectedConsumption) {
+        return evaluation as FeatureEvaluationResult;
       }
 
       try {
@@ -383,8 +399,8 @@ class FeatureEvaluationService {
       pricingsToReturn[serviceName] = {};
 
       // Step 2: Given the show parameter, discover all pricings that must be identified by id, and do the same for url
-      let pricingsWithIdToCheck: string[] = [];
-      let pricingsWithUrlToCheck: string[] = [];
+      const pricingsWithIdToCheck: string[] = [];
+      const pricingsWithUrlToCheck: string[] = [];
 
       if (show === 'active' || show === 'all') {
         for (const [version, pricing] of service.activePricings) {

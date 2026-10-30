@@ -15,6 +15,7 @@ const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$
 export const exactName = (name: string) => ({ $regex: `^${escapeRegex(name)}$`, $options: 'i' });
 
 export type ServiceQueryFilters = {
+  disabled?: boolean;
   name?: string;
   page?: number;
   offset?: number;
@@ -24,12 +25,12 @@ export type ServiceQueryFilters = {
 
 class ServiceRepository extends RepositoryBase {
   async findAll(organizationId?: string, queryFilters?: ServiceQueryFilters, disabled = false) {
-    const { name, page = 1, offset = 0, limit = 20, order = 'asc' } = queryFilters || {};
+    const { name, page = 1, offset = 0, limit = 20, order = 'asc', disabled: selectedDisabled = disabled } = queryFilters || {};
 
     const query: any = {
       // Partial match ("contains"), of the text as written.
       ...(name ? { name: { $regex: escapeRegex(name), $options: 'i' } } : {}),
-      disabled: disabled,
+      disabled: selectedDisabled,
       ...(organizationId ? { organizationId: organizationId } : {}),
     };
 

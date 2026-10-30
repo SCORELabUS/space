@@ -1,3 +1,4 @@
+import { ServiceRelocationPendingError } from '../services/serviceRelocationState';
 import container from '../config/container.js';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import FeatureEvaluationService from '../services/FeatureEvaluationService.js';
@@ -28,6 +29,7 @@ class FeatureEvaluationController {
       const features = await this.featureEvaluationService.index(queryParams, organizationId);
       res.json(features);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       res.status(500).send({ error: err.message });
     }
   }
@@ -44,6 +46,7 @@ class FeatureEvaluationController {
       const featureEvaluation = await this.featureEvaluationService.eval(userId, req.org, options);
       res.json(featureEvaluation);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       }else if (err.message.toLowerCase().includes('invalid')) {
@@ -68,6 +71,7 @@ class FeatureEvaluationController {
       const token = await this.featureEvaluationService.generatePricingToken(userId, req.org, options);
       res.json({pricingToken: token});
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       }else if (err.message.toLowerCase().includes('invalid')) {

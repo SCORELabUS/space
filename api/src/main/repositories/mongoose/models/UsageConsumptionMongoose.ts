@@ -4,8 +4,8 @@ import mongoose, { Schema } from 'mongoose';
  * One applied expected consumption (a single-feature evaluation that
  * incremented usage levels), kept so that it can be reverted by its id.
  *
- * `revertedAt` is set by the one revert that claims the record; the usage
- * levels are then decremented by exactly `levels[].amount`. Records expire at
+ * `revertRequestedAt` records intent; `revertedAt` acknowledges completion.
+ * The contract stores a private receipt in the same write as its decrement. Records expire at
  * `expiresAt` (TTL index), after which the consumption can no longer be
  * reverted.
  */
@@ -30,6 +30,9 @@ const usageConsumptionSchema = new Schema(
     levels: { type: [consumedLevelSchema], required: true },
     createdAt: { type: Date, required: true },
     expiresAt: { type: Date, required: true },
+    state: { type: String, enum: ['prepared', 'applied'], default: 'applied' },
+    contractId: { type: String },
+    revertRequestedAt: { type: Date },
     revertedAt: { type: Date },
   },
   { versionKey: false }

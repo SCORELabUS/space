@@ -3,6 +3,7 @@ FROM node:21.1-slim
 
 ENV http_proxy http://proxy.int.local:3128
 ENV https_proxy http://proxy.int.local:3128
+ENV no_proxy localhost,127.0.0.1
 
 # Set the working directory in the container
 WORKDIR /usr/src/server

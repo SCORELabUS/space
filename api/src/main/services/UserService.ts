@@ -120,9 +120,13 @@ class UserService {
 
     const updatedUser = await this.userRepository.update(username, userData);
 
-    // If the username was changed, update the owner field in the organizations owned by the user
-    if (userData.username && userData.username !== username) {
-      await this.organizationService.updateUsername(username, userData.username);
+    try {
+      // If the username was changed, update the owner field in the organizations owned by the user
+      if (userData.username && userData.username !== username) {
+        await this.organizationService.updateUsername(username, userData.username);
+      }
+    } finally {
+      await container.resolve('eventService').revalidateContractConnections();
     }
 
     return this.sanitizeUserForRequester(updatedUser, creatorData, username);
@@ -139,6 +143,7 @@ class UserService {
       throw new Error('API Key could not be regenerated');
     }
     
+    await container.resolve('eventService').revalidateContractConnections();
     return newApiKey;
   }
 
@@ -170,6 +175,7 @@ class UserService {
     }
 
     const updatedUser = await this.userRepository.changeRole(username, role);
+    await container.resolve('eventService').revalidateContractConnections();
     return this.sanitizeUserForRequester(updatedUser, creatorData, username);
   }
 
@@ -208,6 +214,7 @@ class UserService {
     if (!result) {
       throw new Error('INVALID DATA: User not found');
     }
+    await container.resolve('eventService').revalidateContractConnections();
     return true;
   }
 }
