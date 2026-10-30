@@ -4,6 +4,7 @@ import { retrievePricingFromPath, retrievePricingFromText } from 'pricing4ts/ser
 import container from '../config/container';
 import ServiceRepository, { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository';
 import { parsePricingToSpacePricingObject } from '../utils/pricing-yaml2json';
+import { proxyAgentFor } from '../utils/proxy';
 import { Pricing } from 'pricing4ts';
 import fetch from 'node-fetch';
 import https from 'https';
@@ -23,8 +24,8 @@ import CacheService from './CacheService';
 import OrganizationRepository from '../repositories/mongoose/OrganizationRepository';
 import yaml from 'js-yaml';
 import { SphereVersionNotListedError } from './sphere/errors';
-import { isPrivateSnapshotPath, storedYamlFile } from './sphere/snapshots';
 import { contractCacheKeys } from '../utils/contracts/cacheKeys';
+import { pricingYamlFile, readPricingYaml, uploadedPricingYamlPath } from './pricingFiles';
 
 /** A pricing version exists, but its Pricing2Yaml file cannot be provided. */
 export class PricingYamlUnavailableError extends Error {
@@ -198,7 +199,8 @@ class ServiceService {
     let service = await this.cacheService.get(cacheKey);
 
     if (!service) {
-      service = await this.serviceRepository.findByName(serviceName, organizationId);
+      service = await this.serviceRepository.findByName(serviceName, organizationId)
+        ?? await this.serviceRepository.findByName(serviceName, organizationId, true);
       await this.cacheService.set(cacheKey, service, 3600, true);
     }
 
@@ -474,31 +476,14 @@ class ServiceService {
     return { body, syntaxVersion: readSyntaxVersion(body) };
   }
 
-  /**
-   * Read a stored Pricing2Yaml file by its `yamlPath`, or undefined: files under
-   * `public/static/pricings`, and private SPHERE snapshots, which are stored
-   * outside `public/` (see sphere/snapshots.ts).
-   */
-  _readStoredPricingYaml(publicPath: string): Buffer | undefined {
-    const file = storedYamlFile(publicPath);
-    if (!file) {
-      return undefined;
-    }
-    try {
-      return fs.readFileSync(file);
-    } catch {
-      return undefined;
-    }
+  /** Read an allowed private or legacy pricing path through the shared storage guard. */
+  _readStoredPricingYaml(storedPath: string): Buffer | undefined {
+    return readPricingYaml(storedPath);
   }
 
   async showPublicPricingUrl(serviceName: string, pricingVersion: string, organizationId: string) {
     const pricing = await this.showPricing(serviceName, pricingVersion, organizationId);
 
-    if (isPrivateSnapshotPath(pricing?.yamlPath)) {
-      throw new Error(
-        `NOT FOUND: Pricing version ${pricingVersion} of service ${serviceName} is private and has no public URL; read it with GET .../pricings/${pricingVersion}?format=yaml`
-      );
-    }
 
     if (pricing?.yamlPath) {
       return pricing.yamlPath;
@@ -550,6 +535,9 @@ class ServiceService {
     // Step 1: Parse and validate pricing
 
     const uploadedPricing: Pricing = await this._getPricingFromPath(pricingFile.path);
+    if (!serviceName && (await this.serviceRepository.findByName(uploadedPricing.saasName, organizationId, true))?.source === 'sphere') {
+      throw new Error('Invalid operation: reactivate this linked service through SPHERE synchronization');
+    }
     const pricingYamlPath = this._savePricingYamlFile(
       pricingFile.path,
       organizationId,
@@ -614,6 +602,7 @@ class ServiceService {
       if (existingEnabled) {
         throw new Error(`Invalid request: Service ${uploadedPricing.saasName} already exists`);
       }
+      if (existingDisabled?.source === 'sphere') throw new Error('Invalid operation: reactivate this linked service through SPHERE synchronization');
 
       // Step 3: Create the service as it does not exist and add the pricing
       const savedPricing = await this.pricingRepository.create(pricingData);
@@ -779,6 +768,7 @@ class ServiceService {
       if (existingEnabled) {
         throw new Error(`Invalid request: Service ${uploadedPricing.saasName} already exists`);
       }
+      if (existingDisabled?.source === 'sphere') throw new Error('Invalid operation: reactivate this linked service through SPHERE synchronization');
 
       if (existingDisabled) {
         // Versions of the disabled service stay archived: contracts may still use them.
@@ -919,6 +909,10 @@ class ServiceService {
       dataToUpdate.name = newServiceData.name;
     }
 
+    if (service.source === 'sphere' && 'defaultVersion' in newServiceData) {
+      throw new Error('INVALID DATA: the version for new contracts of a SPHERE-linked service is decided by its synchronization policy');
+    }
+
     if (newServiceData.defaultVersion === null) {
       dataToUpdate.defaultVersion = undefined; // removes it
     } else if (newServiceData.defaultVersion !== undefined) {
@@ -944,10 +938,7 @@ class ServiceService {
         );
       }
 
-      const contracts = await this.contractRepository.findByFilters({
-        filters: { services: [service.name] },
-        organizationId,
-      });
+      const contracts = await this.contractRepository.findAllByService(service.name, organizationId);
 
       for (const contract of contracts) {
         if (Object.keys(contract.contractedServices).length > 1) {
@@ -1434,7 +1425,8 @@ class ServiceService {
     const safeServiceName = this._normalizePricingPathPart(serviceName);
     const safeVersion = this._normalizePricingPathPart(version);
 
-    return `/static/pricings/${safeOrganizationId}-${safeServiceName}-${safeVersion}.yaml`;
+    // Outside public/: read only through GET .../pricings/{version}?format=yaml.
+    return uploadedPricingYamlPath(`${safeOrganizationId}-${safeServiceName}-${safeVersion}.yaml`);
   }
 
   _savePricingYamlContent(
@@ -1444,7 +1436,10 @@ class ServiceService {
     version: string
   ) {
     const relativePath = this._buildPricingYamlRelativePath(organizationId, serviceName, version);
-    const absolutePath = path.resolve('public', `.${relativePath}`);
+    const absolutePath = pricingYamlFile(relativePath);
+    if (!absolutePath) {
+      throw new Error(`Invalid pricing file path ${relativePath}`);
+    }
 
     fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
     fs.writeFileSync(absolutePath, yamlContent, 'utf8');
@@ -1463,7 +1458,7 @@ class ServiceService {
   }
 
   async _fetchRemotePricingYaml(url: string) {
-    const agent = new https.Agent({ rejectUnauthorized: false });
+    const agent = proxyAgentFor(url, { rejectUnauthorized: false }) ?? new https.Agent({ rejectUnauthorized: false });
     const timeoutMs = 5000;
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);

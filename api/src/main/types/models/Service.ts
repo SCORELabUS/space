@@ -18,6 +18,7 @@ export interface LeanService {
 }
 
 export type ServiceQueryFilters = {
+  disabled?: boolean;
   name?: string;
   page?: number;
   offset?: number;

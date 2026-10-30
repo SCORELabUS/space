@@ -2,7 +2,7 @@ import container from '../config/container.js';
 import { createHash } from 'node:crypto';
 import ServiceService, { PricingYamlUnavailableError, PricingYamlUpstreamError } from '../services/ServiceService.js';
 import { SphereCredentialError } from '../services/sphere/credentials.js';
-import { SphereAuthError } from '../services/sphere/errors.js';
+import { SphereAuthError, SphereResourceUnavailableError } from '../services/sphere/errors.js';
 import { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository.js';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import { FallBackSubscription } from '../types/models/Contract.js';
@@ -41,7 +41,7 @@ class ServiceController {
 
       res.json(services);
     } catch (err: any) {
-      res.status(500).send({ error: err.message });
+      res.status(err.message === 'Invalid disabled filter' ? 400 : 500).send({ error: err.message });
     }
   }
 
@@ -124,7 +124,9 @@ class ServiceController {
 
       return res.json(pricing);
     } catch (err: any) {
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err instanceof PricingYamlUnavailableError) {
+        res.status(404).send({ error: 'PRICING_YAML_UNAVAILABLE', message: err.message });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
         res.status(500).send({ error: err.message });
@@ -207,15 +209,17 @@ class ServiceController {
         });
       }
 
-      const pricingPath = await this.serviceService.showPublicPricingUrl(
-        serviceName,
-        pricingVersion,
-        organizationId
-      );
+      // Fails when the version has no stored file.
+      await this.serviceService.showPublicPricingUrl(serviceName, pricingVersion, organizationId);
+
+      // Pricing files are no longer public: the URL is the authorised pricing
+      // route, which needs the same credentials as this request.
+      const pricingPath = `${req.path.replace(/\/public-url\/?$/, '')}?format=yaml`;
 
       return res.json({
         path: pricingPath,
         url: `${req.protocol}://${req.get('host')}${pricingPath}`,
+        requiresAuthentication: true,
       });
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
@@ -241,9 +245,20 @@ class ServiceController {
           const linked = await container.resolve('sphereSyncService').create(req.body, organizationId);
           return res.status(201).json(linked);
         } catch (error: any) {
-          // SPHERE key problems are the caller's to fix (missing SPHERE_KEY_ENCRYPTION_KEY, rejected key).
-          if (error instanceof SphereCredentialError || error instanceof SphereAuthError) {
-            return res.status(400).json({ error: error.message });
+          if (error instanceof SphereCredentialError) {
+            return res.status(400).json({
+              code: 'SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE',
+              error: 'SPHERE credentials cannot be used or saved right now. Ask your SPACE administrator to check credential storage.',
+            });
+          }
+          if (error instanceof SphereAuthError || error instanceof SphereResourceUnavailableError) {
+            const suppliedKey = typeof req.body.sphereApiKey === 'string' && req.body.sphereApiKey.length > 0;
+            return res.status(400).json({
+              code: suppliedKey ? 'SPHERE_KEY_REJECTED' : 'SPHERE_ACCESS_REQUIRED',
+              error: suppliedKey
+                ? 'This SPHERE API key cannot access the pricing. Check the link and the key permissions, then try again.'
+                : 'This pricing may be private or unavailable. Provide a SPHERE API key with access to continue.',
+            });
           }
           throw error;
         }
@@ -474,7 +489,9 @@ class ServiceController {
   _transformIndexQueryParams(
     indexQueryParams: Record<string, string | number>
   ): ServiceQueryFilters {
+    if (indexQueryParams.disabled !== undefined && (typeof indexQueryParams.disabled !== 'string' || !['true', 'false'].includes(indexQueryParams.disabled))) throw new Error('Invalid disabled filter');
     const transformedData: ServiceQueryFilters = {
+      disabled: indexQueryParams.disabled === 'true',
       name: indexQueryParams.name as string,
       page: parseInt(indexQueryParams['page'] as string) || 1,
       offset: parseInt(indexQueryParams['offset'] as string) || 0,

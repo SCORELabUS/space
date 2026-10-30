@@ -6,6 +6,7 @@ import { contractVersionGuard } from '../../utils/contracts/version';
 
 /** Escape a string for use as a literal inside a regular expression. */
 const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+import { novationFields } from '../../utils/contracts/novation';
 
 type ContractMatchPipeline = {
   pipeline: any[];
@@ -180,6 +181,14 @@ class ContractRepository extends RepositoryBase {
     const { pipeline } = buildMatchPipeline(queryFilters);
     const result = await ContractMongoose.aggregate([...pipeline, { $count: 'total' }]);
     return result[0]?.total ?? 0;
+  }
+
+  /** Internal move preflight: every binding is needed, without listing pagination. */
+  async findAllByService(serviceName: string, organizationId: string): Promise<LeanContract[]> {
+    if (!organizationId) throw new Error('An organization is required to list service contracts');
+    const { pipeline } = buildMatchPipeline({ filters: { services: [serviceName] }, organizationId });
+    const contracts = await ContractMongoose.aggregate(pipeline);
+    return contracts.map(contract => toPlainObject<LeanContract>(contract));
   }
 
   async findByUserId(userId: string, organizationId: string): Promise<LeanContract | null> {
@@ -369,8 +378,9 @@ class ContractRepository extends RepositoryBase {
   }
 
   /**
-   * Write several contracts, each only while its stored version still
-   * satisfies its guard (see `contractVersionGuard`). Never upserts.
+   * Write the novation fields of several contracts, each only while its stored
+   * version satisfies its guard (see `contractVersionGuard`). An empty guard
+   * applies an unconditional novation. Never upserts or overwrites consumption.
    *
    * @returns the userIds whose guard no longer held, so nothing was written.
    */
@@ -383,7 +393,7 @@ class ContractRepository extends RepositoryBase {
       const { userId } = contract.userContact;
       const result = await ContractMongoose.updateOne(
         { ...guard, ...byUserId(userId, contract.organizationId) },
-        { $set: contract }
+        { $set: novationFields(contract) }
       );
       if (result.matchedCount === 0) rejected.push(userId);
     }
