@@ -3,10 +3,12 @@ import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { FiZap, FiArchive, FiMoreVertical, FiDownload, FiExternalLink } from 'react-icons/fi';
 import { useCustomConfirm } from '@/hooks/useCustomConfirm';
-import { deletePricingVersion, getPublicPricingUrl } from '@/api/services/servicesApi';
+import { deletePricingVersion, getPricingYaml } from '@/api/services/servicesApi';
 import useAuth from '@/hooks/useAuth';
 import { useOrganization } from '@/hooks/useOrganization';
 import { useCustomAlert } from '@/hooks/useCustomAlert';
+import { sphereEditorContentUrl, sphereEditorFragmentEnabled, sphereViewLink } from '@/lib/sphereUrl';
+import { sphereOpeningPage } from '@/lib/sphereOpeningPage';
 
 interface DragDropPricingsProps {
   activePricings: Pricing[];
@@ -49,11 +51,16 @@ export default function DragDropPricings({
     return `${new URL(apiOrigin || '/', window.location.origin).href.replace(/\/+$/, '')}${normalizedPath}`;
   }
 
-  async function resolvePublicYamlUrl(pricing: Pricing): Promise<string | null> {
-    if (pricing.yamlPath) {
-      return getAbsoluteUrlFromPath(pricing.yamlPath);
-    }
+  /** Pricings loaded from a URL (not stored by SPACE) have a publicly reachable YAML. */
+  function publicYamlUrl(pricing: Pricing): string | null {
+    return pricing.url ? getAbsoluteUrlFromPath(pricing.url) : null;
+  }
 
+  /**
+   * The YAML stored by SPACE (uploaded pricings and SPHERE snapshots). It is not
+   * public: it is read with the user's API key through the authorised route.
+   */
+  async function fetchStoredYaml(pricing: Pricing): Promise<string | null> {
     if (!currentOrganization?.id) {
       await showAlert('Organization not found. Please select an organization and try again.');
       return null;
@@ -61,27 +68,27 @@ export default function DragDropPricings({
 
     try {
       setMenuActionLoadingVersion(pricing.version);
-      const result = await getPublicPricingUrl(
-        user.apiKey,
-        currentOrganization.id,
-        serviceName,
-        pricing.version
-      );
-      return result.url;
+      return await getPricingYaml(user.apiKey, currentOrganization.id, serviceName, pricing.version);
     } catch (error: any) {
-      await showAlert(error.message || 'Failed to prepare public pricing YAML URL');
+      await showAlert(error.message || 'Failed to retrieve the pricing YAML');
       return null;
     } finally {
       setMenuActionLoadingVersion(null);
     }
   }
 
-  async function resolveViewYamlUrl(pricing: Pricing): Promise<string | null> {
-    if (pricing.url) {
-      return getAbsoluteUrlFromPath(pricing.url);
-    }
+  function yamlObjectUrl(yaml: string, type: string): string {
+    return window.URL.createObjectURL(new Blob([yaml], { type }));
+  }
 
-    return resolvePublicYamlUrl(pricing);
+  function downloadFromObjectUrl(objectUrl: string, fileName: string) {
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = fileName;
+    link.rel = 'noopener noreferrer';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
   }
 
   async function downloadYamlFile(url: string, fileName: string): Promise<void> {
@@ -93,54 +100,140 @@ export default function DragDropPricings({
 
       const blob = await response.blob();
       const objectUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = objectUrl;
-      link.download = fileName;
-      link.rel = 'noopener noreferrer';
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
+      downloadFromObjectUrl(objectUrl, fileName);
       window.URL.revokeObjectURL(objectUrl);
     } catch {
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = fileName;
-      link.rel = 'noopener noreferrer';
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
+      downloadFromObjectUrl(url, fileName);
     }
   }
 
   async function handleViewYaml(pricing: Pricing) {
-    const yamlUrl = await resolveViewYamlUrl(pricing);
+    const url = publicYamlUrl(pricing);
 
-    if (!yamlUrl) {
+    if (url) {
+      window.open(url, '_blank', 'noopener,noreferrer');
       return;
     }
 
-    window.open(yamlUrl, '_blank', 'noopener,noreferrer');
+    // Opened before the request, so that popup blockers allow it.
+    const viewer = window.open('', '_blank');
+    const yaml = await fetchStoredYaml(pricing);
+
+    if (!yaml) {
+      viewer?.close();
+      return;
+    }
+
+    const objectUrl = yamlObjectUrl(yaml, 'text/plain;charset=utf-8');
+    if (viewer) {
+      viewer.opener = null;
+      viewer.location.href = objectUrl;
+    } else {
+      window.open(objectUrl, '_blank');
+    }
+    window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 60_000);
   }
 
   async function handleDownloadYaml(pricing: Pricing) {
-    const yamlUrl = await resolveViewYamlUrl(pricing);
+    const url = publicYamlUrl(pricing);
 
-    if (!yamlUrl) {
+    if (url) {
+      await downloadYamlFile(url, `${pricing.version}.yaml`);
       return;
     }
 
-    await downloadYamlFile(yamlUrl, `${pricing.version}.yaml`);
+    const yaml = await fetchStoredYaml(pricing);
+
+    if (!yaml) {
+      return;
+    }
+
+    const objectUrl = yamlObjectUrl(yaml, 'application/yaml');
+    downloadFromObjectUrl(objectUrl, `${pricing.version}.yaml`);
+    window.URL.revokeObjectURL(objectUrl);
   }
 
-  async function handleOpenInSphere(pricing: Pricing) {
-    const publicYamlUrl = await resolvePublicYamlUrl(pricing);
+  /**
+   * SPHERE opens SPHERE snapshots through its permanent link (with its own permissions) and
+   * pricings defined by an external URL in its editor. Files uploaded to SPACE need the
+   * organization's credentials: SPACE reads them and gives SPHERE's editor the content in the
+   * URL fragment, which browsers never send to a server. That is only offered when SPHERE's
+   * editor reads the fragment (`SPHERE_EDITOR_FRAGMENT=true`).
+   */
+  function sphereLink(pricing: Pricing) {
+    return sphereViewLink(pricing, import.meta.env.SPHERE_PUBLIC_URL, {
+      editorFragment: sphereEditorFragmentEnabled(import.meta.env.SPHERE_EDITOR_FRAGMENT),
+    });
+  }
 
-    if (!publicYamlUrl) {
+  /**
+   * Uploaded pricings: the YAML is read with the user's API key, which takes a request, and a
+   * window opened after it would no longer count as opened by the click, so popup blockers could
+   * stop it. The tab is therefore opened blank during the click, detached from SPACE
+   * (`opener = null`), given a loading page, and sent to SPHERE once the content is ready, or
+   * closed with a message.
+   */
+  async function handleOpenInSphere(pricing: Pricing) {
+    const link = sphereLink(pricing);
+
+    if (!link) {
+      return;
+    }
+    if (link.kind !== 'content') {
+      window.open(link.url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    if (!currentOrganization?.id) {
+      await showAlert('Organization not found. Please select an organization and try again.');
       return;
     }
 
-    const sphereUrl = `https://sphere.score.us.es/editor?pricingUrl=${encodeURI(publicYamlUrl)}`;
-    window.open(sphereUrl, '_blank', 'noopener,noreferrer');
+    // `noopener` would make `window.open` return null, so the opener is cleared by hand.
+    const tab = window.open('', '_blank');
+    if (!tab) {
+      await showAlert('The browser blocked the SPHERE tab. Allow pop-ups for SPACE and try again.', 'warning');
+      return;
+    }
+    tab.opener = null;
+    try {
+      // Shown while the YAML is read: inline CSS only, no script, and the version as text.
+      tab.document.documentElement.lang = 'en';
+      tab.document.documentElement.innerHTML = sphereOpeningPage(pricing.version);
+    } catch {
+      // Only a courtesy message.
+    }
+
+    let yaml: string;
+    setMenuActionLoadingVersion(pricing.version);
+    try {
+      yaml = await getPricingYaml(user.apiKey, currentOrganization.id, serviceName, pricing.version);
+    } catch (error: any) {
+      tab.close();
+      await showAlert(error.message || 'Failed to retrieve the pricing YAML', 'danger');
+      return;
+    } finally {
+      setMenuActionLoadingVersion(null);
+    }
+
+    const content = sphereEditorContentUrl(link.url, yaml);
+    if (!content.ok) {
+      tab.close();
+      await showAlert(
+        content.reason === 'too-large'
+          ? `Pricing ${pricing.version} is too large to open in SPHERE (${content.encodedLength.toLocaleString()} encoded characters; the limit is ${content.maxEncodedLength.toLocaleString()}). Download the YAML and use Import in SPHERE's editor.`
+          : `Pricing ${pricing.version} has an empty YAML file, so there is nothing to open in SPHERE.`,
+        'warning'
+      );
+      return;
+    }
+    if (tab.closed) {
+      // The user closed the tab while the YAML was being read.
+      return;
+    }
+
+    // `replace` keeps the blank page out of the tab's history. The content is only in the
+    // fragment, which is never sent to SPHERE's servers (nor in the Referer header).
+    tab.location.replace(content.url);
   }
 
   function handleDragStart(e: React.DragEvent, pricing: Pricing, from: 'active' | 'archived') {
@@ -330,17 +423,19 @@ export default function DragDropPricings({
                         >
                           <FiDownload size={13} /> Download YAML
                         </button>
-                        <button
-                          type="button"
-                          disabled={menuActionLoadingVersion === pricing.version}
-                          className="cursor-pointer w-full px-3 py-2 text-left text-xs text-indigo-700 dark:text-indigo-300 hover:bg-gray-100 dark:hover:bg-gray-800 border-t border-gray-100 dark:border-gray-700 flex items-center gap-2 disabled:opacity-60"
-                          onClick={() => {
-                            setOpenMenuVersion(null);
-                            void handleOpenInSphere(pricing);
-                          }}
-                        >
-                          <FiExternalLink size={13} /> View in SPHERE
-                        </button>
+                        {sphereLink(pricing) && (
+                          <button
+                            type="button"
+                            disabled={menuActionLoadingVersion === pricing.version}
+                            className="cursor-pointer w-full px-3 py-2 text-left text-xs text-indigo-700 dark:text-indigo-300 hover:bg-gray-100 dark:hover:bg-gray-800 border-t border-gray-100 dark:border-gray-700 flex items-center gap-2 disabled:opacity-60"
+                            onClick={() => {
+                              setOpenMenuVersion(null);
+                              void handleOpenInSphere(pricing);
+                            }}
+                          >
+                            <FiExternalLink size={13} /> View in SPHERE
+                          </button>
+                        )}
                       </motion.div>
                     )}
                   </AnimatePresence>
