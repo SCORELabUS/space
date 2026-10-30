@@ -126,14 +126,22 @@ export async function verifyPricingToken(token, myOrganizationId, expectedUserId
 `createRemoteJWKSet` caches the keys and refetches them when a token names an unknown `kid`, so key rotations need
 no change on the verifier. The same code runs in browsers (WebCrypto supports ES256 everywhere).
 
-### Python (PyJWT with `cryptography`)
+### Python (PyJWT 2.15.1+ with `cryptography`)
+
+Install `PyJWT[crypto]>=2.15.1`; this version supplies the bounded refresh cooldown used below.
 
 ```python
 import jwt
 
-jwks = jwt.PyJWKClient("https://space.example.com/api/v1/.well-known/jwks.json")
+jwks = jwt.PyJWKClient(
+    "https://space.example.com/api/v1/.well-known/jwks.json",
+    lifespan=300, cooldown_duration=30, timeout=10, cache_keys=False,
+)
 
 def verify_pricing_token(token: str, my_organization_id: str, expected_user_id: str) -> dict:
+    header = jwt.get_unverified_header(token)
+    if header.get("alg") != "ES256" or not isinstance(header.get("kid"), str) or not header["kid"].strip():
+        raise ValueError("Expected ES256 with a kid")
     key = jwks.get_signing_key_from_jwt(token)
     payload = jwt.decode(
         token,
@@ -159,6 +167,10 @@ processor.setJWTClaimsSetVerifier(new DefaultJWTClaimsVerifier<>(
     myOrganizationId, // aud
     new JWTClaimsSet.Builder().issuer("space").build(), // JWT_ISSUER of your SPACE (default "space")
     Set.of("exp", "iss", "aud")));
+var header = SignedJWT.parse(token).getHeader(); // still untrusted
+if (!JWSAlgorithm.ES256.equals(header.getAlgorithm())
+    || header.getKeyID() == null || header.getKeyID().isBlank())
+    throw new SecurityException("Expected ES256 with a kid");
 JWTClaimsSet claims = processor.process(token, null);
 if (!myOrganizationId.equals(claims.getStringClaim("organizationId"))
     || !expectedUserId.equals(claims.getStringClaim("userId")))
