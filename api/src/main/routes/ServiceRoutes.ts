@@ -6,10 +6,12 @@ import * as PricingValidator from '../controllers/validation/PricingValidation';
 import { handlePricingUpload } from '../middlewares/FileHandlerMiddleware';
 import { handleValidation } from '../middlewares/ValidationHandlingMiddleware';
 import { memberRole, hasPermission } from '../middlewares/AuthMiddleware';
+import { pricingUploadsDirectory } from '../services/pricingFiles';
 
 const loadFileRoutes = function (app: express.Application) {
   const serviceController = new ServiceController();
-  const upload = handlePricingUpload(['pricing'], './public/static/pricings/uploaded');
+  // Received files are kept out of public/, which is served without authentication.
+  const upload = handlePricingUpload(['pricing'], pricingUploadsDirectory);
 
   const baseUrl = '/api/v1';
 

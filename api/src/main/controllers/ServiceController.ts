@@ -1,5 +1,5 @@
 import container from '../config/container.js';
-import ServiceService from '../services/ServiceService.js';
+import ServiceService, { PricingYamlUnavailableError } from '../services/ServiceService.js';
 import { ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository.js';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import { FallBackSubscription } from '../types/models/Contract.js';
@@ -105,13 +105,28 @@ class ServiceController {
         return res.status(400).send({ error: 'Organization ID is required. You can either provide an organization scoped API key or use the /organizations/*/services/** paths' });
       }
 
+      const format = req.query.format ?? 'json';
+      if (format !== 'json' && format !== 'yaml') {
+        return res.status(400).send({ error: 'Invalid format: use "json" (default) or "yaml"' });
+      }
+
+      if (format === 'yaml') {
+        // The Pricing2Yaml file, byte for byte. This is the only way to read it:
+        // pricing files are not served statically.
+        const body = await this.serviceService.showPricingYaml(serviceName, pricingVersion, organizationId);
+        res.set('Cache-Control', 'private, no-cache');
+        return res.status(200).type('application/yaml; charset=utf-8').send(body);
+      }
+
       const pricing = await this.serviceService.showPricing(serviceName, pricingVersion, organizationId);
 
       resetEscapePricingVersion(pricing);
 
       return res.json(pricing);
     } catch (err: any) {
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err instanceof PricingYamlUnavailableError) {
+        res.status(404).send({ error: 'PRICING_YAML_UNAVAILABLE', message: err.message });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
         res.status(500).send({ error: err.message });
@@ -132,15 +147,17 @@ class ServiceController {
         });
       }
 
-      const pricingPath = await this.serviceService.showPublicPricingUrl(
-        serviceName,
-        pricingVersion,
-        organizationId
-      );
+      // Fails when the version has no stored file.
+      await this.serviceService.showPublicPricingUrl(serviceName, pricingVersion, organizationId);
+
+      // Pricing files are no longer public: the URL is the authorised pricing
+      // route, which needs the same credentials as this request.
+      const pricingPath = `${req.path.replace(/\/public-url\/?$/, '')}?format=yaml`;
 
       return res.json({
         path: pricingPath,
         url: `${req.protocol}://${req.get('host')}${pricingPath}`,
+        requiresAuthentication: true,
       });
     } catch (err: any) {
       if (err.message.toLowerCase().includes('not found')) {
