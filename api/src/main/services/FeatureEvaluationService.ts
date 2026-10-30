@@ -182,7 +182,7 @@ class FeatureEvaluationService {
       return evaluation as FeatureEvaluationResult;
     }
 
-    await this.cacheService.del(`features.${userId}.pricingToken`)
+    await this.cacheService.del(`features.${userId}.pricingToken`);
 
     // Step 1: Retrieve contexts
     const { subscriptionContext, pricingContext, evaluationContext } =
@@ -343,8 +343,8 @@ class FeatureEvaluationService {
       pricingsToReturn[serviceName] = {};
 
       // Step 2: Given the show parameter, discover all pricings that must be identified by id, and do the same for url
-      let pricingsWithIdToCheck: string[] = [];
-      let pricingsWithUrlToCheck: string[] = [];
+      const pricingsWithIdToCheck: string[] = [];
+      const pricingsWithUrlToCheck: string[] = [];
 
       if (show === 'active' || show === 'all') {
         for (const [version, pricing] of service.activePricings) {

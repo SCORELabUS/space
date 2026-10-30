@@ -2201,62 +2201,7 @@ describe('Permissions Test Suite', function () {
       });
     });
 
-    describe('POST /features/evaluate - Org Role: ALL, MANAGEMENT, EVALUATION only', function () {
-      it('Should return 403 with ADMIN user API key', async function () {
-        const response = await request(app)
-          .post(`${baseUrl}/features/evaluate`)
-          .set('x-api-key', adminApiKey)
-          .send({ userId: 'test-user' });
-
-        expect(response.status).toBe(403);
-      });
-
-      it('Should return 403 with USER user API key', async function () {
-        const response = await request(app)
-          .post(`${baseUrl}/features/evaluate`)
-          .set('x-api-key', regularUserApiKey)
-          .send({ userId: 'test-user' });
-
-        expect(response.status).toBe(403);
-      });
-
-      it('Should allow evaluation with organization API key with ALL scope', async function () {
-        const response = await request(app)
-          .post(`${baseUrl}/features/evaluate`)
-          .set('x-api-key', featureAllApiKey.key)
-          .send({ userId: 'test-user' });
-
-        expect([200, 400, 404, 422]).toContain(response.status);
-      });
-
-      it('Should allow evaluation with organization API key with MANAGEMENT scope', async function () {
-        const response = await request(app)
-          .post(`${baseUrl}/features/evaluate`)
-          .set('x-api-key', featureManagementApiKey.key)
-          .send({ userId: 'test-user' });
-
-        expect([200, 400, 404, 422]).toContain(response.status);
-      });
-
-      it('Should allow evaluation with organization API key with EVALUATION scope', async function () {
-        const response = await request(app)
-          .post(`${baseUrl}/features/evaluate`)
-          .set('x-api-key', featureEvaluationApiKey.key)
-          .send({ userId: 'test-user' });
-
-        expect([200, 400, 404, 422]).toContain(response.status);
-      });
-
-      it('Should return 401 without API key', async function () {
-        const response = await request(app)
-          .post(`${baseUrl}/features/evaluate`)
-          .send({ userId: 'test-user' });
-
-        expect(response.status).toBe(401);
-      });
-    });
-
-    describe('POST /features/:userId - Org Role: ALL, MANAGEMENT only', function () {
+    describe('POST /features/:userId - Org Role: ALL, MANAGEMENT, EVALUATION', function () {
       it('Should return 403 with ADMIN user API key', async function () {
         const response = await request(app)
           .post(`${baseUrl}/features/test-user`)
@@ -2293,13 +2238,13 @@ describe('Permissions Test Suite', function () {
         expect([200, 400, 404, 422]).toContain(response.status);
       });
 
-      it('Should return 403 with organization API key with EVALUATION scope', async function () {
+      it('Should allow with organization API key with EVALUATION scope', async function () {
         const response = await request(app)
           .post(`${baseUrl}/features/test-user`)
           .set('x-api-key', featureEvaluationApiKey.key)
           .send({ features: [] });
 
-        expect(response.status).toBe(403);
+        expect([200, 400, 404, 422]).toContain(response.status);
       });
 
       it('Should return 401 without API key', async function () {
@@ -2308,6 +2253,120 @@ describe('Permissions Test Suite', function () {
           .send({ features: [] });
 
         expect(response.status).toBe(401);
+      });
+    });
+
+    describe('POST /features/:userId/pricing-token - Org Role: ALL, MANAGEMENT, EVALUATION', function () {
+      it('Should return 403 with ADMIN user API key', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/pricing-token`)
+          .set('x-api-key', adminApiKey);
+
+        expect(response.status).toBe(403);
+      });
+
+      it('Should return 403 with USER user API key', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/pricing-token`)
+          .set('x-api-key', regularUserApiKey);
+
+        expect(response.status).toBe(403);
+      });
+
+      it('Should allow with organization API key with ALL scope', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/pricing-token`)
+          .set('x-api-key', featureAllApiKey.key);
+
+        expect([200, 204, 400, 404, 422]).toContain(response.status);
+      });
+
+      it('Should allow with organization API key with MANAGEMENT scope', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/pricing-token`)
+          .set('x-api-key', featureManagementApiKey.key);
+
+        expect([200, 204, 400, 404, 422]).toContain(response.status);
+      });
+
+      it('Should allow with organization API key with EVALUATION scope', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/pricing-token`)
+          .set('x-api-key', featureEvaluationApiKey.key);
+
+        expect([200, 204, 400, 404, 422]).toContain(response.status);
+      });
+
+      it('Should return 401 without API key', async function () {
+        const response = await request(app).post(`${baseUrl}/features/test-user/pricing-token`);
+
+        expect(response.status).toBe(401);
+      });
+    });
+
+    describe('POST /features/:userId/:featureId - Org Role: ALL, MANAGEMENT, EVALUATION', function () {
+      it('Should return 403 with ADMIN user API key', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/test-feature`)
+          .set('x-api-key', adminApiKey);
+
+        expect(response.status).toBe(403);
+      });
+
+      it('Should return 403 with USER user API key', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/test-feature`)
+          .set('x-api-key', regularUserApiKey);
+
+        expect(response.status).toBe(403);
+      });
+
+      it('Should allow with organization API key with ALL scope', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/test-feature`)
+          .set('x-api-key', featureAllApiKey.key);
+
+        expect([200, 204, 400, 404, 422]).toContain(response.status);
+      });
+
+      it('Should allow with organization API key with MANAGEMENT scope', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/test-feature`)
+          .set('x-api-key', featureManagementApiKey.key);
+
+        expect([200, 204, 400, 404, 422]).toContain(response.status);
+      });
+
+      it('Should allow with organization API key with EVALUATION scope', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/test-feature`)
+          .set('x-api-key', featureEvaluationApiKey.key);
+
+        expect([200, 204, 400, 404, 422]).toContain(response.status);
+      });
+
+      it('Should return 401 without API key', async function () {
+        const response = await request(app).post(`${baseUrl}/features/test-user/test-feature`);
+
+        expect(response.status).toBe(401);
+      });
+    });
+
+    describe('POST /features/:userId/:featureId/* - Org Role: ALL, MANAGEMENT only', function () {
+      it('Should return 403 with organization API key with EVALUATION scope', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/test-feature/extra`)
+          .set('x-api-key', featureEvaluationApiKey.key);
+
+        expect(response.status).toBe(403);
+      });
+
+      it('Should not return 403 with organization API key with ALL scope', async function () {
+        const response = await request(app)
+          .post(`${baseUrl}/features/test-user/test-feature/extra`)
+          .set('x-api-key', featureAllApiKey.key);
+
+        expect(response.status).not.toBe(403);
       });
     });
 
