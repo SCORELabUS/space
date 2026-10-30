@@ -1616,7 +1616,7 @@ describe('Permissions Test Suite', function () {
 
       describe('GET /services/:serviceName/pricings/:pricingVersion', function () {
         it('Should allow access with organization API key with ALL scope', async function () {
-          const testPricingId = Object.keys(testService.activePricings!)[0]
+          const testPricingId = Object.keys(testService.activePricings!)[0];
           
           const response = await request(app)
             .get(`${baseUrl}/services/${testService.name}/pricings/${testPricingId}`)
@@ -1626,7 +1626,7 @@ describe('Permissions Test Suite', function () {
         });
 
         it('Should allow access with organization API key with MANAGEMENT scope', async function () {
-          const testPricingId = Object.keys(testService.activePricings!)[0]
+          const testPricingId = Object.keys(testService.activePricings!)[0];
           
           const response = await request(app)
             .get(`${baseUrl}/services/${testService.name}/pricings/${testPricingId}`)
@@ -1636,7 +1636,7 @@ describe('Permissions Test Suite', function () {
         });
 
         it('Should allow access with organization API key with EVALUATION scope', async function () {
-          const testPricingId = Object.keys(testService.activePricings!)[0]
+          const testPricingId = Object.keys(testService.activePricings!)[0];
           
           const response = await request(app)
             .get(`${baseUrl}/services/${testService.name}/pricings/${testPricingId}`)
@@ -1646,7 +1646,7 @@ describe('Permissions Test Suite', function () {
         });
 
         it('Should return 401 without API key', async function () {
-          const testPricingId = Object.keys(testService.activePricings!)[0]
+          const testPricingId = Object.keys(testService.activePricings!)[0];
 
           const response = await request(app).get(`${baseUrl}/services/${testService.name}/pricings/${testPricingId}`);
 
@@ -1654,7 +1654,7 @@ describe('Permissions Test Suite', function () {
         });
 
         it('Should return 403 with ADMIN user API key', async function () {
-          const testPricingId = Object.keys(testService.activePricings!)[0]
+          const testPricingId = Object.keys(testService.activePricings!)[0];
           
           const response = await request(app)
             .get(`${baseUrl}/services/${testService.name}/pricings/${testPricingId}`)
@@ -1902,7 +1902,7 @@ describe('Permissions Test Suite', function () {
       it('Should return 201 creation with ADMIN user API key', async function () {
         const ownerUser = await createTestUser('USER');
         const testOrg = await createTestOrganization(ownerUser.username);
-        const testService = await createTestService(testOrg.id!)
+        const testService = await createTestService(testOrg.id!);
         
         let contractData = await generateContract(
                 { [testService.name.toLowerCase()]: testService.activePricings.keys().next().value! },

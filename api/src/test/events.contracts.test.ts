@@ -181,6 +181,127 @@ describe('Contract events', function () {
     });
   });
 
+  const disconnected = (socket: Socket) => new Promise<void>((resolve, reject) => {
+    if (!socket.connected) return resolve();
+    const timer = setTimeout(() => reject(new Error('revoked connection stayed open')), 3000);
+    socket.once('disconnect', () => { clearTimeout(timer); resolve(); });
+  });
+
+  describe('revocation', function () {
+    it('disconnects a removed organization key and keeps authorized listeners working', async function () {
+      const revoked = await connect({ apiKey: evaluationKey });
+      const revokedEvents = collect(revoked);
+      const allowed = collect(await connect({ apiKey: allKey }));
+      const before = await createContract();
+      await waitFor(revokedEvents, e => e.details.userId === before.userContact.userId);
+
+      await container.resolve('organizationService').removeApiKey(organization.id!, evaluationKey, owner);
+      await disconnected(revoked);
+      const after = await createContract();
+      await waitFor(allowed, e => e.details.userId === after.userContact.userId);
+      expect(revokedEvents.some(e => e.details.userId === after.userContact.userId)).toBe(false);
+      await expect(connect({ apiKey: evaluationKey })).rejects.toThrow(/Invalid/i);
+    });
+
+    it('disconnects a removed member while retaining other organization access', async function () {
+      await addMemberToOrganization(otherOrganization.id!, { username: member.username, role: 'EVALUATOR' });
+      const revoked = await connect({ apiKey: member.apiKey, organizationId: organization.id } as any);
+      const other = await connect({ apiKey: member.apiKey, organizationId: otherOrganization.id } as any);
+      const revokedEvents = collect(revoked);
+      const otherEvents = collect(other);
+      const allowed = collect(await connect({ apiKey: allKey }));
+      const before = await createContract();
+      await waitFor(revokedEvents, e => e.details.userId === before.userContact.userId);
+
+      await container.resolve('organizationService').removeMember(organization.id!, member.username, owner);
+      await disconnected(revoked);
+      const after = await createContract();
+      await waitFor(allowed, e => e.details.userId === after.userContact.userId);
+      const otherContract = await createContract(otherKey);
+      await waitFor(otherEvents, e => e.details.userId === otherContract.userContact.userId);
+      expect(other.connected).toBe(true);
+      expect(revokedEvents.some(e => e.details.userId === after.userContact.userId)).toBe(false);
+      await expect(connect({ apiKey: member.apiKey, organizationId: organization.id } as any)).rejects.toThrow(/member/i);
+    });
+
+    it('disconnects a regenerated user key and accepts its replacement', async function () {
+      const oldKey = member.apiKey;
+      const revoked = await connect({ apiKey: oldKey, organizationId: organization.id } as any);
+      const events = collect(revoked);
+      const before = await createContract();
+      await waitFor(events, e => e.details.userId === before.userContact.userId);
+
+      const replacement = await container.resolve('userService').regenerateApiKey(member.username, member);
+      await disconnected(revoked);
+      await expect(connect({ apiKey: oldKey, organizationId: organization.id } as any)).rejects.toThrow(/Invalid/i);
+      const allowed = collect(await connect({ apiKey: replacement, organizationId: organization.id } as any));
+      const after = await createContract();
+      await waitFor(allowed, e => e.details.userId === after.userContact.userId);
+      expect(events.some(e => e.details.userId === after.userContact.userId)).toBe(false);
+    });
+
+    it.each(['changeRole', 'update'])('disconnects a global admin who loses authority through %s', async function (method) {
+      const backup = await createTestUser('ADMIN', `event-backup-${uuidv4()}`);
+      try {
+        const revoked = await connect({ apiKey: admin.apiKey, organizationId: organization.id } as any);
+        const events = collect(revoked);
+        const allowed = collect(await connect({ apiKey: allKey }));
+        const before = await createContract();
+        await waitFor(events, e => e.details.userId === before.userContact.userId);
+        const users: any = container.resolve('userService');
+        if (method === 'changeRole') await users.changeRole(admin.username, 'USER', backup);
+        else await users.update(admin.username, { role: 'USER' }, backup);
+        await disconnected(revoked);
+        const after = await createContract();
+        await waitFor(allowed, e => e.details.userId === after.userContact.userId);
+        expect(events.some(e => e.details.userId === after.userContact.userId)).toBe(false);
+        await expect(connect({ apiKey: admin.apiKey, organizationId: organization.id } as any)).rejects.toThrow(/member/i);
+      } finally { await deleteTestUser(backup.username); }
+    });
+
+    it('disconnects a deleted user', async function () {
+      const revoked = await connect({ apiKey: member.apiKey, organizationId: organization.id } as any);
+      const events = collect(revoked);
+      const allowed = collect(await connect({ apiKey: allKey }));
+      const before = await createContract();
+      await waitFor(events, e => e.details.userId === before.userContact.userId);
+      await container.resolve('userService').destroy(member.username, owner);
+      await disconnected(revoked);
+      const after = await createContract();
+      await waitFor(allowed, e => e.details.userId === after.userContact.userId);
+      expect(events.some(e => e.details.userId === after.userContact.userId)).toBe(false);
+      await expect(connect({ apiKey: member.apiKey, organizationId: organization.id } as any)).rejects.toThrow(/Invalid/i);
+    });
+
+    it('rechecks outgoing delivery after a key is removed without a service notification', async function () {
+      const revoked = await connect({ apiKey: evaluationKey });
+      const events = collect(revoked);
+      const allowed = collect(await connect({ apiKey: allKey }));
+      const before = await createContract();
+      await waitFor(events, e => e.details.userId === before.userContact.userId);
+      await container.resolve('organizationRepository').removeApiKey(organization.id!, evaluationKey);
+      const after = await createContract();
+      await waitFor(allowed, e => e.details.userId === after.userContact.userId);
+      await disconnected(revoked);
+      expect(events.some(e => e.details.userId === after.userContact.userId)).toBe(false);
+    });
+
+    it('fails closed when a connected user credential cannot be checked', async function () {
+      const revoked = await connect({ apiKey: member.apiKey, organizationId: organization.id } as any);
+      const events = collect(revoked);
+      const allowed = collect(await connect({ apiKey: allKey }));
+      const before = await createContract();
+      await waitFor(events, e => e.details.userId === before.userContact.userId);
+      const outage = vi.spyOn(container.resolve<any>('userService'), 'findByApiKey').mockRejectedValue(new Error('database unavailable'));
+      try {
+        const after = await createContract();
+        await waitFor(allowed, e => e.details.userId === after.userContact.userId);
+        await disconnected(revoked);
+        expect(events.some(e => e.details.userId === after.userContact.userId)).toBe(false);
+      } finally { outage.mockRestore(); }
+    });
+  });
+
   describe('delivery', function () {
     it('delivers created, novated and deleted events of the organization', async function () {
       const events = collect(await connect({ apiKey: evaluationKey }));
@@ -232,7 +353,7 @@ describe('Contract events', function () {
       for (const userId of ids) await waitFor(events, e => e.code === 'CONTRACT_NOVATED' && e.details.userId === userId);
     });
 
-    it('delivers novated events for the contracts a partly rejected guarded group novation wrote', async function () {
+    it.each([true, false])('delivers written events after a partly rejected group novation (conditional: %s)', async function (conditional) {
       const events = collect(await connect({ apiKey: allKey }));
       const groupId = `group-${uuidv4()}`;
       const versions: Record<string, string> = {};
@@ -249,7 +370,7 @@ describe('Contract events', function () {
         versions[userId] = created.body.contractVersion;
       }
       const [written, skipped] = Object.keys(versions);
-      // The second contract changes between the precondition check and its own write.
+      // Reject the second write after the first succeeds, with or without preconditions.
       const repository: any = container.resolve('contractRepository');
       const original = repository.bulkUpdateGuarded.bind(repository);
       const guarded = vi.spyOn(repository, 'bulkUpdateGuarded').mockImplementation(async (entries: any) => {
@@ -260,10 +381,13 @@ describe('Contract events', function () {
         const response = await request(app)
           .put(`${baseUrl}/contracts?groupId=${groupId}`)
           .set('x-api-key', allKey)
-          .send({ subscriptionPlans: { [serviceName]: 'BASIC' }, subscriptionAddOns: {}, expectedContractVersions: versions });
+          .send({
+            subscriptionPlans: { [serviceName]: 'BASIC' }, subscriptionAddOns: {},
+            ...(conditional ? { expectedContractVersions: versions } : {}),
+          });
 
-        expect(response.status).toBe(412);
-        expect(response.body.novated).toEqual([written]);
+        expect(response.status).toBe(conditional ? 412 : 500);
+        if (conditional) expect(response.body.novated).toEqual([written]);
       } finally {
         guarded.mockRestore();
       }

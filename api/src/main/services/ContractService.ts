@@ -726,6 +726,12 @@ class ContractService {
           await this.cacheService.del(`contracts.${contract.userContact.userId}`);
           await this.cacheService.del(`features.${contract.userContact.userId}.*`);
         }
+        for (const contract of updatedContracts) {
+          const userId = contract.userContact.userId;
+          if (rejected.includes(userId)) continue;
+          const written = await this.contractRepository.findByUserId(userId, organizationId);
+          if (written) this._events()?.emitContractEvent('CONTRACT_NOVATED', written);
+        }
         throw new Error(`Failed to update contracts for groupId ${groupId} within organization ${organizationId}`);
       }
     }
