@@ -1008,7 +1008,7 @@ class ContractService {
     const contract = await this._findContract(userId, organizationId);
     const recoveryGuard = contractVersionGuard(contract);
     const periodGuard = Object.fromEntries(Object.entries(contract.usageLevels ?? {}).flatMap(([service, levels]) =>
-      Object.entries(levels).map(([limit, level]) => [`usageLevels.${service}.${limit}.resetTimeStamp`, level.resetTimeStamp ?? null])));
+      Object.entries(levels).map(([limit, level]) => [`usageLevels.${service}.${limit}.resetTimeStamp`, level.resetTimeStamp == null ? null : new Date(level.resetTimeStamp)])));
     // Usage levels of dormant services are kept as they are: they cannot be
     // consumed, and resets leave them alone.
     const dormant = await this.serviceService.dormantServices(
@@ -1161,7 +1161,7 @@ class ContractService {
     const consumptionId = options.featureId ? randomUUID() : undefined;
     const createdAt = new Date(), expiresAt = new Date(createdAt.getTime() + consumptionRetentionSeconds() * 1000);
     const resetTimeStamps = Object.fromEntries(targets.map(({ serviceName, usageLimit }) =>
-      [`${serviceName}.${usageLimit}`, source.usageLevels?.[serviceName]?.[usageLimit]?.resetTimeStamp ?? null]));
+      [`${serviceName}.${usageLimit}`, source.usageLevels?.[serviceName]?.[usageLimit]?.resetTimeStamp == null ? null : new Date(source.usageLevels[serviceName][usageLimit].resetTimeStamp!)]));
     if (currentIdempotencyExecution() && options.evaluation) return executeIdempotentAction({ kind: 'consume', organizationId,
       evaluation: options.evaluation, increments,
       consumption: { id: consumptionId, contractId: source.id, state: 'prepared', organizationId, userId,
