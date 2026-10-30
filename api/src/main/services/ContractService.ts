@@ -1114,6 +1114,14 @@ class ContractService {
       if (ceiling !== null) ceilings[`${serviceName}.${usageLimit}`] = ceiling;
     }
 
+    if (!options.featureId) {
+      const updated = await this.contractRepository.incrementUsageLevels(userId, increments, organizationId,
+        { ceilings, ...(options.contract ? { guard: contractVersionGuard(options.contract) } : {}) });
+      if (!updated) return this._explainRejectedConsumption(userId, targets, organizationId, options.contract);
+      await this.cacheService.del(contractCacheKey(organizationId, userId));
+      return { status: 'applied', contract: updated };
+    }
+
     // Persist the intent before touching usage. The atomic increment carries
     // its receipt; an ambiguous write is never compensated against a newer
     // billing period, subscription, or recreated contract.
