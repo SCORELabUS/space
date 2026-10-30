@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Server } from 'http';
 import request from 'supertest';
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
@@ -17,6 +18,7 @@ import { LeanContract } from '../main/types/models/Contract';
 import { generateContract } from './utils/contracts/generators';
 import { createTestContract } from './utils/contracts/contractTestUtils';
 import ContractMongoose from '../main/repositories/mongoose/models/ContractMongoose';
+import { PETCLINIC_BASE_VERSION, uploadPetclinicService } from './utils/services/petclinicVersions';
 
 describe('Contract API routes', function () {
   let app: Server;
@@ -32,6 +34,21 @@ describe('Contract API routes', function () {
     if (contract?.userContact?.userId) {
       contractsToCleanup.add(contract.userContact.userId);
     }
+  };
+
+  // Cache and organization-boundary assertions need a valid fixed subscription,
+  // rather than random feature/usage-limit and add-on combinations.
+  const createFixedContract = async (key: string, serviceName: string, groupId: string): Promise<LeanContract> => {
+    const name = serviceName.toLowerCase();
+    const response = await request(app).post(`${baseUrl}/contracts`).set('x-api-key', key).send({
+      userContact: { userId: randomUUID(), username: 'fixed-contract-fixture' },
+      groupId,
+      contractedServices: { [name]: PETCLINIC_BASE_VERSION },
+      subscriptionPlans: { [name]: 'BASIC' },
+      subscriptionAddOns: {},
+      billingPeriod: { autoRenew: false, renewalDays: 30 },
+    }).expect(201);
+    return response.body;
   };
 
   beforeAll(async function () {
@@ -944,7 +961,8 @@ describe('Contract API routes', function () {
 
     it('clears cached single-feature evaluations when novating contracts by groupId', async function () {
       const sharedGroupId = `bulk-cache-features-${Date.now()}`;
-      const targetContract = await createTestContract(testOrganization.id!, [testService], app, sharedGroupId);
+      const fixedService = await uploadPetclinicService(app, testOrgApiKey);
+      const targetContract = await createFixedContract(testOrgApiKey, fixedService.name, sharedGroupId);
       trackContractForCleanup(targetContract);
 
       const allFeaturesBeforeResponse = await request(app)
@@ -998,6 +1016,7 @@ describe('Contract API routes', function () {
       expect(singleFeatureAfterResponse.body.error.code).toBe('FLAG_NOT_FOUND');
 
       await deleteTestService(novationService.name, testOrganization.id!);
+      await deleteTestService(fixedService.name, testOrganization.id!);
     });
 
     it('clears cached pricing token when novating contracts by groupId', async function () {
@@ -1152,29 +1171,20 @@ describe('Contract API routes', function () {
       const sharedGroupId = `billing-group-${Date.now()}`;
       const unaffectedGroupId = `billing-unaffected-${Date.now()}`;
 
-      const targetContract = await createTestContract(testOrganization.id!, [testService], app, sharedGroupId);
+      const fixedService = await uploadPetclinicService(app, testOrgApiKey);
+      const targetContract = await createFixedContract(testOrgApiKey, fixedService.name, sharedGroupId);
       trackContractForCleanup(targetContract);
 
-      const unaffectedContract = await createTestContract(
-        testOrganization.id!,
-        [testService],
-        app,
-        unaffectedGroupId
-      );
+      const unaffectedContract = await createFixedContract(testOrgApiKey, fixedService.name, unaffectedGroupId);
       trackContractForCleanup(unaffectedContract);
 
       const foreignOrgOwner = await createTestUser('USER');
       const foreignOrganization = await createTestOrganization(foreignOrgOwner.username);
-      const foreignService = await createTestService(foreignOrganization.id);
       const foreignOrgApiKey = generateOrganizationApiKey();
       await addApiKeyToOrganization(foreignOrganization.id!, { key: foreignOrgApiKey, scope: 'ALL' });
 
-      const foreignContract = await createTestContract(
-        foreignOrganization.id!,
-        [foreignService],
-        app,
-        sharedGroupId
-      );
+      const foreignService = await uploadPetclinicService(app, foreignOrgApiKey);
+      const foreignContract = await createFixedContract(foreignOrgApiKey, foreignService.name, sharedGroupId);
       trackContractForCleanup(foreignContract);
 
       const billingData = {
@@ -1223,6 +1233,7 @@ describe('Contract API routes', function () {
         foreignContractBefore.body.billingPeriod.renewalDays
       );
 
+      await deleteTestService(fixedService.name, testOrganization.id!);
       await deleteTestService(foreignService.name, foreignOrganization.id!);
       await deleteTestOrganization(foreignOrganization.id!);
       await deleteTestUser(foreignOrgOwner.username);
