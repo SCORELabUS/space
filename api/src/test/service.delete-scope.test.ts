@@ -18,6 +18,7 @@ import { LeanOrganization } from '../main/types/models/Organization';
 import ContractMongoose from '../main/repositories/mongoose/models/ContractMongoose';
 import ServiceMongoose from '../main/repositories/mongoose/models/ServiceMongoose';
 import PricingMongoose from '../main/repositories/mongoose/models/PricingMongoose';
+import { LEGACY_PRICINGS_PREFIX, PRIVATE_PRICINGS_PREFIX, legacyPublicYamlFile, pricingYamlFile, privateYamlPathFor } from '../main/services/pricingFiles';
 import { PETCLINIC_BASE_VERSION, petclinicPricingPath, uploadPetclinicService, writePetclinicVariant } from './utils/services/petclinicVersions';
 
 /**
@@ -47,7 +48,7 @@ describe('Deleting and disabling services: organization and exact name', functio
     ServiceMongoose.findOne({ organizationId: org.organization.id, name }).lean() as any;
   const pricingsOf = (org: Org) =>
     PricingMongoose.find({ _organizationId: org.organization.id }).sort({ _id: 1 }).lean() as Promise<any[]>;
-  const fileOf = (pricing: any) => path.resolve('public', `.${pricing.yamlPath}`);
+  const fileOf = (pricing: any) => pricingYamlFile(pricing.yamlPath)!;
   const contractOf = (org: Org) =>
     ContractMongoose.findOne({ organizationId: org.organization.id, 'userContact.userId': org.userId }).lean() as any;
   const evaluate = (org: Org) => request(app).post(`${baseUrl}/features/${org.userId}`).set('x-api-key', org.key);
@@ -179,7 +180,9 @@ describe('Deleting and disabling services: organization and exact name', functio
       vi.spyOn(serviceService, '_removeServicesFromContracts').mockImplementation(async (...args: any[]) => {
         if (!late) {
           late = true;
-          expect((await upload(one, variant('Latecomer'))).status).toBe(201);
+          // Reentrant internal writer under the held lease: a second HTTP
+          // request would correctly wait for the prune's organization lock.
+          expect((await serviceService.create({ path: variant('Latecomer') }, 'file', one.organization.id!)).name).toBe('Latecomer');
         }
         return (original as any)(...args);
       });
@@ -209,6 +212,50 @@ describe('Deleting and disabling services: organization and exact name', functio
       expect(await serviceOf(one, 'Petclinic')).toBeNull();
       expect((await pricingsOf(one)).map(pricing => pricing._serviceName)).toEqual(['Vetclinic']);
       expect(fs.existsSync(fileOf(petclinicPricing))).toBe(false);
+    });
+
+    it.each(['private', 'legacy'] as const)('keeps a file while another organization holds its %s alias', async reference => {
+      const [own] = await pricingsOf(one), [other] = await pricingsOf(two);
+      const orphanedOtherFile = fileOf(other);
+      const privatePath = privateYamlPathFor(own.yamlPath);
+      const legacyPath = LEGACY_PRICINGS_PREFIX + privatePath.slice(PRIVATE_PRICINGS_PREFIX.length);
+      const sharedFile = pricingYamlFile(privatePath)!;
+      await PricingMongoose.updateOne({ _id: own._id }, { $set: { yamlPath: reference === 'private' ? legacyPath : privatePath } });
+      await PricingMongoose.updateOne({ _id: other._id }, { $set: { yamlPath: reference === 'private' ? privatePath : legacyPath } });
+      try {
+        expect(await destroy('Petclinic', one)).toBeTruthy();
+        expect(fs.existsSync(sharedFile)).toBe(true);
+        expect(await PricingMongoose.findById(other._id).lean()).not.toBeNull();
+        expect(await destroy('Petclinic', two)).toBeTruthy();
+        expect(fs.existsSync(sharedFile)).toBe(false);
+      } finally { fs.rmSync(orphanedOtherFile, { force: true }); }
+    });
+
+    it('removes both protected storage and a legacy public copy when no pricing references either', async () => {
+      const [own] = await pricingsOf(one);
+      const privateFile = fileOf(own);
+      const privatePath = privateYamlPathFor(own.yamlPath);
+      const legacyPath = LEGACY_PRICINGS_PREFIX + privatePath.slice(PRIVATE_PRICINGS_PREFIX.length);
+      const legacyFile = legacyPublicYamlFile(legacyPath)!;
+      fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+      fs.copyFileSync(privateFile, legacyFile);
+      await PricingMongoose.updateOne({ _id: own._id }, { $set: { yamlPath: legacyPath } });
+      try {
+        expect(await destroy('Petclinic', one)).toBeTruthy();
+        expect(fs.existsSync(privateFile)).toBe(false);
+        expect(fs.existsSync(legacyFile)).toBe(false);
+      } finally { fs.rmSync(legacyFile, { force: true }); }
+    });
+
+    it('only accepts contained manual-pricing paths for file cleanup', () => {
+      const service = container.resolve('serviceService');
+      for (const unsafe of ['/etc/passwd', 'https://example.com/pricing.yaml', '/private/sphere/a/b.yaml', '/static/pricings/sphere/a/b.yaml',
+        '/private/pricings//shared.yaml', '/private/pricings/../outside.yaml', '/private/pricings/a/../../outside.yaml', '/static/pricings/../outside.yaml',
+        '/private/pricings/back\\slash.yaml', '/private/pricings/null\0.yaml']) {
+        expect(service._isUploadedPricingYamlPath(unsafe), unsafe).toBe(false);
+      }
+      expect(service._isUploadedPricingYamlPath('/private/pricings/example.yaml')).toBe(true);
+      expect(service._isUploadedPricingYamlPath('/static/pricings/example.yaml')).toBe(true);
     });
 
     it('deletes exactly the named service, not one it is a prefix of or matches as a pattern', async function () {
@@ -321,17 +368,32 @@ describe('Deleting and disabling services: organization and exact name', functio
       );
     };
 
-    it('are disabled through their SPHERE removal whatever the casing of the name in the URL', async function () {
+    it('pause through the SPHERE path and retain contracts whatever the casing of the URL name', async function () {
       await insertLinked(one);
+      const before = await contractOf(one);
+      const snapshots = await pricingsOf(one);
 
       const response = await request(app).delete(`${baseUrl}/services/LINKEDCASE`).set('x-api-key', one.key);
 
       expect(response.status, JSON.stringify(response.body)).toBe(204);
       expect((await serviceOf(one, linkedName)).disabled).toBe(true);
-      // The SPHERE removal takes the service out of the contracts and records it.
-      const contract = await contractOf(one);
-      expect(contract.contractedServices[linkedName]).toBeUndefined();
-      expect(contract.synchronizationHistory.map((entry: any) => entry.reason)).toEqual(['service_removed']);
+      expect(await contractOf(one)).toEqual(before);
+      expect(await pricingsOf(one)).toEqual(snapshots);
+    });
+
+    it.each([false, true])('refuses a manual upload through a case alias of a SPHERE service (paused=%s)', async paused => {
+      await insertLinked(one);
+      if (paused) expect((await request(app).delete(`${baseUrl}/services/LINKEDCASE`).set('x-api-key', one.key)).status).toBe(204);
+      const before = await serviceOf(one, linkedName), contract = await contractOf(one), pricings = await pricingsOf(one);
+      const file = variant('LINKEDCASE', '6.0');
+      const response = paused
+        ? await upload(one, file)
+        : await request(app).post(`${baseUrl}/services/LINKEDCASE/pricings`).set('x-api-key', one.key).attach('pricing', file);
+      expect(response.status).toBe(400);
+      expect(response.body.error).toContain('SPHERE');
+      expect(await serviceOf(one, linkedName)).toEqual(before);
+      expect(await contractOf(one)).toEqual(contract);
+      expect(await pricingsOf(one)).toEqual(pricings);
     });
 
     it('cannot be renamed through another casing of the name in the URL', async function () {

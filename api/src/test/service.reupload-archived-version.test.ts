@@ -7,6 +7,7 @@ import yaml from 'js-yaml';
 import { v4 as uuidv4 } from 'uuid';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import container from '../main/config/container';
+import { pricingYamlFile } from '../main/services/pricingFiles';
 import { contractCacheKey } from '../main/utils/contracts/cacheKeys';
 import { baseUrl, getApp, shutdownApp } from './utils/testApp';
 import { createTestUser, deleteTestUser } from './utils/users/userTestUtils';
@@ -58,7 +59,7 @@ describe('Uploading a pricing version the service has archived', function () {
   const pricingDocs = () => PricingMongoose.find({ _organizationId: organization.id, _serviceName: 'Vetclinic' }).lean();
   const yamlFileOf = async (version = '1_0') => {
     const pricing: any = await PricingMongoose.findOne({ _organizationId: organization.id, _serviceName: 'Vetclinic', version }).lean();
-    return path.resolve('public', `.${pricing.yamlPath}`);
+    return pricingYamlFile(pricing.yamlPath)!;
   };
   const disable = () => request(app).delete(`${baseUrl}/services/Vetclinic`).set('x-api-key', orgKey);
   const upload = (file: string) => request(app).post(`${baseUrl}/services`).set('x-api-key', orgKey).attach('pricing', file);
@@ -105,6 +106,37 @@ describe('Uploading a pricing version the service has archived', function () {
 
   afterAll(async function () {
     await shutdownApp();
+  });
+
+  describe('conflicts preserve stored YAML bytes', function () {
+    it('rejects an orphaned pricing row before replacing its YAML', async function () {
+      const file = await yamlFileOf(); const bytes = fs.readFileSync(file);
+      await ServiceMongoose.updateOne({ organizationId: organization.id, name: 'Vetclinic' }, { $unset: { 'activePricings.1_0': '' } });
+      await container.resolve('cacheService').del(`service.${organization.id}.Vetclinic`);
+      const before = await service();
+      const response = await addVersion(changed1());
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(response.body.error).toContain('stored pricing');
+      expect(fs.readFileSync(file).equals(bytes)).toBe(true);
+      expect(await service()).toEqual(before);
+      expect(await pricingDocs()).toHaveLength(1);
+    });
+
+    it('does not replace an existing unreferenced file when importing a new version', async function () {
+      const sync = container.resolve('serviceService');
+      const file = pricingYamlFile(sync._buildPricingYamlRelativePath(organization.id!, 'Vetclinic', '2.0'))!;
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const bytes = Buffer.from('Existing bytes from an interrupted import'); fs.writeFileSync(file, bytes);
+      const before = await service();
+      try {
+        const response = await addVersion(vetclinicFile('2.0'));
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        expect(response.body.error).toContain('not replaced');
+        expect(fs.readFileSync(file).equals(bytes)).toBe(true);
+        expect(await service()).toEqual(before);
+        expect(await pricingDocs()).toHaveLength(1);
+      } finally { fs.rmSync(file, { force: true }); }
+    });
   });
 
   describe('enabling a disabled service again', function () {
@@ -238,6 +270,44 @@ describe('Uploading a pricing version the service has archived', function () {
       expect(response.status, JSON.stringify(response.body)).toBe(409);
       expect(await service()).toEqual(before);
       expect(await pricingDocs()).toHaveLength(2);
+      expect(fs.readFileSync(file).equals(bytes)).toBe(true);
+    });
+
+    it.each(['feature', 'add-on'])('does not ignore a legitimate %s named _id when comparing archived content', async function (kind) {
+      const file = await yamlFileOf();
+      const bytes = fs.readFileSync(file);
+      const before = await service();
+      const changed = vetclinicFile('1.0', pricing => {
+        if (kind === 'feature') {
+          pricing.features._id = {
+            valueType: 'BOOLEAN', defaultValue: true, type: 'DOMAIN',
+          };
+          pricing.plans.GOLD.features._id = false;
+        } else {
+          pricing.addOns._id = { ...pricing.addOns.extraPets, price: 7 };
+        }
+      });
+
+      const response = await addVersion(changed);
+
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(await service()).toEqual(before);
+      expect(await pricingDocs()).toHaveLength(2);
+      expect(fs.readFileSync(file).equals(bytes)).toBe(true);
+    });
+
+    it('distinguishes Infinity and NaN when comparing archived numeric content', async function () {
+      const infinite = vetclinicFile('3.0', pricing => { pricing.plans.GOLD.price = Infinity; });
+      expect((await addVersion(infinite)).status).toBe(201);
+      const archived = await request(app).put(`${baseUrl}/services/Vetclinic/pricings/3.0?availability=archived`)
+        .set('x-api-key', orgKey).send({ subscriptionPlan: 'GOLD', subscriptionAddOns: {} });
+      expect(archived.status, JSON.stringify(archived.body)).toBe(200);
+      const file = await yamlFileOf('3_0'); const bytes = fs.readFileSync(file); const before = await service();
+      const changed = vetclinicFile('3.0', pricing => { pricing.plans.GOLD.price = NaN; });
+      const response = await addVersion(changed);
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(await service()).toEqual(before);
+      expect(await pricingDocs()).toHaveLength(3);
       expect(fs.readFileSync(file).equals(bytes)).toBe(true);
     });
 

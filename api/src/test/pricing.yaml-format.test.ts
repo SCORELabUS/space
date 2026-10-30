@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { pricingYamlFile } from '../main/services/pricingFiles';
 import path from 'path';
 import { createHash } from 'crypto';
 import mongoose from 'mongoose';
@@ -126,7 +127,9 @@ describe('Pricing version as Pricing2Yaml (format=yaml)', function () {
       _organizationId: organization.id,
       version: version.replace(/\./g, '_'),
     }).lean();
-    return fs.readFileSync(path.resolve('public', `.${pricing.yamlPath}`));
+    const file = pricingYamlFile(pricing.yamlPath);
+    expect(file).toBeDefined();
+    return fs.readFileSync(file!);
   };
 
   describe('uploaded pricings', function () {
