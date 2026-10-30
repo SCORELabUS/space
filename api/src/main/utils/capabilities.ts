@@ -15,6 +15,7 @@ export const SPACE_CAPABILITIES: readonly string[] = Object.freeze([
   'reject-private',
   'pricing-yaml',
   'new-contracts-version',
+  'idempotency-key',
   'contract-pricings',
   'novation-preview',
   'token-subscription',

@@ -1,3 +1,4 @@
+import IdempotencyKey from '../../../repositories/mongoose/models/IdempotencyKeyMongoose';
 import UsageConsumption from '../../../repositories/mongoose/models/UsageConsumptionMongoose';
 import { ServiceRelocation, ServiceRelocationStep } from '../../../repositories/mongoose/models/ServiceRelocationMongoose';
 import { Seeder } from 'mongo-seeding';
@@ -33,6 +34,7 @@ export const seedDatabase = async () => {
       ServiceModel.syncIndexes(),
       ContractModel.syncIndexes(),
       UsageConsumption.syncIndexes(),
+      IdempotencyKey.syncIndexes(),
       PricingModel.syncIndexes(),
       UserModel.syncIndexes(),
       ServiceRelocation.syncIndexes(), ServiceRelocationStep.syncIndexes(),

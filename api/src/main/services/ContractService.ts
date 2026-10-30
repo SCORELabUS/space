@@ -1,3 +1,6 @@
+import { executeIdempotentAction } from './idempotentActions';
+import { currentIdempotencyExecution } from './idempotencyExecution';
+import { Types } from 'mongoose';
 import ServiceModel from '../repositories/mongoose/models/ServiceMongoose';
 import ContractModel from '../repositories/mongoose/models/ContractMongoose';
 import { assertNoPendingRelocation, relocationGlobalLease } from './serviceRelocationState';
@@ -196,6 +199,8 @@ class ContractService {
     for (const method of ['create', 'novate', 'novateByGroupId', 'renew', 'destroy', 'novateUserContact', 'novateBillingPeriod', 'novateBillingPeriodByGroupId', 'resetUsageLevels', '_revertExpectedConsumption', 'revertConsumption'] as const) {
       const original = (this[method] as (...args: any[]) => Promise<any>).bind(this);
       (this as any)[method] = async (...args: any[]) => {
+        const saved = currentIdempotencyExecution()?.record.plan;
+        if (saved && ['create', 'novate', 'novateByGroupId', 'resetUsageLevels'].includes(method)) return executeIdempotentAction(saved);
         let contract: any = null;
         if (method !== 'create') {
           // A userId or groupId is only unique within an organization: without
@@ -213,7 +218,11 @@ class ContractService {
           if (await ServiceModel.exists({ organizationId: org, source: 'sphere', 'sphere.status': 'applying' })) throw new Error('Synchronization is applying; retry shortly');
           if (contract) await this.cacheService.del(contractCacheKey(contract.organizationId, contract.userContact.userId));
           await assertOwned();
-          const result = await original(...args);
+          const execution = currentIdempotencyExecution();
+          const resumable = ['create', 'novate', 'novateByGroupId', 'resetUsageLevels'].includes(method);
+          const result = execution?.record.plan && resumable
+            ? await executeIdempotentAction(execution.record.plan)
+            : await original(...args);
           const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
           for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
           return result;
@@ -634,6 +643,10 @@ class ContractService {
       history: [],
     };
 
+    if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'create', organizationId: contractData.organizationId,
+      writes: [{ contractId: new Types.ObjectId().toString(), organizationId: contractData.organizationId,
+        userId: contractData.userContact.userId, create: contractDataToCreate }] });
+
     const contract = await this.contractRepository.create(contractDataToCreate);
 
     contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
@@ -688,9 +701,14 @@ class ContractService {
       rejectPrivate: options.rejectPrivate,
     });
 
+    const recoveryGuard = contractVersionGuard(contract);
     const newContract = performNovation(contract, subscription, {
       keepBillingPeriod: options.keepBillingPeriod,
     });
+
+    if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'novate', organizationId,
+      expected: expected !== undefined, writes: [{ contractId: contract.id!, organizationId, userId,
+        set: novationFields(newContract), guard: recoveryGuard }] });
 
     const result = await this.contractRepository.update(
       userId,
@@ -767,6 +785,7 @@ class ContractService {
       }
     }
 
+    if (!expected) for (const contract of contracts) guards.set(contract.userContact.userId, contractVersionGuard(contract));
     const updatedContracts: LeanContract[] = [];
 
     for (const contract of contracts) {
@@ -781,6 +800,10 @@ class ContractService {
       });
       updatedContracts.push(newContract);
     }
+
+    if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'group', organizationId,
+      expected: expected !== undefined, writes: updatedContracts.map(contract => ({ contractId: contract.id ?? String((contract as any)._id), organizationId,
+        userId: contract.userContact.userId, set: novationFields(contract), guard: guards.get(contract.userContact.userId) ?? {} })) });
 
     if (expected) {
       const rejected = await this.contractRepository.bulkUpdateGuarded(
@@ -983,6 +1006,9 @@ class ContractService {
     organizationId: string
   ): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
+    const recoveryGuard = contractVersionGuard(contract);
+    const periodGuard = Object.fromEntries(Object.entries(contract.usageLevels ?? {}).flatMap(([service, levels]) =>
+      Object.entries(levels).map(([limit, level]) => [`usageLevels.${service}.${limit}.resetTimeStamp`, level.resetTimeStamp == null ? null : new Date(level.resetTimeStamp)])));
     // Usage levels of dormant services are kept as they are: they cannot be
     // consumed, and resets leave them alone.
     const dormant = await this.serviceService.dormantServices(
@@ -1015,6 +1041,8 @@ class ContractService {
           }
         }
       }
+      if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'usage', organizationId,
+        writes: [{ contractId: contract.id!, organizationId, userId, increments, guard: { ...recoveryGuard, ...periodGuard } }] });
       if (
         Object.keys(increments).length > 0 &&
         !(await this.contractRepository.incrementUsageLevels(userId, increments, contract.organizationId))
@@ -1042,6 +1070,9 @@ class ContractService {
           };
         }
       }
+      if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'usage', organizationId,
+        writes: [{ contractId: contract.id!, organizationId, userId, guard: { ...recoveryGuard, ...periodGuard },
+          set: Object.fromEntries(Object.entries(reset).flatMap(([path, level]) => Object.entries(level).map(([field, value]) => [`usageLevels.${path}.${field}`, value]))) }] });
       if (!(await this.contractRepository.setUsageLevels(userId, contract.organizationId, reset))) {
         throw new Error(`Failed to update contract for userId ${userId}`);
       }
@@ -1097,7 +1128,7 @@ class ContractService {
     userId: string,
     expectedConsumptions: Record<string, number>,
     organizationId: string,
-    options: { limits?: Record<string, unknown>; contract?: LeanContract; featureId?: string } = {}
+    options: { limits?: Record<string, unknown>; contract?: LeanContract; featureId?: string; evaluation?: any } = {}
   ): Promise<ConsumptionOutcome> {
     if (!organizationId) {
       throw new Error(`An organization is required to consume the usage levels of userId ${userId}`);
@@ -1130,7 +1161,15 @@ class ContractService {
     const consumptionId = options.featureId ? randomUUID() : undefined;
     const createdAt = new Date(), expiresAt = new Date(createdAt.getTime() + consumptionRetentionSeconds() * 1000);
     const resetTimeStamps = Object.fromEntries(targets.map(({ serviceName, usageLimit }) =>
-      [`${serviceName}.${usageLimit}`, source.usageLevels?.[serviceName]?.[usageLimit]?.resetTimeStamp ?? null]));
+      [`${serviceName}.${usageLimit}`, source.usageLevels?.[serviceName]?.[usageLimit]?.resetTimeStamp == null ? null : new Date(source.usageLevels[serviceName][usageLimit].resetTimeStamp!)]));
+    if (currentIdempotencyExecution() && options.evaluation) return executeIdempotentAction({ kind: 'consume', organizationId,
+      evaluation: options.evaluation, increments,
+      consumption: { id: consumptionId, contractId: source.id, state: 'prepared', organizationId, userId,
+        featureId: normalizeFeatureId(options.featureId), createdAt, expiresAt, source,
+        levels: targets.map(({ serviceName, usageLimit, amount }) => ({ serviceName, usageLimit, amount,
+          resetTimeStamp: resetTimeStamps[`${serviceName}.${usageLimit}`] ? new Date(resetTimeStamps[`${serviceName}.${usageLimit}`]!) : null })) },
+      writes: [{ contractId: source.id!, organizationId, userId, increments, guard: contractVersionGuard(source),
+        consume: { id: consumptionId!, expiresAt, ceilings, resetTimeStamps } }] });
     if (consumptionId) {
       try {
         await this.usageConsumptionRepository.create({ id: consumptionId, contractId: source.id, state: 'prepared',
@@ -1370,6 +1409,16 @@ class ContractService {
    */
   private async _takeBackConsumption(consumption: UsageConsumption): Promise<ConsumptionRevertResult | null> {
     const { userId, organizationId } = consumption;
+    if (currentIdempotencyExecution()) {
+      const contract = await this.contractRepository.findByUserId(userId, organizationId);
+      if (!contract) throw new Error('Contract not found');
+      const { present, skipped, services } = this._resolveConsumption(consumption, contract);
+      return executeIdempotentAction({ kind: 'revert', organizationId, consumption,
+        writes: [{ contractId: consumption.contractId ?? contract.id!, organizationId, userId, refund: { id: consumption.id, expiresAt: consumption.expiresAt, services, absent: skipped.map(level => `${level.serviceName}.${level.usageLimit}`), levels: present.map(level => ({ path: `${level.serviceName}.${level.usageLimit}`, amount: level.amount, resetTimeStamp: level.resetTimeStamp })) } }],
+        result: skipped.length === 0 ? null : { consumptionId: consumption.id,
+          reverted: Object.fromEntries(present.map(({ serviceName, usageLimit, amount }) => [`${serviceName}-${usageLimit}`, amount])),
+          skipped: skipped.map(({ serviceName, usageLimit }) => `${serviceName}-${usageLimit}`) } });
+    }
     // Requested and completed are separate states. The receipt is persisted in
     // the SAME contract write as the subtraction, so interrupted acknowledgement
     // or cache invalidation can never make a retry subtract twice.

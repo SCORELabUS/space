@@ -124,6 +124,27 @@ describe('Atomic usage limits and revert by consumption', function () {
   });
 
   describe('the limit is enforced by the write', function () {
+    it('matches a renewable period received as an ISO string from a cached contract DTO', async function () {
+      expect((await createContract(keyA, userId)).status).toBe(201);
+      const repository = container.resolve('contractRepository');
+      const contract = await repository.findByUserId(userId, orgA.id!);
+      // Redis round-trips dates through JSON. Mongoose does not cast the
+      // nested Map<Map<usageLevel>> query path back to a BSON Date for us.
+      const cached = JSON.parse(JSON.stringify(contract));
+      const period = cached.usageLevels[service].calendarEventsCreationLimit.resetTimeStamp;
+      expect(period).toBeTypeOf('string');
+      const path = `${service}.calendarEventsCreationLimit`;
+      const updated = await repository.incrementUsageLevels(userId, { [path]: 1 }, orgA.id!, {
+        ceilings: { [path]: 15 },
+        receipt: { id: uuidv4(), expiresAt: new Date(Date.now() + 60000), contractId: cached.id,
+          resetTimeStamps: { [path]: period } },
+      });
+
+      expect(updated).not.toBeNull();
+      expect(updated!.usageLevels[service].calendarEventsCreationLimit.consumed).toBe(1);
+      expect(await consumed('calendarEventsCreationLimit')).toBe(1);
+    });
+
     it('N parallel consumptions against limit L never exceed L', async function () {
       expect((await createContract(keyA, userId)).status).toBe(201);
 
@@ -393,16 +414,70 @@ describe('Atomic usage limits and revert by consumption', function () {
 
     it('no longer loses consumptions that land while it runs', async function () {
       expect((await createContract(keyA, userId)).status).toBe(201);
-      await consume(calendar(), { [calendarLimit()]: 2 });
+      const initial = await consume(calendar(), { [calendarLimit()]: 2 });
+      const initialDiagnostic = JSON.stringify({ status: initial.status, body: initial.body });
+      expect(initial.status, initialDiagnostic).toBe(200);
+      expect(initial.body.eval, initialDiagnostic).toBe(true);
+      expect(initial.body.consumptionId, initialDiagnostic).toBeTypeOf('string');
 
-      const [reverted] = await Promise.all([
+      const [reverted, ...consumptions] = await Promise.all([
         revert(calendar(), '&latest=true'),
         ...Array.from({ length: 6 }, () => consume(calendar(), { [calendarLimit()]: 1 })),
       ]);
 
+      for (const [index, response] of consumptions.entries()) {
+        const diagnostic = JSON.stringify({ index, status: response.status, body: response.body });
+        expect(response.status, diagnostic).toBe(200);
+        expect(response.body.eval, diagnostic).toBe(true);
+        expect(response.body.consumptionId, diagnostic).toBeTypeOf('string');
+      }
       expect(reverted.status).toBe(204);
       // 2 + 6 consumed, and one operation reverted: either the first (2) or one of the others (1).
       expect([6, 7]).toContain(await consumed('calendarEventsCreationLimit'));
+    });
+
+    it('preserves all six consumptions completed after a legacy refund reads its contract', async function () {
+      expect((await createContract(keyA, userId)).status).toBe(201);
+      const initial = await consume(calendar(), { [calendarLimit()]: 2 });
+      const initialDiagnostic = JSON.stringify({ status: initial.status, body: initial.body });
+      expect(initial.status, initialDiagnostic).toBe(200);
+      expect(initial.body.eval, initialDiagnostic).toBe(true);
+      expect(initial.body.consumptionId, initialDiagnostic).toBeTypeOf('string');
+      expect(await consumed('calendarEventsCreationLimit')).toBe(2);
+
+      const repository: any = container.resolve('contractRepository');
+      const original = repository.decrementUsageLevels.bind(repository);
+      let entered!: () => void, release!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const decrement = vi.spyOn(repository, 'decrementUsageLevels').mockImplementationOnce(async (...args: any[]) => {
+        entered();
+        await gate;
+        return original(...args);
+      });
+      const pending = revert(calendar(), '&latest=true').then(response => response);
+      let refunded!: request.Response;
+      try {
+        await Promise.race([started, pending.then(response => {
+          throw new Error(`Refund finished before reaching the decrement barrier: ${JSON.stringify({ status: response.status, body: response.body })}`);
+        })]);
+        // The refund has selected the original consumption and read its contract.
+        // Every increment now lands before the subtraction itself is allowed to run.
+        const responses = await Promise.all(Array.from({ length: 6 }, () => consume(calendar(), { [calendarLimit()]: 1 })));
+        for (const [index, response] of responses.entries()) {
+          const diagnostic = JSON.stringify({ index, status: response.status, body: response.body });
+          expect(response.status, diagnostic).toBe(200);
+          expect(response.body.eval, diagnostic).toBe(true);
+          expect(response.body.consumptionId, diagnostic).toBeTypeOf('string');
+        }
+        expect(new Set(responses.map(response => response.body.consumptionId)).size).toBe(6);
+        expect(await consumed('calendarEventsCreationLimit')).toBe(8);
+      } finally {
+        release();
+        try { refunded = await pending; } finally { decrement.mockRestore(); }
+      }
+      expect(refunded.status, JSON.stringify(refunded.body)).toBe(204);
+      expect(await consumed('calendarEventsCreationLimit')).toBe(6);
     });
 
     it('reverts each consumption once, then does nothing', async function () {

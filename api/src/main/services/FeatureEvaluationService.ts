@@ -1,3 +1,5 @@
+import { executeIdempotentAction, consumptionEvaluation } from './idempotentActions';
+import { currentIdempotencyExecution } from './idempotencyExecution';
 import { isAfter } from 'date-fns';
 import { decodeJwt } from 'jose';
 import container from '../config/container';
@@ -200,6 +202,11 @@ class FeatureEvaluationService {
     reqOrg: any,
     options: SingleFeatureEvalQueryParams
   ): Promise<boolean | FeatureEvaluationResult | ConsumptionRevertResult> {
+    const prepared = currentIdempotencyExecution()?.record.plan;
+    if (prepared && ['consume', 'revert'].includes(prepared.kind)) {
+      const result = await executeIdempotentAction(prepared);
+      if (prepared.kind !== 'consume' || result.status !== 'changed') return prepared.kind === 'consume' ? consumptionEvaluation(prepared, result) : result ?? true;
+    }
     // Resolve the contract within the caller's organization before anything
     // cached under this userId is returned.
     const { organizationId } = await this.contractService.show(userId, reqOrg.id);
