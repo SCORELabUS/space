@@ -89,6 +89,7 @@ info:
     - `contract-version`: contracts carry `contractVersion` and an `ETag`; novations accept `If-Match` / `expectedContractVersion` and answer `412 CONTRACT_CHANGED`.
     - `keep-billing-period`: `keepBillingPeriod` on novations, and subscriptions validated strictly against the pricing (`400` with `errors`; archived versions rejected for new contracts and version changes).
     - `reject-private`: the opt-in `rejectPrivate` option (query or body) of contract creation and novations, which rejects private plans and add-ons.
+    - `pricing-yaml`: `GET .../pricings/{version}?format=yaml` returns the stored Pricing2Yaml file.
 
   contact:
     email: agarcia29@us.es
@@ -2103,6 +2104,8 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/PricingFormat'
+        - $ref: '#/components/parameters/IfNoneMatchPricingYaml'
         - name: organizationId
           in: path
           required: true
@@ -2119,20 +2122,20 @@ paths:
           schema:
             type: string
           example: "1.0.0"
-        - name: format
-          in: query
-          required: false
-          description: |
-            `json` (default): the pricing as JSON. `yaml`: the stored Pricing2Yaml
-            file of the version, byte for byte. This is the only way to read a
-            pricing file: SPACE does not serve them as static files.
-          schema:
-            type: string
-            enum: [json, yaml]
-            default: json
       responses:
         '200':
-          description: Pricing version details
+          description: |
+            Pricing details (JSON), or with `format=yaml` the stored Pricing2Yaml file of the version, byte for
+            byte.
+          headers:
+            ETag:
+              description: '`format=yaml` only: `"<sha256 hex of the body>"`.'
+              schema:
+                type: string
+            X-Pricing-Syntax-Version:
+              description: '`format=yaml` only: `syntaxVersion` of the file, exactly as written (an unquoted `3.0` is `3.0`). Exposed to browsers through CORS, like `ETag`.'
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -2140,14 +2143,41 @@ paths:
             application/yaml:
               schema:
                 type: string
-              description: "The stored Pricing2Yaml file (with `format=yaml`), sent with `Cache-Control: private, no-cache`."
-        '400':
-          description: Invalid `format`
+                description: Pricing2Yaml document
         '404':
           description: |
-            Pricing version not found, or (`format=yaml`) SPACE stores no
-            Pricing2Yaml file for it (`PRICING_YAML_UNAVAILABLE`: remote URL
-            pricings, SPHERE versions SPACE keeps no copy of).
+            Pricing not found. With `format=yaml`, `{"error": "PRICING_YAML_UNAVAILABLE"}` when the version exists
+            but its file cannot be provided (no stored copy and, for SPHERE-linked services, SPHERE no longer
+            lists the version).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: PRICING_YAML_UNAVAILABLE
+                  message:
+                    type: string
+        '502':
+          description: |
+            `format=yaml`, SPHERE-linked services only: `{"error": "SPHERE_UNAVAILABLE"}` when a historical
+            version had to be fetched from SPHERE and SPHERE could not be reached, failed, or returned content
+            that does not match its manifest. Temporary; retry later.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: SPHERE_UNAVAILABLE
+                  message:
+                    type: string
+        '304':
+          description: '`format=yaml` only: the file matches `If-None-Match`.'
+        '400':
+          description: Invalid `format` (use `json` or `yaml`).
 
     put:
       summary: Update pricing availability
@@ -2628,6 +2658,8 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - $ref: '#/components/parameters/PricingFormat'
+        - $ref: '#/components/parameters/IfNoneMatchPricingYaml'
         - name: serviceName
           in: path
           required: true
@@ -2638,20 +2670,20 @@ paths:
           required: true
           schema:
             type: string
-        - name: format
-          in: query
-          required: false
-          description: |
-            `json` (default): the pricing as JSON. `yaml`: the stored Pricing2Yaml
-            file of the version, byte for byte. This is the only way to read a
-            pricing file: SPACE does not serve them as static files.
-          schema:
-            type: string
-            enum: [json, yaml]
-            default: json
       responses:
         '200':
-          description: Pricing details
+          description: |
+            Pricing details (JSON), or with `format=yaml` the stored Pricing2Yaml file of the version, byte for
+            byte.
+          headers:
+            ETag:
+              description: '`format=yaml` only: `"<sha256 hex of the body>"`.'
+              schema:
+                type: string
+            X-Pricing-Syntax-Version:
+              description: '`format=yaml` only: `syntaxVersion` of the file, exactly as written (an unquoted `3.0` is `3.0`). Exposed to browsers through CORS, like `ETag`.'
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -2659,13 +2691,41 @@ paths:
             application/yaml:
               schema:
                 type: string
-              description: "The stored Pricing2Yaml file (with `format=yaml`), sent with `Cache-Control: private, no-cache`."
-        '400':
-          description: Invalid `format`
+                description: Pricing2Yaml document
         '404':
           description: |
-            Pricing not found, or (`format=yaml`) SPACE stores no Pricing2Yaml
-            file for it (`PRICING_YAML_UNAVAILABLE`).
+            Pricing not found. With `format=yaml`, `{"error": "PRICING_YAML_UNAVAILABLE"}` when the version exists
+            but its file cannot be provided (no stored copy and, for SPHERE-linked services, SPHERE no longer
+            lists the version).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: PRICING_YAML_UNAVAILABLE
+                  message:
+                    type: string
+        '502':
+          description: |
+            `format=yaml`, SPHERE-linked services only: `{"error": "SPHERE_UNAVAILABLE"}` when a historical
+            version had to be fetched from SPHERE and SPHERE could not be reached, failed, or returned content
+            that does not match its manifest. Temporary; retry later.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: SPHERE_UNAVAILABLE
+                  message:
+                    type: string
+        '304':
+          description: '`format=yaml` only: the file matches `If-None-Match`.'
+        '400':
+          description: Invalid `format` (use `json` or `yaml`).
 
     put:
       summary: Update pricing availability
@@ -5069,6 +5129,26 @@ components:
       schema:
         type: boolean
         default: false
+    PricingFormat:
+      name: format
+      in: query
+      required: false
+      description: |
+        `json` (default): the parsed pricing, as before. `yaml`: the stored Pricing2Yaml file of the version, byte for
+        byte (`Content-Type: application/yaml; charset=utf-8`), with `X-Pricing-Syntax-Version` and
+        `ETag: "<sha256 hex of the body>"`. For SPHERE-linked services, versions SPACE no longer keeps are fetched
+        from SPHERE and checked against its content hash.
+      schema:
+        type: string
+        enum: [json, yaml]
+        default: json
+    IfNoneMatchPricingYaml:
+      name: If-None-Match
+      in: header
+      required: false
+      description: '`format=yaml` only: answer `304` when the file still has this ETag.'
+      schema:
+        type: string
     KeepBillingPeriod:
       name: keepBillingPeriod
       in: query

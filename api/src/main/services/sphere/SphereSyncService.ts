@@ -14,6 +14,7 @@ import { SphereConfiguration, SphereManifest, SphereVersion, SyntaxUpgrade, isSp
 import { migrateSubscription, migrateUsage } from './migration';
 import { isSphereSnapshotYamlPath, pricingYamlFile, removePricingYaml, sphereSnapshotYamlPath } from '../pricingFiles';
 import { withOrganizationLock } from './lock';
+import { SphereVersionNotListedError } from './errors';
 
 export default class SphereSyncService {
   private client = new SphereClient();
@@ -61,14 +62,18 @@ export default class SphereSyncService {
     });
   }
   async historicalPricing(organizationId: string, name: string, version: string) {
+    return parsePricingToSpacePricingObject(retrievePricingFromText(await this.historicalPricingYaml(organizationId, name, version)));
+  }
+  /** The SPHERE source text of a version SPACE does not keep, checked against the manifest's content hash. */
+  async historicalPricingYaml(organizationId: string, name: string, version: string): Promise<string> {
     const service: any = await this.repository.service({ organizationId, name, source: 'sphere' });
-    if (!service) throw new Error('Historical pricing not found');
+    if (!service) throw new SphereVersionNotListedError('Historical pricing not found');
     const manifest = await this.client.manifest(service.sphere.pricingId);
     const remote = manifest.versions.find(v => v.version === resetEscapeVersion(version));
-    if (!remote) throw new Error('Historical version is no longer public in SPHERE');
+    if (!remote) throw new SphereVersionNotListedError('Historical version is no longer public in SPHERE');
     const text = await this.client.yaml(service.sphere.pricingId, remote.versionId);
     if (functionalHash(text) !== remote.contentHash) throw new Error('Historical version changed during retrieval');
-    return parsePricingToSpacePricingObject(retrievePricingFromText(text));
+    return text;
   }
   async get(organizationId: string, name: string) {
     const service: any = await this.repository.service({ organizationId, name });

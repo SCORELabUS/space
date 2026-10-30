@@ -16,6 +16,7 @@ const EXPECTED = [
   'contract-version',
   'keep-billing-period',
   'reject-private',
+  'pricing-yaml',
 ];
 
 const tokens = (response: request.Response) =>

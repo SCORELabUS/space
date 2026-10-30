@@ -23,13 +23,43 @@ import { escapeVersion } from '../utils/helpers';
 import { resetEscapeVersionInService } from '../utils/services/helpers';
 import CacheService from './CacheService';
 import OrganizationRepository from '../repositories/mongoose/OrganizationRepository';
+import yaml from 'js-yaml';
+import { SphereVersionNotListedError } from './sphere/errors';
 import { pricingYamlFile, readPricingYaml, uploadedPricingYamlPath } from './pricingFiles';
 
-/** A pricing version exists, but SPACE stores no Pricing2Yaml file for it. */
+/** A pricing version exists, but its Pricing2Yaml file cannot be provided. */
 export class PricingYamlUnavailableError extends Error {
   constructor(serviceName: string, pricingVersion: string) {
     super(`PRICING_YAML_UNAVAILABLE: The Pricing2Yaml file of version ${pricingVersion} of service ${serviceName} is not available`);
     this.name = 'PricingYamlUnavailableError';
+  }
+}
+
+/**
+ * SPHERE could not provide a version it should have (unreachable, failing, or
+ * content that does not match its manifest): a gateway failure, not a missing file.
+ */
+export class PricingYamlUpstreamError extends Error {
+  constructor(serviceName: string, pricingVersion: string, cause: unknown) {
+    super(`SPHERE_UNAVAILABLE: The Pricing2Yaml file of version ${pricingVersion} of service ${serviceName} could not be retrieved from SPHERE (${(cause as Error)?.message ?? cause})`);
+    this.name = 'PricingYamlUpstreamError';
+  }
+}
+
+/**
+ * `syntaxVersion` of a Pricing2Yaml document as written, without trusting the
+ * rest of it. Parsed with the failsafe schema, so every scalar stays the string
+ * of the file: an unquoted `3.0` is `3.0`, not the number 3.
+ */
+function readSyntaxVersion(body: Buffer): string | undefined {
+  try {
+    const document = yaml.load(body.toString('utf8'), { schema: yaml.FAILSAFE_SCHEMA }) as
+      | { syntaxVersion?: unknown }
+      | undefined;
+    const value = document?.syntaxVersion;
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -256,13 +286,19 @@ class ServiceService {
   }
 
   /**
-   * The stored Pricing2Yaml file of a pricing version, byte for byte, read from
-   * its `yamlPath` (outside public/, see pricingFiles.ts). Versions that exist
-   * but whose file SPACE does not store (remote URL pricings, SPHERE versions
-   * SPACE keeps no copy of, lost files) raise `PricingYamlUnavailableError`;
-   * unknown services and versions raise a `NOT FOUND` error.
+   * The stored Pricing2Yaml file of a pricing version, byte for byte.
+   *
+   * Uploaded versions and retained SPHERE snapshots are read from their
+   * `yamlPath`. Historical SPHERE versions, of which SPACE keeps no copy, are
+   * fetched from SPHERE and checked against the content hash of its manifest.
+   * Versions that exist but whose file is not available raise
+   * `PricingYamlUnavailableError`; unknown versions raise a `NOT FOUND` error.
    */
-  async showPricingYaml(serviceName: string, pricingVersion: string, organizationId: string): Promise<Buffer> {
+  async showPricingYaml(
+    serviceName: string,
+    pricingVersion: string,
+    organizationId: string
+  ): Promise<{ body: Buffer; syntaxVersion?: string }> {
     const cacheKey = `service.${organizationId}.${serviceName}`;
     let service = await this.cacheService.get(cacheKey);
 
@@ -279,23 +315,41 @@ class ServiceService {
       service.activePricings?.get(formattedPricingVersion) ??
       service.archivedPricings?.get(formattedPricingVersion);
 
-    if (!pricingLocator) {
-      if (service.source === 'sphere') {
-        throw new PricingYamlUnavailableError(serviceName, pricingVersion);
+    let body: Buffer | undefined;
+
+    if (pricingLocator?.id) {
+      const pricing = await this.showPricing(serviceName, pricingVersion, organizationId);
+      body = pricing?.yamlPath ? this._readStoredPricingYaml(pricing.yamlPath) : undefined;
+    } else if (pricingLocator?.url) {
+      body = pricingLocator.url.startsWith('public/')
+        ? this._readStoredPricingYaml(pricingLocator.url.slice('public'.length))
+        : undefined;
+    } else if (service.source === 'sphere') {
+      try {
+        const text: string = await container
+          .resolve('sphereSyncService')
+          .historicalPricingYaml(organizationId, service.name, pricingVersion);
+        body = Buffer.from(text, 'utf8');
+      } catch (error) {
+        // Not listed by SPHERE: unavailable (404). Anything else is SPHERE failing (502).
+        if (!(error instanceof SphereVersionNotListedError)) {
+          throw new PricingYamlUpstreamError(serviceName, pricingVersion, error);
+        }
       }
+    } else {
       throw new Error(`NOT FOUND: Pricing version ${pricingVersion} not found for service ${serviceName}`);
     }
-
-    const pricing = pricingLocator.id
-      ? await this.showPricing(serviceName, pricingVersion, organizationId)
-      : undefined;
-    const body = pricing?.yamlPath ? readPricingYaml(pricing.yamlPath) : undefined;
 
     if (!body) {
       throw new PricingYamlUnavailableError(serviceName, pricingVersion);
     }
 
-    return body;
+    return { body, syntaxVersion: readSyntaxVersion(body) };
+  }
+
+  /** Read an allowed private or legacy pricing path through the shared storage guard. */
+  _readStoredPricingYaml(storedPath: string): Buffer | undefined {
+    return readPricingYaml(storedPath);
   }
 
   async showPublicPricingUrl(serviceName: string, pricingVersion: string, organizationId: string) {
