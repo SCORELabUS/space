@@ -2122,17 +2122,6 @@ paths:
           schema:
             type: string
           example: "1.0.0"
-        - name: format
-          in: query
-          required: false
-          description: |
-            `json` (default): the pricing as JSON. `yaml`: the stored Pricing2Yaml
-            file of the version, byte for byte. This is the only way to read a
-            pricing file: SPACE does not serve them as static files.
-          schema:
-            type: string
-            enum: [json, yaml]
-            default: json
       responses:
         '200':
           description: |
@@ -2681,17 +2670,6 @@ paths:
           required: true
           schema:
             type: string
-        - name: format
-          in: query
-          required: false
-          description: |
-            `json` (default): the pricing as JSON. `yaml`: the stored Pricing2Yaml
-            file of the version, byte for byte. This is the only way to read a
-            pricing file: SPACE does not serve them as static files.
-          schema:
-            type: string
-            enum: [json, yaml]
-            default: json
       responses:
         '200':
           description: |
