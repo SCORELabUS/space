@@ -1,5 +1,6 @@
 import ServiceModel from '../repositories/mongoose/models/ServiceMongoose';
 import ContractModel from '../repositories/mongoose/models/ContractMongoose';
+import { assertNoPendingRelocation, relocationGlobalLease } from './serviceRelocationState';
 import { withOrganizationLock } from './sphere/lock';
 import { enforceSpherePolicy } from './sphere/contractPolicy';
 import container from '../config/container';
@@ -21,7 +22,7 @@ import {
   collectSubscriptionErrors,
   validateSubscription,
 } from '../controllers/validation/ContractValidation';
-import { performNovation } from '../utils/contracts/novation';
+import { novationFields, performNovation } from '../utils/contracts/novation';
 import CacheService from './CacheService';
 import type EventService from './EventService';
 import {
@@ -189,10 +190,10 @@ class ContractService {
     // that address a contract by userId (see `_findContract`).
     const scopeArgument: Record<string, number> = {
       novate: 2, renew: 1, destroy: 1, novateUserContact: 2, novateBillingPeriod: 2,
-      resetUsageLevels: 3, _revertExpectedConsumption: 3,
+      resetUsageLevels: 3, _revertExpectedConsumption: 3, revertConsumption: 3,
     };
     // Serialize binding mutations with synchronization. Consumption uses conditional atomic writes separately.
-    for (const method of ['create', 'novate', 'novateByGroupId', 'renew', 'destroy', 'novateUserContact', 'novateBillingPeriod', 'novateBillingPeriodByGroupId', 'resetUsageLevels', '_revertExpectedConsumption'] as const) {
+    for (const method of ['create', 'novate', 'novateByGroupId', 'renew', 'destroy', 'novateUserContact', 'novateBillingPeriod', 'novateBillingPeriodByGroupId', 'resetUsageLevels', '_revertExpectedConsumption', 'revertConsumption'] as const) {
       const original = (this[method] as (...args: any[]) => Promise<any>).bind(this);
       (this as any)[method] = async (...args: any[]) => {
         let contract: any = null;
@@ -206,8 +207,9 @@ class ContractService {
           }
         }
         const org = method === 'create' ? args[0]?.organizationId : method.endsWith('ByGroupId') ? args[1] : contract?.organizationId;
-        if (!org || !await ServiceModel.exists({ organizationId: org, source: 'sphere' })) return original(...args);
+        if (!org) return original(...args);
         return withOrganizationLock(org, async assertOwned => {
+          await assertNoPendingRelocation(org);
           if (await ServiceModel.exists({ organizationId: org, source: 'sphere', 'sphere.status': 'applying' })) throw new Error('Synchronization is applying; retry shortly');
           if (contract) await this.cacheService.del(contractCacheKey(contract.organizationId, contract.userContact.userId));
           await assertOwned();
@@ -215,9 +217,14 @@ class ContractService {
           const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
           for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
           return result;
-        });
+        }, 2000);
       };
     }
+    const prune = this.prune.bind(this);
+    this.prune = async (organizationId?: string) => withOrganizationLock(organizationId ?? relocationGlobalLease, async () => {
+      await assertNoPendingRelocation(organizationId);
+      return prune(organizationId);
+    }, 2000);
 
   }
 
@@ -645,9 +652,9 @@ class ContractService {
    *        what the version covers (subscription, billing period, histories),
    *        so a novation that lands between the read and the write is not
    *        overwritten. A mismatch throws `ContractChangedError` and writes
-   *        nothing. Usage levels are not part of the version: the write still
-   *        sets the whole contract as read, so consumption recorded in that
-   *        window (`$inc`) can be lost, with or without a precondition.
+   *        nothing. Usage levels are not part of the version; the write only
+   *        sets novation fields, preserving concurrent consumption and contact
+   *        changes with or without a precondition.
    */
   async novate(
     userId: string,
@@ -687,7 +694,7 @@ class ContractService {
 
     const result = await this.contractRepository.update(
       userId,
-      newContract,
+      novationFields(newContract),
       contract.organizationId,
       guard
     );
@@ -707,8 +714,10 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
+    // A consumption may have landed after this write returned. Do not cache
+    // its earlier snapshot over the newer state.
+    await this.cacheService.del(contractCacheKey(organizationId, userId));
+    await this.cacheService.del(featuresCachePattern(organizationId, userId));
     this._events()?.emitContractEvent('CONTRACT_NOVATED', result);
 
     return result;
@@ -804,9 +813,19 @@ class ContractService {
         throw new ContractChangedError(changed, novated);
       }
     } else {
-      const result = await this.contractRepository.bulkUpdate(updatedContracts);
-
-      if (!result) {
+      const rejected = await this.contractRepository.bulkUpdateGuarded(
+        updatedContracts.map(contract => ({ contract, guard: {} }))
+      );
+      if (rejected.length > 0) {
+        for (const contract of updatedContracts) {
+          await this.cacheService.delMany(contractCacheKeys(contract));
+        }
+        for (const contract of updatedContracts) {
+          const userId = contract.userContact.userId;
+          if (rejected.includes(userId)) continue;
+          const written = await this.contractRepository.findByUserId(userId, organizationId);
+          if (written) this._events()?.emitContractEvent('CONTRACT_NOVATED', written);
+        }
         throw new Error(`Failed to update contracts for groupId ${groupId} within organization ${organizationId}`);
       }
     }
@@ -815,8 +834,8 @@ class ContractService {
 
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
-      this.cacheService.set(contractCacheKey(contract.organizationId, contract.userContact.userId), contract, 3600, true); // Cache for 1 hour
-      this.cacheService.del(featuresCachePattern(contract.organizationId, contract.userContact.userId));
+      await this.cacheService.del(contractCacheKey(contract.organizationId, contract.userContact.userId));
+      await this.cacheService.del(featuresCachePattern(contract.organizationId, contract.userContact.userId));
       this._events()?.emitContractEvent('CONTRACT_NOVATED', contract);
     }
 
@@ -1111,6 +1130,7 @@ class ContractService {
       try {
         await this.usageConsumptionRepository.create({
           id: consumptionId,
+          contractId: updatedContract.id,
           organizationId,
           userId,
           featureId: normalizeFeatureId(options.featureId),
@@ -1132,8 +1152,8 @@ class ContractService {
       }
     }
 
-    await this.cacheService.set(contractCacheKey(organizationId, userId), updatedContract, 3600, true); // Cache for 1 hour
-
+    // Invalidate rather than restore a snapshot that a concurrent novation replaced.
+    await this.cacheService.del(contractCacheKey(organizationId, userId));
     return { status: 'applied', contract: updatedContract, consumptionId };
   }
 
@@ -1223,7 +1243,7 @@ class ContractService {
 
     // Refused before it is claimed, so that it is never seen as reverted.
     const existing = await this.usageConsumptionRepository.find(consumptionId, scope);
-    if (existing && !existing.revertedAt) {
+    if (existing && !existing.revertedAt && !await this.contractRepository.hasUsageRevert(userId, organizationId, existing.id, existing.contractId)) {
       const stored = await this.contractRepository.findByUserId(userId, organizationId);
       if (stored) this._resolveConsumption(existing, stored);
     }
@@ -1342,45 +1362,33 @@ class ContractService {
    */
   private async _takeBackConsumption(consumption: UsageConsumption): Promise<ConsumptionRevertResult | null> {
     const { userId, organizationId } = consumption;
-    try {
-      // The levels of the contract's services, in one update; a level whose
-      // service is gone refuses the revert (and gives the claim back), one
-      // that its service no longer has is skipped. The update requires what
-      // was decided to still hold (the services, the levels present and the
-      // skipped ones absent); if that changes in between, look again.
-      for (let attempt = 0; attempt < 3; attempt++) {
+    // Requested and completed are separate states. The receipt is persisted in
+    // the SAME contract write as the subtraction, so interrupted acknowledgement
+    // or cache invalidation can never make a retry subtract twice.
+    if (!await this.contractRepository.hasUsageRevert(userId, organizationId, consumption.id, consumption.contractId)) {
+      let done = false;
+      for (let attempt = 0; attempt < 3 && !done; attempt++) {
         const contract = await this.contractRepository.findByUserId(userId, organizationId);
-        if (!contract) {
-          throw new Error(`Contract with userId ${userId} not found`);
-        }
+        if (!contract || (consumption.contractId && contract.id !== consumption.contractId)) throw new Error(`Consumption ${consumption.id} not found for this contract`);
         const { present, skipped, services } = this._resolveConsumption(consumption, contract);
-        const levels = present.map(({ serviceName, usageLimit, amount, resetTimeStamp }) => ({
-          path: `${serviceName}.${usageLimit}`,
-          amount,
-          resetTimeStamp: resetTimeStamp ? new Date(resetTimeStamp) : null,
-        }));
-
-        const applied = await this.contractRepository.decrementUsageLevels(userId, organizationId, levels, {
-          services,
-          absent: skipped.map(({ serviceName, usageLimit }) => `${serviceName}.${usageLimit}`),
-        });
-        if (applied) {
+        done = await this.contractRepository.decrementUsageLevels(userId, organizationId,
+          present.map(({ serviceName, usageLimit, amount, resetTimeStamp }) => ({ path: `${serviceName}.${usageLimit}`, amount, resetTimeStamp: resetTimeStamp ? new Date(resetTimeStamp) : null })),
+          { services, absent: skipped.map(({ serviceName, usageLimit }) => `${serviceName}.${usageLimit}`),
+            receipt: { id: consumption.id, expiresAt: consumption.expiresAt, contractId: consumption.contractId } });
+        if (done) {
+          await this.usageConsumptionRepository.complete(consumption.id);
           await this.cacheService.del(contractCacheKey(organizationId, userId));
-          if (skipped.length === 0) return null;
-          return {
-            consumptionId: consumption.id,
+          return skipped.length === 0 ? null : { consumptionId: consumption.id,
             reverted: Object.fromEntries(present.map(({ serviceName, usageLimit, amount }) => [`${serviceName}-${usageLimit}`, amount])),
-            skipped: skipped.map(({ serviceName, usageLimit }) => `${serviceName}-${usageLimit}`),
-          };
+            skipped: skipped.map(({ serviceName, usageLimit }) => `${serviceName}-${usageLimit}`) };
         }
+        done = await this.contractRepository.hasUsageRevert(userId, organizationId, consumption.id, consumption.contractId);
       }
-      throw new Error(`Failed to revert consumption ${consumption.id} for userId ${userId}`);
-    } catch (error) {
-      if (!String((error as Error)?.message).includes('not found')) {
-        await this.usageConsumptionRepository.release(consumption.id);
-      }
-      throw error;
+      if (!done) throw new Error(`Failed to revert consumption ${consumption.id} for userId ${userId}`);
     }
+    await this.usageConsumptionRepository.complete(consumption.id);
+    await this.cacheService.del(contractCacheKey(organizationId, userId));
+    return null;
   }
 
   async prune(organizationId?: string, reqUser?: LeanUser): Promise<number> {

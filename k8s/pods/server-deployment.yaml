@@ -44,7 +44,7 @@ spec:
         volumeMounts:
           - mountPath: /usr/src/server/public
             name: space-statics
-          # Files that must not be served without authorisation (private SPHERE snapshots).
+          # Files that must not be served without authorisation (pricing files, SPACE_PRIVATE_FILES_DIR).
           - mountPath: /usr/src/server/private
             name: space-private
       restartPolicy: Always

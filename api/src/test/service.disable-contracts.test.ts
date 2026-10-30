@@ -286,6 +286,76 @@ describe('Disabled and deleted services in contracts', function () {
       expect(featuresOf((await tokenPayload()).features, B)).toEqual([]);
     });
 
+    it('rejects an active token cached after a concurrent disable invalidated the cache', async function () {
+      const cache = container.resolve('cacheService');
+      const original = cache.set.bind(cache);
+      const tokenKey = featuresCacheKey(organization.id!, userId, 'pricingToken');
+      let interleaved = false;
+      vi.spyOn(cache, 'set').mockImplementation(async (...args: Parameters<typeof cache.set>) => {
+        if (!interleaved && args[0] === tokenKey) {
+          interleaved = true;
+          expect((await disable()).status).toBe(204);
+        }
+        return original(...args);
+      });
+
+      // This request evaluated before the disable, but stores its token after it.
+      const inFlight = await tokenPayload();
+      expect(interleaved).toBe(true);
+      expect(featuresOf(inFlight.features, B).length).toBeGreaterThan(0);
+      const next = await tokenPayload();
+      expect(next.dormantServices).toEqual([B]);
+      expect(featuresOf(next.features, B)).toEqual([]);
+    });
+
+    it('rejects a dormant token cached after a concurrent reactivation invalidated the cache', async function () {
+      expect((await disable()).status).toBe(204);
+      const cache = container.resolve('cacheService');
+      const original = cache.set.bind(cache);
+      const tokenKey = featuresCacheKey(organization.id!, userId, 'pricingToken');
+      let interleaved = false;
+      vi.spyOn(cache, 'set').mockImplementation(async (...args: Parameters<typeof cache.set>) => {
+        if (!interleaved && args[0] === tokenKey) {
+          interleaved = true;
+          const enabled = await reenable();
+          expect(enabled.status, JSON.stringify(enabled.body)).toBe(201);
+        }
+        return original(...args);
+      });
+
+      const inFlight = await tokenPayload();
+      expect(interleaved).toBe(true);
+      expect(inFlight.dormantServices).toEqual([B]);
+      const next = await tokenPayload();
+      expect(next.dormantServices).toBeUndefined();
+      expect(featuresOf(next.features, B).length).toBeGreaterThan(0);
+    });
+
+    it('does not reuse an active feature evaluation cached after a concurrent disable', async function () {
+      const cache = container.resolve('cacheService');
+      const original = cache.set.bind(cache);
+      const featureId = `${B}-vetSelection`;
+      const evaluationKey = featuresCacheKey(organization.id!, userId, `eval.${featureId}`);
+      let interleaved = false;
+      vi.spyOn(cache, 'set').mockImplementation(async (...args: Parameters<typeof cache.set>) => {
+        if (!interleaved && args[0] === evaluationKey) {
+          interleaved = true;
+          expect((await disable()).status).toBe(204);
+        }
+        return original(...args);
+      });
+      const evaluator = container.resolve('featureEvaluationService');
+      const before = await stored();
+      // Omitted expected consumption exercises the service's cached read path.
+      const inFlight: any = await evaluator.evalFeature(userId, featureId, undefined as any, organization, { server: false });
+      expect(interleaved).toBe(true);
+      expect(inFlight.eval).toBe(true);
+      const next: any = await evaluator.evalFeature(userId, featureId, undefined as any, organization, { server: false });
+      expect(next.eval).toBe(false);
+      expect(next.error.code).toBe('SERVICE_DISABLED');
+      expect((await stored()).usageLevels[B]).toEqual(before.usageLevels[B]);
+    });
+
     it('marks the disabled service in the pricings of the contract', async function () {
       await disable();
 

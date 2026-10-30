@@ -1,11 +1,14 @@
-import { withOrganizationLock } from './sphere/lock';
+import { randomUUID, createHash } from 'node:crypto';
+import ServiceRelocationRepository from '../repositories/mongoose/ServiceRelocationRepository';
+import { assertNoPendingRelocation, relocationGlobalLease } from './serviceRelocationState';
+import { withOrganizationLocks, withOrganizationLock } from './sphere/lock';
 import ServiceModel from '../repositories/mongoose/models/ServiceMongoose';
 import PricingModel from '../repositories/mongoose/models/PricingMongoose';
-import { createHash } from 'node:crypto';
 import { retrievePricingFromPath, retrievePricingFromText } from 'pricing4ts/server';
 import container from '../config/container';
 import ServiceRepository, { exactName, ServiceQueryFilters } from '../repositories/mongoose/ServiceRepository';
 import { parsePricingToSpacePricingObject } from '../utils/pricing-yaml2json';
+import { proxyAgentFor } from '../utils/proxy';
 import { Pricing } from 'pricing4ts';
 import fetch from 'node-fetch';
 import https from 'https';
@@ -26,8 +29,8 @@ import CacheService from './CacheService';
 import OrganizationRepository from '../repositories/mongoose/OrganizationRepository';
 import yaml from 'js-yaml';
 import { SphereVersionNotListedError } from './sphere/errors';
-import { isPrivateSnapshotPath, PUBLIC_SNAPSHOT_PREFIX, storedYamlFile } from './sphere/snapshots';
 import { contractCacheKeys } from '../utils/contracts/cacheKeys';
+import { LEGACY_PRICINGS_PREFIX, PRIVATE_PRICINGS_PREFIX, pricingYamlFile, privateYamlPathFor, readPricingYaml, removePricingYaml, uploadedPricingYamlPath } from './pricingFiles';
 
 /** A pricing version exists, but its Pricing2Yaml file cannot be provided. */
 export class PricingYamlUnavailableError extends Error {
@@ -140,25 +143,24 @@ const PRICING_CONTENT_FIELDS = ['version', 'currency', 'createdAt', 'features', 
 /**
  * Hash of the content of a pricing as SPACE stores and serves it: the fields
  * of `PRICING_CONTENT_FIELDS`, normalized by the pricing schema (so an upload
- * and a stored document get the same defaults and casts), with keys sorted and
- * document ids left out. Two uploads of the same pricing written differently
- * (layout, comments, key order) have the same hash.
+ * and a stored document get the same defaults and casts), with keys sorted.
+ * Only the explicit root content fields participate; nested map keys are
+ * retained. Layout, comments and key order do not affect the hash.
  */
 export function pricingContentHash(pricing: any): string {
   const picked = Object.fromEntries(PRICING_CONTENT_FIELDS.map(field => [field, pricing?.[field]]));
   const normalized: any = new PricingModel(picked).toJSON({ flattenMaps: true });
   const canonical = (value: any): any => {
-    if (value instanceof Date) return value.toISOString();
-    if (Array.isArray(value)) return value.map(canonical);
+    if (value instanceof Date) return ['date', value.toISOString()];
+    if (Array.isArray(value)) return ['array', value.map(canonical)];
     if (value && typeof value === 'object') {
-      return Object.fromEntries(
-        Object.keys(value)
-          .filter(key => key !== '_id' && key !== 'id' && value[key] !== undefined)
-          .sort()
-          .map(key => [key, canonical(value[key])])
-      );
+      // Type tags keep numeric sentinels distinct from real string/map content.
+      return ['object', Object.keys(value).filter(key => value[key] !== undefined).sort()
+        .map(key => [key, canonical(value[key])])];
     }
-    return value;
+    if (value === null) return ['null'];
+    if (typeof value === 'number') return ['number', String(value)];
+    return [typeof value, value];
   };
   const material = canonical(Object.fromEntries(PRICING_CONTENT_FIELDS.map(field => [field, normalized[field]])));
   return createHash('sha256').update(JSON.stringify(material)).digest('hex');
@@ -233,8 +235,21 @@ class ServiceService {
         return original(...args);
       };
     }
+    // Binding and service mutations share relocation leases, including manual services.
+    for (const method of ['create', 'addPricingToService', 'updatePricingAvailability', 'destroyPricing', 'disable', 'destroy', 'prune'] as const) {
+      const original = (this[method] as (...args: any[]) => Promise<any>).bind(this);
+      (this as any)[method] = (...args: any[]) => {
+        const organizationId = args[args.length - 1];
+        return withOrganizationLock(organizationId ?? relocationGlobalLease, async () => {
+          await assertNoPendingRelocation(organizationId);
+          return original(...args);
+        }, 2000);
+      };
+    }
 
   }
+
+  private get relocations(): ServiceRelocationRepository { return container.resolve('serviceRelocationRepository'); }
 
   async index(queryParams: ServiceQueryFilters, organizationId?: string) {
     const services = await this.serviceRepository.findAll(organizationId, queryParams);
@@ -260,7 +275,8 @@ class ServiceService {
     let service = await this.cacheService.get(cacheKey);
 
     if (!service) {
-      service = await this.serviceRepository.findByName(serviceName, organizationId);
+      service = await this.serviceRepository.findByName(serviceName, organizationId)
+        ?? await this.serviceRepository.findByName(serviceName, organizationId, true);
       await this.cacheService.set(cacheKey, service, 3600, true);
     }
 
@@ -536,31 +552,14 @@ class ServiceService {
     return { body, syntaxVersion: readSyntaxVersion(body) };
   }
 
-  /**
-   * Read a stored Pricing2Yaml file by its `yamlPath`, or undefined: files under
-   * `public/static/pricings`, and private SPHERE snapshots, which are stored
-   * outside `public/` (see sphere/snapshots.ts).
-   */
-  _readStoredPricingYaml(publicPath: string): Buffer | undefined {
-    const file = storedYamlFile(publicPath);
-    if (!file) {
-      return undefined;
-    }
-    try {
-      return fs.readFileSync(file);
-    } catch {
-      return undefined;
-    }
+  /** Read an allowed private or legacy pricing path through the shared storage guard. */
+  _readStoredPricingYaml(storedPath: string): Buffer | undefined {
+    return readPricingYaml(storedPath);
   }
 
   async showPublicPricingUrl(serviceName: string, pricingVersion: string, organizationId: string) {
     const pricing = await this.showPricing(serviceName, pricingVersion, organizationId);
 
-    if (isPrivateSnapshotPath(pricing?.yamlPath)) {
-      throw new Error(
-        `NOT FOUND: Pricing version ${pricingVersion} of service ${serviceName} is private and has no public URL; read it with GET .../pricings/${pricingVersion}?format=yaml`
-      );
-    }
 
     if (pricing?.yamlPath) {
       return pricing.yamlPath;
@@ -612,6 +611,9 @@ class ServiceService {
     // Step 1: Parse and validate pricing
 
     const uploadedPricing: Pricing = await this._getPricingFromPath(pricingFile.path);
+    if (!serviceName && (await this.serviceRepository.findByName(uploadedPricing.saasName, organizationId, true))?.source === 'sphere') {
+      throw new Error('Invalid operation: reactivate this linked service through SPHERE synchronization');
+    }
     const formattedPricingVersion = escapeVersion(uploadedPricing.version);
     // Step 1.1: Load the service if already exists
     if (serviceName) {
@@ -678,6 +680,7 @@ class ServiceService {
       if (existingEnabled) {
         throw new Error(`Invalid request: Service ${uploadedPricing.saasName} already exists`);
       }
+      if (existingDisabled?.source === 'sphere') throw new Error('Invalid operation: reactivate this linked service through SPHERE synchronization');
     }
 
     const reactivated = await this._reactivateArchivedVersion(
@@ -691,8 +694,7 @@ class ServiceService {
       service = reactivated;
     } else if (!service) {
       // Step 3: Create the service as it does not exist and add the pricing
-      this._savePricingYamlFile(pricingFile.path, organizationId, uploadedPricing.saasName, uploadedPricing.version);
-      const savedPricing = await this._createPricing(pricingData);
+      const savedPricing = await this._createUploadedPricing(pricingData, pricingFile.path, uploadedPricing.saasName, uploadedPricing.version);
 
       if (existingDisabled) {
         // Versions of the disabled service stay archived: contracts may still use them.
@@ -747,8 +749,7 @@ class ServiceService {
     } else {
       // service exists (serviceName provided) and does not have this version:
       // add it to its active pricings.
-      this._savePricingYamlFile(pricingFile.path, organizationId, uploadedPricing.saasName, uploadedPricing.version);
-      const savedPricing = await this._createPricing(pricingData);
+      const savedPricing = await this._createUploadedPricing(pricingData, pricingFile.path, uploadedPricing.saasName, uploadedPricing.version);
 
       const updatedService = await this.serviceRepository.update(
         service.name,
@@ -779,6 +780,18 @@ class ServiceService {
 
     // Step 5: Return the saved service
     return service;
+  }
+
+  private async _createUploadedPricing(data: any, sourcePath: string, serviceName: string, version: string): Promise<LeanPricing> {
+    const saved = await this._createPricing(data);
+    try {
+      this._savePricingYamlFile(sourcePath, data._organizationId, serviceName, version, true);
+    } catch (error) {
+      // Only this request's new row is rolled back. Existing files are never replaced.
+      await this.pricingRepository.destroy(String(saved.id));
+      throw error;
+    }
+    return saved;
   }
 
   /**
@@ -890,6 +903,7 @@ class ServiceService {
       if (existingEnabled) {
         throw new Error(`Invalid request: Service ${uploadedPricing.saasName} already exists`);
       }
+      if (existingDisabled?.source === 'sphere') throw new Error('Invalid operation: reactivate this linked service through SPHERE synchronization');
 
       if (existingDisabled) {
         const reactivated = await this._reactivateArchivedVersion(
@@ -1017,6 +1031,35 @@ class ServiceService {
    * service is written.
    */
   async update(serviceName: string, newServiceData: any, organizationId: string) {
+    if (!newServiceData || typeof newServiceData !== 'object' || Array.isArray(newServiceData)) throw new Error('INVALID DATA: service update must be an object');
+    const request: Record<string, any> = {};
+    for (const field of ['name', 'organizationId', 'defaultVersion']) {
+      if (newServiceData[field] === undefined) continue;
+      if (field === 'defaultVersion' && newServiceData[field] === null) { request[field] = null; continue; }
+      if (typeof newServiceData[field] !== 'string' || newServiceData[field].length === 0) throw new Error(`INVALID DATA: ${field} must be a nonempty string`);
+      request[field] = newServiceData[field];
+    }
+    const targetOrganizationId = request.organizationId ?? organizationId;
+    return withOrganizationLocks([relocationGlobalLease, organizationId, targetOrganizationId], async assertOwned => {
+      const pending = await this.relocations.pendingForIdentity(organizationId, serviceName);
+      if (pending) {
+        // A destination-only caller may not resume a move that also mutates its source.
+        // Exact request matching keeps the destination visible to the authorization middleware.
+        if (pending.sourceOrganizationId !== organizationId || pending.sourceName.toLowerCase() !== serviceName.toLowerCase() ||
+            JSON.stringify(pending.request) !== JSON.stringify(request)) {
+          throw new Error('CONFLICT: Service relocation pending; retry the original update from its original organization and name');
+        }
+        await assertNoPendingRelocation(organizationId, pending._id);
+        await assertNoPendingRelocation(targetOrganizationId, pending._id);
+        return this._continueRelocation(pending, assertOwned);
+      }
+      await assertNoPendingRelocation(organizationId);
+      await assertNoPendingRelocation(targetOrganizationId);
+      return this._updateService(serviceName, request, organizationId, assertOwned);
+    });
+  }
+
+  private async _updateService(serviceName: string, newServiceData: any, organizationId: string, assertOwned: () => Promise<void>) {
     const cacheKey = `service.${organizationId}.${serviceName}`;
     const dataToUpdate: any = {};
 
@@ -1029,6 +1072,10 @@ class ServiceService {
 
     if (newServiceData.name && newServiceData.name !== service.name) {
       dataToUpdate.name = newServiceData.name;
+    }
+
+    if (service.source === 'sphere' && 'defaultVersion' in newServiceData) {
+      throw new Error('INVALID DATA: the version for new contracts of a SPHERE-linked service is decided by its synchronization policy');
     }
 
     if (newServiceData.defaultVersion === null) {
@@ -1071,13 +1118,16 @@ class ServiceService {
       await this._assertServiceNameFree(finalName, finalOrganizationId, service);
     }
 
-    if (change.name || change.organizationId) {
-      // Checks every contract (409) before anything is written.
-      const plan = await this._planServiceInContracts(service.name, organizationId, change);
-      await this.pricingRepository.reassignToService(pricingIdsOf(service), finalName, finalOrganizationId);
-      await this._renameOrMoveServiceInContracts(plan);
-    } else if (relocated) {
-      await this.pricingRepository.reassignToService(pricingIdsOf(service), finalName, finalOrganizationId);
+    if (relocated) {
+      if (change.name || change.organizationId) await this._planServiceInContracts(service.name, organizationId, change);
+      await assertOwned();
+      const operation = await this.relocations.create({
+        _id: randomUUID(), serviceId: service.id,
+        sourceOrganizationId: organizationId, sourceName: service.name,
+        targetOrganizationId: finalOrganizationId, targetName: finalName,
+        request: newServiceData, pricingIds: pricingIdsOf(service), state: 'pending', stage: 'prepared',
+      });
+      return this._continueRelocation(operation, assertOwned);
     }
 
     const updatedService = await this.serviceRepository.update(
@@ -1090,20 +1140,114 @@ class ServiceService {
       throw new Error(`NOT FOUND: Service with name ${serviceName}`);
     }
 
-    if (relocated) {
-      await this.cacheService.delMany([cacheKey, `service.${organizationId}.${service.name}`]);
-    }
-
-    if (change.name || change.organizationId) {
-      // Contracts created with the old name while the contracts were written.
-      await this._renameOrMoveServiceInContracts(
-        await this._planServiceInContracts(service.name, organizationId, change)
-      );
-    }
-
     await this.cacheService.set(`service.${finalOrganizationId}.${finalName}`, updatedService, 3600, true);
 
     return updatedService;
+  }
+
+  private async _continueRelocation(operation: any, assertOwned: () => Promise<void>): Promise<any> {
+    const fromOrg = operation.sourceOrganizationId, toOrg = operation.targetOrganizationId;
+    const from = operation.sourceName, to = operation.targetName;
+    const change = {
+      ...(from.toLowerCase() !== to.toLowerCase() ? { name: to } : {}),
+      ...(fromOrg !== toOrg ? { organizationId: toOrg } : {}),
+    };
+    try {
+      const stored = await ServiceModel.findById(operation.serviceId);
+      if (!stored) throw new Error('CONFLICT: Relocating service no longer exists');
+      const current: any = stored.toObject();
+      if (![fromOrg, toOrg].includes(current.organizationId) || ![from.toLowerCase(), to.toLowerCase()].includes(current.name.toLowerCase())) {
+        throw new Error('CONFLICT: Relocating service identity changed outside this operation');
+      }
+      await this._assertServiceNameFree(to, toOrg, current);
+      // Only contracts not yet written are in the source scan; existing journal rows recover the others.
+      if (change.name || change.organizationId) await this._planServiceInContracts(from, fromOrg, change);
+      await assertOwned();
+      await this.cacheService.delMany([`service.${fromOrg}.${from}`, `service.${toOrg}.${to}`]);
+      await this.pricingRepository.reassignToService(operation.pricingIds, to, toOrg);
+      for (const id of operation.pricingIds) await this.cacheService.del(`pricing.id.${id}`);
+      await this.relocations.stage(operation._id, 'pricings');
+      await this._drainRelocationContracts(operation, change, assertOwned);
+      await assertOwned();
+      const data: any = { name: to, organizationId: toOrg };
+      if ('defaultVersion' in operation.request) data.defaultVersion = operation.request.defaultVersion ?? undefined;
+      const updated = await this.serviceRepository.update(current.name, data, current.organizationId);
+      if (!updated) throw new Error('CONFLICT: Relocating service changed before its metadata write');
+      await this.relocations.stage(operation._id, 'service');
+      // Also covers a legacy/direct writer that slipped in before the service metadata changed.
+      await this._drainRelocationContracts(operation, change, assertOwned);
+      await this.relocations.stage(operation._id, 'effects');
+      await this.cacheService.delMany([`service.${fromOrg}.${from}`, `service.${toOrg}.${to}`]);
+      await this.cacheService.set(`service.${toOrg}.${to}`, updated, 3600, true);
+      await assertOwned();
+      await this.relocations.complete(operation._id);
+      return updated;
+    } catch (error) {
+      await this.relocations.fail(operation._id, (error as Error).message).catch(() => {});
+      throw error;
+    }
+  }
+
+  private async _drainRelocationContracts(operation: any, change: { name?: string; organizationId?: string }, assertOwned: () => Promise<void>) {
+    if (!change.name && !change.organizationId) return;
+    for (let pass = 0; pass < 5; pass++) {
+      const plan = await this._planServiceInContracts(operation.sourceName, operation.sourceOrganizationId, change);
+      for (const userId of plan.userIds) {
+        const before = await this.contractRepository.findByUserId(userId, operation.sourceOrganizationId);
+        if (before) { await assertOwned(); await this.relocations.ensureStep(operation._id, before); }
+      }
+      for (const step of await this.relocations.steps(operation._id)) {
+        if (step.effectsDone) continue;
+        let current = await this.contractRepository.findForRelocation(String(step.contractId));
+        let changed = step.changed !== false;
+        if (!step.applied && current?.serviceRelocationOperationId !== operation._id) {
+          let done = false;
+          for (let attempt = 0; attempt < 5 && !done; attempt++) {
+            if (!current) { changed = false; done = true; break; }
+            const names = SERVICE_MAPS.flatMap(field => Object.keys(plainMap(current[field])));
+            if (!names.some(name => name.toLowerCase() === operation.sourceName.toLowerCase())) { changed = false; done = true; break; }
+            await assertOwned();
+            const moving = Boolean(change.organizationId) && movesWithService(Object.keys(plainMap(current.contractedServices)), operation.sourceName.toLowerCase());
+            const written = change.organizationId && !moving
+              ? await this.contractRepository.removeServicesFromContract(current, [operation.sourceName], operation._id)
+              : await this.contractRepository.renameOrMoveServiceInContract(current, operation.sourceName, change, operation._id);
+            if (written) { done = true; current = await this.contractRepository.findForRelocation(String(step.contractId)); }
+            else current = await this.contractRepository.findForRelocation(String(step.contractId));
+          }
+          if (!done) throw new Error('CONFLICT: Contract kept changing during service relocation; retry original update');
+        }
+        // The marker was persisted in the SAME write as the mutation. A restart
+        // between that write and this acknowledgement never reapplies its history.
+        await assertOwned();
+        await this.relocations.applied(step._id, changed);
+        const before = step.before;
+        // Replayed alongside the durable contract step, including when the
+        // contract write survived a crash before its acknowledgement.
+        if (changed && current) {
+          if (change.organizationId && current.organizationId === operation.sourceOrganizationId) {
+            await this.usageConsumptionRepository.deleteOfServices(operation.sourceOrganizationId, [operation.sourceName], before.userContact.userId);
+          } else {
+            await this.usageConsumptionRepository.renameOrMoveService(operation.sourceOrganizationId, before.userContact.userId,
+              operation.sourceName, current.organizationId !== operation.sourceOrganizationId ? change : { name: change.name });
+          }
+        }
+        await this.cacheService.delMany([...contractCacheKeys(before), ...contractCacheKeys({ ...before, organizationId: operation.targetOrganizationId })]);
+        if (changed && current) {
+          const written = { ...current, id: String(current._id) };
+          delete written.serviceRelocationOperationId;
+          const moves = before.organizationId !== current.organizationId;
+          if (moves) {
+            this.eventService.emitContractEvent?.('CONTRACT_DELETED', before, { deleted: true });
+            this.eventService.emitContractEvent?.('CONTRACT_CREATED', written);
+          } else this.eventService.emitContractEvent?.('CONTRACT_NOVATED', written);
+        }
+        await assertOwned();
+        await this.relocations.effectsDone(step._id);
+      }
+      const remaining = await this.contractRepository.findServiceKeysOfContracts(operation.sourceOrganizationId, operation.sourceName);
+      if (remaining.length === 0) { await this.relocations.stage(operation._id, 'contracts'); return; }
+    }
+    throw new Error('CONFLICT: New contracts kept referencing the old service; retry original update');
   }
 
   /**
@@ -1173,90 +1317,6 @@ class ServiceService {
     return { serviceName, organizationId, change, userIds: rows.map(row => row.userId) };
   }
 
-  /**
-   * Apply a plan of `_planServiceInContracts`, contract by contract:
-   * - renamed in place (no move): CONTRACT_NOVATED (`contractVersion` changes
-   *   with the name);
-   * - moved (the contract only has this service): CONTRACT_DELETED in the
-   *   organization it leaves and CONTRACT_CREATED in the one it joins, whose
-   *   consumers did not know it;
-   * - service removed (the contract has other services, and stays):
-   *   CONTRACT_NOVATED.
-   * Each write is conditional on the version that was read; a contract that
-   * changed meanwhile is read again and retried. The cached contract,
-   * evaluations and pricing token are dropped in every organization concerned.
-   *
-   * The consumption records of each written contract (`consumptionId`) follow
-   * it, so that a revert by id keeps subtracting exactly what was consumed:
-   * renamed with the service, moved with the contract (all of them, as the
-   * contract leaves the organization), or deleted when the contract stays and
-   * loses the service (its usage levels are gone).
-   *
-   * @returns how many contracts were changed.
-   */
-  async _renameOrMoveServiceInContracts(plan: {
-    serviceName: string;
-    organizationId: string;
-    change: { name?: string; organizationId?: string };
-    userIds: string[];
-  }): Promise<number> {
-    const { serviceName, organizationId, change } = plan;
-    const from = serviceName.toLowerCase();
-    const attempts = 5;
-    let changed = 0;
-
-    for (const userId of plan.userIds) {
-      let done = false;
-      for (let attempt = 0; attempt < attempts && !done; attempt++) {
-        const contract = await this.contractRepository.findByUserId(userId, organizationId);
-        if (!contract) {
-          done = true; // Deleted meanwhile.
-          break;
-        }
-        const names = SERVICE_MAPS.flatMap(field => Object.keys(plainMap(contract[field])));
-        if (!names.some(name => name.toLowerCase() === from)) {
-          done = true; // Nothing of the service left in it.
-          break;
-        }
-
-        const moves = Boolean(change.organizationId) && movesWithService(Object.keys(plainMap(contract.contractedServices)), from);
-        const written =
-          change.organizationId && !moves
-            ? await this.contractRepository.removeServicesFromContract(contract, [serviceName])
-            : await this.contractRepository.renameOrMoveServiceInContract(contract, serviceName, change);
-        if (!written) continue; // Changed after it was read: read it again.
-        done = true;
-        changed++;
-
-        if (change.organizationId && !moves) {
-          await this.usageConsumptionRepository.deleteOfServices(organizationId, [serviceName], userId);
-        } else {
-          await this.usageConsumptionRepository.renameOrMoveService(
-            organizationId,
-            userId,
-            serviceName,
-            moves ? change : { name: change.name }
-          );
-        }
-
-        await this.cacheService.delMany(contractCacheKeys(contract));
-        if (moves) {
-          await this.cacheService.delMany(contractCacheKeys(written));
-          this.eventService.emitContractEvent?.('CONTRACT_DELETED', contract, { deleted: true });
-          this.eventService.emitContractEvent?.('CONTRACT_CREATED', written);
-        } else {
-          this.eventService.emitContractEvent?.('CONTRACT_NOVATED', written);
-        }
-      }
-      if (!done) {
-        throw new Error(
-          `CONFLICT: The contract of user ${userId} kept changing while service ${serviceName} was renamed or moved in it; retry`
-        );
-      }
-    }
-
-    return changed;
-  }
 
   async updatePricingAvailability(
     serviceName: string,
@@ -1381,7 +1441,10 @@ class ServiceService {
    */
   async prune(organizationId?: string) {
     const linked = await ServiceModel.find({ ...(organizationId ? { organizationId } : {}), source: 'sphere' }).lean();
-    for (const service of linked) await this.destroy(service.name, service.organizationId);
+    let deleted = 0;
+    for (const service of linked) {
+      if (await this.destroy(service.name, service.organizationId)) deleted++;
+    }
 
     // Every remaining service, enabled or disabled, of every page.
     const remaining: LeanService[] = await ServiceModel.find(
@@ -1394,13 +1457,17 @@ class ServiceService {
       byOrganization.set(org, [...(byOrganization.get(org) ?? []), service]);
     }
 
-    let deleted = 0;
     for (const [org, services] of byOrganization) {
-      const names = services.map(service => service.name);
-      await this._removeServicesFromContracts(names, org);
-      await this.cacheService.delMany(names.map(name => `service.${org}.${name}`));
-      deleted += await this.serviceRepository.destroyByIds(services.map(service => String((service as any)._id)), org);
-      await this._deletePricingsOfServices(services, org);
+      // A global prune also needs each organization's binding lease. Otherwise
+      // a contract can be created after cleanup but before its service is deleted.
+      deleted += await withOrganizationLock(org, async () => {
+        const names = services.map(service => service.name);
+        await this._removeServicesFromContracts(names, org);
+        await this.cacheService.delMany(names.map(name => `service.${org}.${name}`));
+        const count = await this.serviceRepository.destroyByIds(services.map(service => String((service as any)._id)), org);
+        await this._deletePricingsOfServices(services, org);
+        return count;
+      }, 2000);
     }
 
     return deleted;
@@ -1467,11 +1534,15 @@ class ServiceService {
     const yamlPaths = new Set(pricings.map(pricing => pricing.yamlPath).filter(Boolean) as string[]);
     for (const yamlPath of yamlPaths) {
       if (!this._isUploadedPricingYamlPath(yamlPath)) continue;
-      if (await this.pricingRepository.existsWithYamlPath(yamlPath)) continue;
-      const file = storedYamlFile(yamlPath);
-      if (!file) continue;
+      const privatePath = privateYamlPathFor(yamlPath);
+      const legacyPath = LEGACY_PRICINGS_PREFIX + privatePath.slice(PRIVATE_PRICINGS_PREFIX.length);
+      // A legacy and a private reference can name the same file. Keep it while
+      // either representation is still held by any organization's pricing.
+      if (await this.pricingRepository.existsWithYamlPath(privatePath) ||
+          await this.pricingRepository.existsWithYamlPath(legacyPath)) continue;
       try {
-        fs.rmSync(file, { force: true });
+        // The legacy form removes both protected storage and an old public copy.
+        removePricingYaml(legacyPath);
       } catch (error) {
         // The pricing is gone; a file that cannot be removed is reported, not fatal.
         console.error(`Pricing file ${yamlPath} could not be removed:`, (error as Error).message);
@@ -1481,7 +1552,11 @@ class ServiceService {
 
   /** `yamlPath` of an uploaded pricing (not a SPHERE snapshot). */
   _isUploadedPricingYamlPath(yamlPath: string): boolean {
-    return yamlPath.startsWith('/static/pricings/') && !yamlPath.startsWith(PUBLIC_SNAPSHOT_PREFIX) && !isPrivateSnapshotPath(yamlPath);
+    const normalized = privateYamlPathFor(yamlPath);
+    if (!normalized.startsWith(PRIVATE_PRICINGS_PREFIX) || path.posix.normalize(normalized) !== normalized) return false;
+    const relative = normalized.slice(PRIVATE_PRICINGS_PREFIX.length);
+    if (relative.split('/').some(segment => segment === '.' || segment === '..')) return false;
+    return Boolean(pricingYamlFile(normalized));
   }
 
   /**
@@ -1714,20 +1789,35 @@ class ServiceService {
     const safeServiceName = this._normalizePricingPathPart(serviceName);
     const safeVersion = this._normalizePricingPathPart(version);
 
-    return `/static/pricings/${safeOrganizationId}-${safeServiceName}-${safeVersion}.yaml`;
+    // Outside public/: read only through GET .../pricings/{version}?format=yaml.
+    return uploadedPricingYamlPath(`${safeOrganizationId}-${safeServiceName}-${safeVersion}.yaml`);
   }
 
   _savePricingYamlContent(
     yamlContent: string,
     organizationId: string,
     serviceName: string,
-    version: string
+    version: string,
+    exclusive = false
   ) {
     const relativePath = this._buildPricingYamlRelativePath(organizationId, serviceName, version);
-    const absolutePath = path.resolve('public', `.${relativePath}`);
+    const absolutePath = pricingYamlFile(relativePath);
+    if (!absolutePath) {
+      throw new Error(`Invalid pricing file path ${relativePath}`);
+    }
 
     fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-    fs.writeFileSync(absolutePath, yamlContent, 'utf8');
+    if (exclusive) {
+      let handle: number;
+      try { handle = fs.openSync(absolutePath, 'wx'); }
+      catch (error: any) {
+        if (error.code === 'EEXIST') throw new Error('CONFLICT: Stored YAML already exists for this version; it was not replaced');
+        throw error;
+      }
+      try { fs.writeFileSync(handle, yamlContent, 'utf8'); }
+      catch (error) { fs.rmSync(absolutePath, { force: true }); throw error; }
+      finally { fs.closeSync(handle); }
+    } else fs.writeFileSync(absolutePath, yamlContent, 'utf8');
 
     return relativePath;
   }
@@ -1736,14 +1826,15 @@ class ServiceService {
     sourcePath: string,
     organizationId: string,
     serviceName: string,
-    version: string
+    version: string,
+    exclusive = false
   ) {
     const yamlContent = fs.readFileSync(sourcePath, 'utf8');
-    return this._savePricingYamlContent(yamlContent, organizationId, serviceName, version);
+    return this._savePricingYamlContent(yamlContent, organizationId, serviceName, version, exclusive);
   }
 
   async _fetchRemotePricingYaml(url: string) {
-    const agent = new https.Agent({ rejectUnauthorized: false });
+    const agent = proxyAgentFor(url, { rejectUnauthorized: false }) ?? new https.Agent({ rejectUnauthorized: false });
     const timeoutMs = 5000;
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);

@@ -4,6 +4,33 @@ import { isAfter } from 'date-fns';
 
 const DEFAULT_TIMEOUT = 5000;
 
+const servicePath = (organizationId: string, serviceName: string) =>
+  `/organizations/${encodeURIComponent(organizationId)}/services/${encodeURIComponent(serviceName)}`;
+
+export interface NewContractsPricing {
+  version: string;
+  source: 'default' | 'latest-active' | 'sphere-policy';
+  yamlUrl: string;
+}
+
+export async function getService(apiKey: string, organizationId: string, serviceName: string, signal?: AbortSignal): Promise<RetrievedService> {
+  return (await axios.get(servicePath(organizationId, serviceName), {
+    headers: { 'x-api-key': apiKey }, timeout: DEFAULT_TIMEOUT, signal,
+  })).data;
+}
+
+export async function getNewContractsPricing(apiKey: string, organizationId: string, serviceName: string, signal?: AbortSignal): Promise<NewContractsPricing> {
+  return (await axios.get(`${servicePath(organizationId, serviceName)}/pricings/new-contracts`, {
+    headers: { 'x-api-key': apiKey }, timeout: DEFAULT_TIMEOUT, signal,
+  })).data;
+}
+
+export async function setDefaultVersion(apiKey: string, organizationId: string, serviceName: string, defaultVersion: string | null): Promise<RetrievedService> {
+  return (await axios.put(servicePath(organizationId, serviceName), { defaultVersion }, {
+    headers: { 'x-api-key': apiKey }, timeout: DEFAULT_TIMEOUT,
+  })).data;
+}
+
 export async function getServices(
   apiKey: string,
   organizationId: string,
@@ -73,30 +100,40 @@ export async function getPricingVersion(
     .catch(() => null);
 }
 
-export async function getPublicPricingUrl(
+/**
+ * The stored Pricing2Yaml file of a pricing version. Pricing files are not
+ * served as static files: they are only readable through this authorised route.
+ */
+export async function getPricingYaml(
   apiKey: string,
   organizationId: string,
   serviceName: string,
   version: string
-): Promise<{ path: string; url: string }> {
+): Promise<string> {
   return axios
     .get(
-      `/organizations/${organizationId}/services/${serviceName}/pricings/${version}/public-url`,
+      `/organizations/${organizationId}/services/${encodeURIComponent(serviceName)}/pricings/${encodeURIComponent(version)}`,
       {
         headers: {
-          'Content-Type': 'application/json',
           'x-api-key': apiKey,
         },
+        params: { format: 'yaml' },
+        responseType: 'text',
+        transformResponse: data => data,
         timeout: DEFAULT_TIMEOUT,
       }
     )
-    .then(response => response.data as { path: string; url: string })
+    .then(response => response.data as string)
     .catch(error => {
-      throw new Error(
-        `Failed to retrieve public YAML URL for pricing version ${version}. Error: ${
-          error.response?.data?.error || error.message
-        }`
-      );
+      let message = error.response?.data?.error || error.message;
+      if (typeof error.response?.data === 'string') {
+        try {
+          message = JSON.parse(error.response.data).error ?? message;
+        } catch {
+          // not JSON
+        }
+      }
+      throw new Error(`Failed to retrieve the YAML file of pricing version ${version}. Error: ${message}`);
     });
 }
 
