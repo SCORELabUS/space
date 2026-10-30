@@ -25,3 +25,13 @@ test('distinguishes no contracts from counts unavailable on an older server', ()
   assert.match(unavailable, /counts are unavailable/);
   assert.doesNotMatch(unavailable, /0 contracts/);
 });
+
+test('keeps paused cohorts visible and labels the applied target without promising new contracts', () => {
+  const html = renderToStaticMarkup(createElement(PricingContractCounts, {
+    counts: [{ version: '1.0', count: 4 }], versions: ['1.0', '2.0'], target: '2.0', disabled: true,
+  }));
+  assert.match(html, /4 contracts/);
+  assert.match(html, /Applied target/);
+  assert.doesNotMatch(html, /New contracts/);
+  assert.match(html, />4<\/td>/);
+});

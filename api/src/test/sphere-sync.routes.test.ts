@@ -194,6 +194,25 @@ describe('SPHERE synchronization API routes', () => {
       expect(scoped.body.contractCounts).toEqual(response.body.contractCounts);
     });
 
+    it('preserves counts while paused and after reactivation without exposing credentials', async () => {
+      await createLinkedService({ service: { disabled: true }, sphere: { encryptedApiKey: { ciphertext: 'private-credential-marker' } } });
+      await Contract.collection.insertOne({ organizationId: organization.id, userContact: { userId: 'counts-paused' }, contractedServices: { [serviceName]: '1_0' } });
+      const get = () => request(app).get(`${baseUrl}/services/${serviceName}/synchronization`).set('x-api-key', allKey);
+      const paused = await get();
+      expect(paused.status).toBe(200);
+      expect(paused.body.disabled).toBe(true);
+      expect(paused.body.contractCounts).toEqual([{ version: '1.0', count: 1 }]);
+      expect(paused.body.configuration.hasApiKey).toBe(true);
+      expect(paused.body.configuration.encryptedApiKey).toBeUndefined();
+      expect(JSON.stringify(paused.body)).not.toContain('private-credential-marker');
+      const resumed = await request(app).post(`${baseUrl}/services/${serviceName}/synchronization/resume`).set('x-api-key', allKey);
+      expect(resumed.status).toBe(202);
+      const active = await get();
+      expect(active.body.disabled).toBe(false);
+      expect(active.body.contractCounts).toEqual(paused.body.contractCounts);
+      expect(active.body.configuration.encryptedApiKey).toBeUndefined();
+    });
+
     it('refreshes counts after a binding changes or a contract is deleted', async () => {
       await createLinkedService();
       const contract = await Contract.collection.insertOne({ organizationId: organization.id, userContact: { userId: 'counts-changing' }, contractedServices: { [serviceName]: '1_0' } });
