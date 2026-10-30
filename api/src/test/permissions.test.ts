@@ -116,12 +116,12 @@ describe('Permissions Test Suite', function () {
         expect(response.status).toBe(200);
       });
 
-      it('Should allow POST /events/test-event without API key', async function () {
+      it('Should require an API key for POST /events/test-event', async function () {
         const response = await request(app)
           .post(`${baseUrl}/events/test-event`)
           .send({ serviceName: 'test', pricingVersion: 'v1' });
 
-        expect([200, 400, 404]).toContain(response.status);
+        expect(response.status).toBe(401);
       });
     });
   });
@@ -1616,7 +1616,7 @@ describe('Permissions Test Suite', function () {
 
       describe('GET /services/:serviceName/pricings/:pricingVersion', function () {
         it('Should allow access with organization API key with ALL scope', async function () {
-          const testPricingId = Object.keys(testService.activePricings!)[0]
+          const testPricingId = Object.keys(testService.activePricings!)[0];
           
           const response = await request(app)
             .get(`${baseUrl}/services/${testService.name}/pricings/${testPricingId}`)
@@ -1626,7 +1626,7 @@ describe('Permissions Test Suite', function () {
         });
 
         it('Should allow access with organization API key with MANAGEMENT scope', async function () {
-          const testPricingId = Object.keys(testService.activePricings!)[0]
+          const testPricingId = Object.keys(testService.activePricings!)[0];
           
           const response = await request(app)
             .get(`${baseUrl}/services/${testService.name}/pricings/${testPricingId}`)
@@ -1636,7 +1636,7 @@ describe('Permissions Test Suite', function () {
         });
 
         it('Should allow access with organization API key with EVALUATION scope', async function () {
-          const testPricingId = Object.keys(testService.activePricings!)[0]
+          const testPricingId = Object.keys(testService.activePricings!)[0];
           
           const response = await request(app)
             .get(`${baseUrl}/services/${testService.name}/pricings/${testPricingId}`)
@@ -1646,7 +1646,7 @@ describe('Permissions Test Suite', function () {
         });
 
         it('Should return 401 without API key', async function () {
-          const testPricingId = Object.keys(testService.activePricings!)[0]
+          const testPricingId = Object.keys(testService.activePricings!)[0];
 
           const response = await request(app).get(`${baseUrl}/services/${testService.name}/pricings/${testPricingId}`);
 
@@ -1654,7 +1654,7 @@ describe('Permissions Test Suite', function () {
         });
 
         it('Should return 403 with ADMIN user API key', async function () {
-          const testPricingId = Object.keys(testService.activePricings!)[0]
+          const testPricingId = Object.keys(testService.activePricings!)[0];
           
           const response = await request(app)
             .get(`${baseUrl}/services/${testService.name}/pricings/${testPricingId}`)
@@ -1902,7 +1902,7 @@ describe('Permissions Test Suite', function () {
       it('Should return 201 creation with ADMIN user API key', async function () {
         const ownerUser = await createTestUser('USER');
         const testOrg = await createTestOrganization(ownerUser.username);
-        const testService = await createTestService(testOrg.id!)
+        const testService = await createTestService(testOrg.id!);
         
         let contractData = await generateContract(
                 { [testService.name.toLowerCase()]: testService.activePricings.keys().next().value! },
@@ -1970,7 +1970,7 @@ describe('Permissions Test Suite', function () {
     describe('GET /contracts/:userId', function () {
       it('Should return 200 with ADMIN user API key', async function () {
         const response = await request(app)
-          .get(`${baseUrl}/contracts/test-user`)
+          .get(`${baseUrl}/contracts/test-user?organizationId=${contractTestOrganization.id}`)
           .set('x-api-key', adminApiKey);
 
         expect([200, 404]).toContain(response.status);
@@ -2018,7 +2018,7 @@ describe('Permissions Test Suite', function () {
     describe('PUT /contracts/:userId', function () {
       it('Should allow update with ADMIN user API key', async function () {
         const response = await request(app)
-          .put(`${baseUrl}/contracts/test-user`)
+          .put(`${baseUrl}/contracts/test-user?organizationId=${contractTestOrganization.id}`)
           .set('x-api-key', adminApiKey)
           .send({ serviceName: 'test' });
 
@@ -2071,7 +2071,7 @@ describe('Permissions Test Suite', function () {
     describe('DELETE /contracts/:userId - Org Role: ALL', function () {
       it('Should allow deletion with ADMIN user API key', async function () {
         const response = await request(app)
-          .delete(`${baseUrl}/contracts/test-user`)
+          .delete(`${baseUrl}/contracts/test-user?organizationId=${contractTestOrganization.id}`)
           .set('x-api-key', adminApiKey);
 
         expect([200, 204, 404]).toContain(response.status);

@@ -3,6 +3,7 @@ import { Server } from 'http';
 import { v4 as uuidv4 } from 'uuid';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import container from '../main/config/container';
+import { contractCacheKey } from '../main/utils/contracts/cacheKeys';
 import { baseUrl, getApp, shutdownApp } from './utils/testApp';
 import { createTestUser, deleteTestUser } from './utils/users/userTestUtils';
 import {
@@ -110,6 +111,7 @@ describe('Pricing versions of a contract', function () {
           newContractsVersion: '2.0.1',
           plan: 'GOLD',
           addOns: { extraPets: 2 },
+          serviceStatus: 'enabled',
         },
       },
       contractVersion: contract.body.contractVersion,
@@ -143,7 +145,7 @@ describe('Pricing versions of a contract', function () {
       { $set: { [`contractedServices.${serviceName}`]: '2_0_1' } }
     );
     const cacheService = (await import('../main/config/container')).default.resolve('cacheService');
-    await cacheService.del(`contracts.${userId}`);
+    await cacheService.del(contractCacheKey(organization.id!, userId));
 
     const entry = (await pricingsOf()).body.services[serviceName];
 

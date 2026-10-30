@@ -1,5 +1,9 @@
+import { executeIdempotentAction } from './idempotentActions';
+import { currentIdempotencyExecution } from './idempotencyExecution';
+import { Types } from 'mongoose';
 import ServiceModel from '../repositories/mongoose/models/ServiceMongoose';
 import ContractModel from '../repositories/mongoose/models/ContractMongoose';
+import { assertNoPendingRelocation, relocationGlobalLease } from './serviceRelocationState';
 import { withOrganizationLock } from './sphere/lock';
 import { enforceSpherePolicy } from './sphere/contractPolicy';
 import container from '../config/container';
@@ -12,7 +16,7 @@ import {
 } from '../types/models/Contract';
 import ContractRepository from '../repositories/mongoose/ContractRepository';
 import { validateContractQueryFilters } from './validation/ContractServiceValidation';
-import ServiceService from './ServiceService';
+import ServiceService, { DormantReason, DormantServiceError } from './ServiceService';
 import { LeanPricing, LeanUsageLimit } from '../types/models/Pricing';
 import { addDays, isAfter } from 'date-fns';
 import {
@@ -23,6 +27,7 @@ import {
 } from '../controllers/validation/ContractValidation';
 import { novationFields, performNovation } from '../utils/contracts/novation';
 import CacheService from './CacheService';
+import type EventService from './EventService';
 import {
   addPeriodToDate,
   convertKeysToLowercase,
@@ -41,6 +46,48 @@ import {
 } from '../utils/contracts/version';
 import { LeanUser } from '../types/models/User';
 import { pricingYamlUrl } from '../utils/services/helpers';
+import {
+  contractCacheKey,
+  contractCacheKeys,
+  featuresCachePattern,
+  organizationContractCachePatterns,
+} from '../utils/contracts/cacheKeys';
+import { randomUUID } from 'node:crypto';
+import UsageConsumptionRepository, { UsageConsumption } from '../repositories/mongoose/UsageConsumptionRepository';
+import { ConsumptionRevertResult } from '../types/models/FeatureEvaluation';
+import {
+  ConsumptionTarget,
+  consumptionTargets,
+  normalizeFeatureId,
+} from '../utils/feature-evaluation/consumption';
+
+/**
+ * How long an applied consumption can be reverted by its `consumptionId`
+ * (`CONSUMPTION_RETENTION_SECONDS`, default 24 hours, at least 60 seconds).
+ */
+export function consumptionRetentionSeconds(): number {
+  const configured = Number(process.env.CONSUMPTION_RETENTION_SECONDS);
+  return Number.isFinite(configured) && configured >= 60 ? Math.floor(configured) : 24 * 3600;
+}
+
+/** The legacy revert (`?revert=true` without `consumptionId`) only considers consumptions this recent. */
+export const LEGACY_REVERT_WINDOW_MS = 120_000;
+
+/**
+ * What applying an expected consumption came to.
+ * - `applied`: every level was incremented; `contract` is the stored contract
+ *   after the increment, `consumptionId` identifies the consumption when it
+ *   was recorded (single-feature evaluations).
+ * - `limit`: nothing was written because a level would have exceeded its
+ *   limit; `contract` is the stored contract that showed it.
+ * - `changed`: nothing was written because the subscription the limits were
+ *   computed from is no longer the stored one (or the room seen at the write
+ *   was freed right after): the evaluation has to be made again.
+ */
+export type ConsumptionOutcome =
+  | { status: 'applied'; contract: LeanContract; consumptionId?: string }
+  | { status: 'limit'; contract: LeanContract }
+  | { status: 'changed' };
 
 /** Response of POST /contracts/{userId}/novation/preview. */
 export interface NovationPreview {
@@ -55,6 +102,11 @@ export interface NovationPreview {
   usageWarnings: { service: string; usageLimit: string; consumed: number; newLimit: number }[];
   billingPeriod: { startDate: string; endDate: string; restarts: boolean };
   contractVersion: string;
+  /**
+   * Services of the resulting subscription that are dormant (disabled): kept
+   * unchanged, their features stay unavailable until they are enabled again.
+   */
+  dormantServices: string[];
 }
 
 /**
@@ -109,6 +161,13 @@ export interface ContractPricing {
   newContractsVersion: string | null;
   plan?: string;
   addOns: Record<string, number>;
+  /**
+   * Whether the service itself is enabled. `disabled`: its features are not
+   * available until a pricing with its saasName is uploaded again (all its
+   * versions are archived meanwhile); `not-found`: the organization no longer
+   * has it.
+   */
+  serviceStatus: 'enabled' | 'disabled' | 'not-found';
 }
 
 /** Options shared by the novation routes (see S8 in the API docs). */
@@ -123,60 +182,99 @@ class ContractService {
   private readonly contractRepository: ContractRepository;
   private readonly serviceService: ServiceService;
   private readonly cacheService: CacheService;
+  private readonly usageConsumptionRepository: UsageConsumptionRepository;
 
   constructor() {
     this.contractRepository = container.resolve('contractRepository');
     this.serviceService = container.resolve('serviceService');
     this.cacheService = container.resolve('cacheService');
+    this.usageConsumptionRepository = container.resolve('usageConsumptionRepository');
     // Position of the caller's organization among the arguments of the methods
     // that address a contract by userId (see `_findContract`).
     const scopeArgument: Record<string, number> = {
       novate: 2, renew: 1, destroy: 1, novateUserContact: 2, novateBillingPeriod: 2,
-      resetUsageLevels: 3, _revertExpectedConsumption: 3,
+      resetUsageLevels: 3, _revertExpectedConsumption: 3, revertConsumption: 3,
     };
     // Serialize binding mutations with synchronization. Consumption uses conditional atomic writes separately.
-    for (const method of ['create', 'novate', 'novateByGroupId', 'renew', 'destroy', 'novateUserContact', 'novateBillingPeriod', 'novateBillingPeriodByGroupId', 'resetUsageLevels', '_revertExpectedConsumption'] as const) {
+    for (const method of ['create', 'novate', 'novateByGroupId', 'renew', 'destroy', 'novateUserContact', 'novateBillingPeriod', 'novateBillingPeriodByGroupId', 'resetUsageLevels', '_revertExpectedConsumption', 'revertConsumption'] as const) {
       const original = (this[method] as (...args: any[]) => Promise<any>).bind(this);
       (this as any)[method] = async (...args: any[]) => {
-        const scope = args[scopeArgument[method]];
-        const contract: any = method === 'create' || method.endsWith('ByGroupId') ? null :
-          await ContractModel.findOne({ 'userContact.userId': args[0], ...(scope ? { organizationId: scope } : {}) }).lean();
+        const saved = currentIdempotencyExecution()?.record.plan;
+        if (saved && ['create', 'novate', 'novateByGroupId', 'resetUsageLevels'].includes(method)) return executeIdempotentAction(saved);
+        let contract: any = null;
+        if (method !== 'create') {
+          // A userId or groupId is only unique within an organization: without
+          // one, fail before reading or locking anything (callers always pass it).
+          const scope = method.endsWith('ByGroupId') ? args[1] : args[scopeArgument[method]];
+          if (!scope) throw new Error(`INTERNAL ERROR: ${method} requires the organization of the contract`);
+          if (!method.endsWith('ByGroupId')) {
+            contract = await ContractModel.findOne({ 'userContact.userId': args[0], organizationId: scope }).lean();
+          }
+        }
         const org = method === 'create' ? args[0]?.organizationId : method.endsWith('ByGroupId') ? args[1] : contract?.organizationId;
-        if (!org || !await ServiceModel.exists({ organizationId: org, source: 'sphere' })) return original(...args);
+        if (!org) return original(...args);
         return withOrganizationLock(org, async assertOwned => {
+          await assertNoPendingRelocation(org);
           if (await ServiceModel.exists({ organizationId: org, source: 'sphere', 'sphere.status': 'applying' })) throw new Error('Synchronization is applying; retry shortly');
-          if (contract) await this.cacheService.del(`contracts.${contract.userContact.userId}`);
+          if (contract) await this.cacheService.del(contractCacheKey(contract.organizationId, contract.userContact.userId));
           await assertOwned();
-          const result = await original(...args);
+          const execution = currentIdempotencyExecution();
+          const resumable = ['create', 'novate', 'novateByGroupId', 'resetUsageLevels'].includes(method);
+          const result = execution?.record.plan && resumable
+            ? await executeIdempotentAction(execution.record.plan)
+            : await original(...args);
           const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
           for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
           return result;
-        });
+        }, 2000);
       };
     }
+    const prune = this.prune.bind(this);
+    this.prune = async (organizationId?: string) => withOrganizationLock(organizationId ?? relocationGlobalLease, async () => {
+      await assertNoPendingRelocation(organizationId);
+      return prune(organizationId);
+    }, 2000);
 
   }
 
+  /** EventService, resolved lazily (it is registered after this service). */
+  _events(): EventService | undefined {
+    try {
+      return container.resolve('eventService');
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
-   * Look a contract up by `userId`, confined to `organizationId` when given.
+   * Look a contract up by `userId` within `organizationId` (required: a
+   * `userId` is only unique within an organization).
    *
-   * Contracts are cached under `contracts.<userId>` whatever their organization,
-   * so a cached contract is checked against the organization as well: a hit
-   * from another organization is a miss. Outside the organization the contract
-   * does not exist, and the error says exactly what it says for an unknown
-   * `userId`, so that a caller cannot tell the two apart.
+   * Contracts are cached per organization and userId (see `contractCacheKey`);
+   * a cached entry is still checked against both. Outside the organization the
+   * contract does not exist, and the error says exactly what it says for an
+   * unknown `userId`, so that a caller cannot tell the two apart.
    */
-  async _findContract(userId: string, organizationId?: string): Promise<LeanContract> {
-    let contract: LeanContract | null = await this.cacheService.get(`contracts.${userId}`);
+  async _findContract(userId: string, organizationId: string): Promise<LeanContract> {
+    const organization = organizationId;
+    if (!organization) {
+      throw new Error('INTERNAL ERROR: a contract is looked up by userId within an organization');
+    }
+
+    const key = contractCacheKey(organization, userId);
+    let contract: LeanContract | null = await this.cacheService.get(key);
+    if (contract && (contract.organizationId !== organization || contract.userContact?.userId !== userId)) {
+      contract = null;
+    }
 
     if (!contract) {
-      contract = await this.contractRepository.findByUserId(userId);
+      contract = await this.contractRepository.findByUserId(userId, organization);
       if (contract) {
-        await this.cacheService.set(`contracts.${userId}`, contract, 3600, true); // Cache for 1 hour
+        await this.cacheService.set(key, contract, 3600, true); // Cache for 1 hour
       }
     }
 
-    if (!contract || (organizationId && contract.organizationId !== organizationId)) {
+    if (!contract) {
       throw new Error(`Contract with userId ${userId} not found`);
     }
 
@@ -261,7 +359,7 @@ class ContractService {
   async previewNovation(
     userId: string,
     newSubscription: any,
-    organizationId?: string,
+    organizationId: string,
     options: NovationOptions = {}
   ): Promise<NovationPreview> {
     const found = await this._findContract(userId, organizationId);
@@ -285,6 +383,10 @@ class ContractService {
     const novated = performNovation(structuredClone(contract), subscription, {
       keepBillingPeriod: options.keepBillingPeriod,
     });
+    const dormant = await this.serviceService.dormantServices(
+      Object.keys(subscription.contractedServices),
+      contract.organizationId
+    );
 
     return {
       valid: errors.length === 0,
@@ -304,6 +406,7 @@ class ContractService {
         restarts: !options.keepBillingPeriod,
       },
       contractVersion: computeContractVersion(contract),
+      dormantServices: Object.keys(dormant),
     };
   }
 
@@ -378,11 +481,19 @@ class ContractService {
    */
   async pricings(
     userId: string,
-    organizationId?: string,
+    organizationId: string,
     routeOrganizationId?: string
   ): Promise<{ contract: LeanContract; services: Record<string, ContractPricing> }> {
     const contract = await this.show(userId, organizationId);
     const services: Record<string, ContractPricing> = {};
+    const dormant = await this.serviceService.dormantServices(
+      Object.keys(contract.contractedServices),
+      contract.organizationId
+    );
+    const serviceStatus = (serviceName: string): ContractPricing['serviceStatus'] => {
+      const reason = dormant[serviceName.toLowerCase()];
+      return reason === 'SERVICE_DISABLED' ? 'disabled' : reason === 'SERVICE_NOT_FOUND' ? 'not-found' : 'enabled';
+    };
 
     for (const [serviceName, version] of Object.entries(contract.contractedServices)) {
       const status = await this.serviceService.pricingVersionStatus(serviceName, version, contract.organizationId);
@@ -406,13 +517,14 @@ class ContractService {
         newContractsVersion,
         plan: contract.subscriptionPlans?.[serviceName],
         addOns: contract.subscriptionAddOns?.[serviceName] ?? {},
+        serviceStatus: serviceStatus(serviceName),
       };
     }
 
     return { contract, services };
   }
 
-  async show(userId: string, organizationId?: string): Promise<LeanContract> {
+  async show(userId: string, organizationId: string): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
 
     contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
@@ -437,8 +549,11 @@ class ContractService {
       throw new Error('INVALID DATA: Missing organizationId');
     }
 
+    // userIds are unique per organization; a userId of another organization
+    // neither conflicts nor is revealed.
     const existingContract = await this.contractRepository.findByUserId(
-      contractData.userContact.userId
+      contractData.userContact.userId,
+      contractData.organizationId
     );
 
     if (existingContract) {
@@ -528,11 +643,17 @@ class ContractService {
       history: [],
     };
 
+    if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'create', organizationId: contractData.organizationId,
+      writes: [{ contractId: new Types.ObjectId().toString(), organizationId: contractData.organizationId,
+        userId: contractData.userContact.userId, create: contractDataToCreate }] });
+
     const contract = await this.contractRepository.create(contractDataToCreate);
+    const occurredAt = new Date();
 
     contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
 
-    await this.cacheService.set(`contracts.${contract.userContact.userId}`, contract, 3600, true); // Cache for 1 hour
+    await this.cacheService.set(contractCacheKey(contract.organizationId, contract.userContact.userId), contract, 3600, true); // Cache for 1 hour
+    this._events()?.emitContractEvent('CONTRACT_CREATED', contract, { occurredAt });
 
     return contract;
   }
@@ -552,7 +673,7 @@ class ContractService {
   async novate(
     userId: string,
     newSubscription: any,
-    organizationId?: string,
+    organizationId: string,
     options: NovationOptions & { expectedContractVersion?: string | string[] } = {}
   ): Promise<LeanContract> {
     let contract = await this._findContract(userId, organizationId);
@@ -581,9 +702,14 @@ class ContractService {
       rejectPrivate: options.rejectPrivate,
     });
 
+    const recoveryGuard = contractVersionGuard(contract);
     const newContract = performNovation(contract, subscription, {
       keepBillingPeriod: options.keepBillingPeriod,
     });
+
+    if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'novate', organizationId,
+      expected: expected !== undefined, writes: [{ contractId: contract.id!, organizationId, userId,
+        set: novationFields(newContract), guard: recoveryGuard }] });
 
     const result = await this.contractRepository.update(
       userId,
@@ -591,10 +717,11 @@ class ContractService {
       contract.organizationId,
       guard
     );
+    const occurredAt = new Date();
 
     if (!result && expected !== undefined) {
       const latest = await this.contractRepository.findByUserId(userId, contract.organizationId);
-      await this.cacheService.del(`contracts.${userId}`);
+      await this.cacheService.del(contractCacheKey(contract.organizationId, userId));
       if (!latest) {
         throw new Error(`Contract with userId ${userId} not found`);
       }
@@ -609,8 +736,9 @@ class ContractService {
 
     // A consumption may have landed after this write returned. Do not cache
     // its earlier snapshot over the newer state.
-    await this.cacheService.del(`contracts.${userId}`);
-    await this.cacheService.del(`features.${userId}.*`);
+    await this.cacheService.del(contractCacheKey(organizationId, userId));
+    await this.cacheService.del(featuresCachePattern(organizationId, userId));
+    this._events()?.emitContractEvent('CONTRACT_NOVATED', result, { occurredAt });
 
     return result;
   }
@@ -659,7 +787,9 @@ class ContractService {
       }
     }
 
+    if (!expected) for (const contract of contracts) guards.set(contract.userContact.userId, contractVersionGuard(contract));
     const updatedContracts: LeanContract[] = [];
+    let occurredAt: Date;
 
     for (const contract of contracts) {
       // Resolved per contract: kept versions and the SPHERE policy may differ.
@@ -674,6 +804,10 @@ class ContractService {
       updatedContracts.push(newContract);
     }
 
+    if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'group', organizationId,
+      expected: expected !== undefined, writes: updatedContracts.map(contract => ({ contractId: contract.id ?? String((contract as any)._id), organizationId,
+        userId: contract.userContact.userId, set: novationFields(contract), guard: guards.get(contract.userContact.userId) ?? {} })) });
+
     if (expected) {
       const rejected = await this.contractRepository.bulkUpdateGuarded(
         updatedContracts.map(contract => ({
@@ -681,16 +815,16 @@ class ContractService {
           guard: guards.get(contract.userContact.userId)!,
         }))
       );
+      occurredAt = new Date();
       if (rejected.length > 0) {
         const changed: Record<string, string | null> = {};
         for (const userId of rejected) {
-          await this.cacheService.del(`contracts.${userId}`);
+          await this.cacheService.del(contractCacheKey(organizationId, userId));
           const latest = await this.contractRepository.findByUserId(userId, organizationId);
           changed[userId] = latest ? computeContractVersion(latest) : null;
         }
         for (const contract of updatedContracts) {
-          await this.cacheService.del(`contracts.${contract.userContact.userId}`);
-          await this.cacheService.del(`features.${contract.userContact.userId}.*`);
+          await this.cacheService.delMany(contractCacheKeys(contract));
         }
         // Every precondition held when checked, but a contract changed before
         // its own write. Contracts are written one by one (no multi-document
@@ -698,16 +832,27 @@ class ContractService {
         const novated = updatedContracts
           .map(contract => contract.userContact.userId)
           .filter(userId => !rejected.includes(userId));
+        // Those writes are persisted: announce them before reporting the failure.
+        for (const userId of novated) {
+          const written = await this.contractRepository.findByUserId(userId, organizationId);
+          if (written) this._events()?.emitContractEvent('CONTRACT_NOVATED', written, { occurredAt });
+        }
         throw new ContractChangedError(changed, novated);
       }
     } else {
       const rejected = await this.contractRepository.bulkUpdateGuarded(
         updatedContracts.map(contract => ({ contract, guard: {} }))
       );
+      occurredAt = new Date();
       if (rejected.length > 0) {
         for (const contract of updatedContracts) {
-          await this.cacheService.del(`contracts.${contract.userContact.userId}`);
-          await this.cacheService.del(`features.${contract.userContact.userId}.*`);
+          await this.cacheService.delMany(contractCacheKeys(contract));
+        }
+        for (const contract of updatedContracts) {
+          const userId = contract.userContact.userId;
+          if (rejected.includes(userId)) continue;
+          const written = await this.contractRepository.findByUserId(userId, organizationId);
+          if (written) this._events()?.emitContractEvent('CONTRACT_NOVATED', written, { occurredAt });
         }
         throw new Error(`Failed to update contracts for groupId ${groupId} within organization ${organizationId}`);
       }
@@ -717,14 +862,15 @@ class ContractService {
 
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
-      await this.cacheService.del(`contracts.${contract.userContact.userId}`);
-      await this.cacheService.del(`features.${contract.userContact.userId}.*`);
+      await this.cacheService.del(contractCacheKey(contract.organizationId, contract.userContact.userId));
+      await this.cacheService.del(featuresCachePattern(contract.organizationId, contract.userContact.userId));
+      this._events()?.emitContractEvent('CONTRACT_NOVATED', contract, { occurredAt });
     }
 
     return contractsToReturn;
   }
 
-  async renew(userId: string, organizationId?: string): Promise<LeanContract> {
+  async renew(userId: string, organizationId: string): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
 
     if (!contract.billingPeriod.autoRenew) {
@@ -740,6 +886,7 @@ class ContractService {
     contract.billingPeriod.endDate = newEndDate;
 
     const result = await this.contractRepository.update(userId, contract, contract.organizationId);
+    const occurredAt = new Date();
 
     if (!result) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -747,8 +894,9 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(`features.${userId}.*`);
+    await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
+    await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
+    this._events()?.emitContractEvent('CONTRACT_RENEWED', result, { occurredAt });
 
     return result;
   }
@@ -756,7 +904,7 @@ class ContractService {
   async novateUserContact(
     userId: string,
     userContact: Omit<UserContact, 'userId'>,
-    organizationId?: string
+    organizationId: string
   ): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
 
@@ -773,8 +921,8 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(`features.${userId}.*`);
+    await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
+    await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
 
     return result;
   }
@@ -782,7 +930,7 @@ class ContractService {
   async novateBillingPeriod(
     userId: string,
     newBillingPeriod: { endDate: Date; autoRenew: boolean; renewalDays: number },
-    organizationId?: string
+    organizationId: string
   ): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
 
@@ -796,6 +944,7 @@ class ContractService {
     };
 
     const result = await this.contractRepository.update(userId, contract, contract.organizationId);
+    const occurredAt = new Date();
 
     if (!result) {
       throw new Error(`Failed to update contract for userId ${userId}`);
@@ -803,8 +952,10 @@ class ContractService {
 
     result.contractedServices = resetEscapeContractedServiceVersions(result.contractedServices);
 
-    await this.cacheService.set(`contracts.${userId}`, result, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(`features.${userId}.*`);
+    await this.cacheService.set(contractCacheKey(result.organizationId, userId), result, 3600, true); // Cache for 1 hour
+    await this.cacheService.del(featuresCachePattern(result.organizationId, userId));
+    // The billing period is part of contractVersion.
+    this._events()?.emitContractEvent('CONTRACT_NOVATED', result, { occurredAt });
 
     return result;
   }
@@ -836,6 +987,7 @@ class ContractService {
     }
 
     const result = await this.contractRepository.bulkUpdate(updatedContracts);
+    const occurredAt = new Date();
 
     if (!result) {
       throw new Error(`Failed to update contracts for groupId ${groupId} within organization ${organizationId}`);
@@ -843,8 +995,13 @@ class ContractService {
 
     const contractsToReturn = await this.index({ groupId: groupId }, organizationId);
 
+    // The billing period is part of contractVersion: drop cached contracts,
+    // evaluations and pricing tokens (they carry the version).
+    await this.cacheService.delMany(contractsToReturn.flatMap(contract => contractCacheKeys(contract)));
+
     for (const contract of contractsToReturn) {
       contract.contractedServices = resetEscapeContractedServiceVersions(contract.contractedServices);
+      this._events()?.emitContractEvent('CONTRACT_NOVATED', contract, { occurredAt });
     }
 
     return contractsToReturn;
@@ -853,44 +1010,94 @@ class ContractService {
   async resetUsageLevels(
     userId: string,
     queryParams: UsageLevelsResetQuery,
-    usageLevelsIncrements?: Record<string, Record<string, number>>,
-    organizationId?: string
+    usageLevelsIncrements: Record<string, Record<string, number>> | undefined,
+    organizationId: string
   ): Promise<LeanContract> {
     const contract = await this._findContract(userId, organizationId);
+    const recoveryGuard = contractVersionGuard(contract);
+    const periodGuard = Object.fromEntries(Object.entries(contract.usageLevels ?? {}).flatMap(([service, levels]) =>
+      Object.entries(levels).map(([limit, level]) => [`usageLevels.${service}.${limit}.resetTimeStamp`, level.resetTimeStamp == null ? null : new Date(level.resetTimeStamp)])));
+    // Usage levels of dormant services are kept as they are: they cannot be
+    // consumed, and resets leave them alone.
+    const dormant = await this.serviceService.dormantServices(
+      [...Object.keys(contract.contractedServices ?? {}), ...Object.keys(contract.usageLevels ?? {})],
+      contract.organizationId
+    );
 
+    // Only the usage levels this request changes are written (`$set` of those
+    // levels, `$inc` for increments). Writing the whole contract as read
+    // would undo consumptions recorded meanwhile on any level.
     if (queryParams.usageLimit) {
       await this._resetUsageLimitUsageLevels(
         contract,
         queryParams.usageLimit,
-        contract.organizationId
+        contract.organizationId,
+        dormant
       );
     } else if (queryParams.reset) {
-      await this._resetUsageLevels(contract, queryParams.renewableOnly, contract.organizationId);
+      await this._resetUsageLevels(contract, queryParams.renewableOnly, contract.organizationId, dormant);
     } else if (usageLevelsIncrements) {
+      const increments: Record<string, number> = {};
+      for (const serviceName in usageLevelsIncrements) {
+        const reason = dormant[serviceName.toLowerCase()];
+        if (reason) throw new DormantServiceError(serviceName.toLowerCase(), reason);
+      }
       for (const serviceName in usageLevelsIncrements) {
         for (const usageLimit in usageLevelsIncrements[serviceName]) {
-          if (contract.usageLevels[serviceName][usageLimit]) {
-            contract.usageLevels[serviceName][usageLimit].consumed +=
-              usageLevelsIncrements[serviceName][usageLimit];
+          if (contract.usageLevels?.[serviceName]?.[usageLimit]) {
+            increments[`${serviceName}.${usageLimit}`] = usageLevelsIncrements[serviceName][usageLimit];
           }
         }
+      }
+      if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'usage', organizationId,
+        writes: [{ contractId: contract.id!, organizationId, userId, increments, guard: { ...recoveryGuard, ...periodGuard } }] });
+      if (
+        Object.keys(increments).length > 0 &&
+        !(await this.contractRepository.incrementUsageLevels(userId, increments, contract.organizationId))
+      ) {
+        throw new Error(`Failed to update contract for userId ${userId}`);
       }
     } else {
       throw new Error(`Invalid query params: ${JSON.stringify(queryParams)}`);
     }
 
-    const updatedContract = await this.contractRepository.update(userId, contract, contract.organizationId);
+    if (queryParams.usageLimit || queryParams.reset) {
+      // Every level the reset targets, whatever the copy read says it holds;
+      // those of dormant services are not written at all.
+      const reset: Record<string, { consumed: number; resetTimeStamp?: Date }> = {};
+      for (const [serviceName, levels] of Object.entries(contract.usageLevels ?? {})) {
+        if (dormant[serviceName.toLowerCase()]) continue;
+        for (const [usageLimit, level] of Object.entries(levels)) {
+          const targeted = queryParams.usageLimit
+            ? usageLimit === queryParams.usageLimit
+            : !(queryParams.renewableOnly && !level.resetTimeStamp);
+          if (!targeted) continue;
+          reset[`${serviceName}.${usageLimit}`] = {
+            consumed: level.consumed,
+            ...(level.resetTimeStamp ? { resetTimeStamp: new Date(level.resetTimeStamp) } : {}),
+          };
+        }
+      }
+      if (currentIdempotencyExecution()) return executeIdempotentAction({ kind: 'usage', organizationId,
+        writes: [{ contractId: contract.id!, organizationId, userId, guard: { ...recoveryGuard, ...periodGuard },
+          set: Object.fromEntries(Object.entries(reset).flatMap(([path, level]) => Object.entries(level).map(([field, value]) => [`usageLevels.${path}.${field}`, value]))) }] });
+      if (!(await this.contractRepository.setUsageLevels(userId, contract.organizationId, reset))) {
+        throw new Error(`Failed to update contract for userId ${userId}`);
+      }
+    }
+
+    const updatedContract = await this.contractRepository.findByUserId(userId, contract.organizationId);
 
     if (!updatedContract) {
-      throw new Error(`Failed to update contract for userId ${userId}`);
+      throw new Error(`Contract with userId ${userId} not found`);
     }
 
     updatedContract.contractedServices = resetEscapeContractedServiceVersions(
       updatedContract.contractedServices
     );
 
-    await this.cacheService.set(`contracts.${userId}`, updatedContract, 3600, true); // Cache for 1 hour
-    await this.cacheService.del(`features.${userId}.*`);
+    await this.cacheService.set(contractCacheKey(updatedContract.organizationId, userId), updatedContract, 3600, true); // Cache for 1 hour
+    await this.cacheService.del(featuresCachePattern(updatedContract.organizationId, userId));
 
     return updatedContract;
   }
@@ -899,88 +1106,118 @@ class ContractService {
     userId: string,
     usageLimitId: string,
     expectedConsumption: number,
-    organizationId?: string
-  ): Promise<void> {
-    await this._applyExpectedConsumptions(userId, { [usageLimitId]: expectedConsumption }, organizationId);
+    organizationId: string
+  ): Promise<ConsumptionOutcome> {
+    return this._applyExpectedConsumptions(userId, { [usageLimitId]: expectedConsumption }, organizationId);
   }
 
   /**
    * Apply several expected consumptions to a contract in one atomic update.
    *
-   * Read-modify-write loses consumptions, and it does so in two ways. Applying
-   * the limits of one evaluation in turn made each application read the whole
-   * contract, change a single usage level in its own copy and write the whole
-   * contract back, so an evaluation touching two limits recorded one of them.
-   * Batching the limits into a single read and write fixes that, but not the
-   * case of two requests arriving together: both read the same consumed value,
-   * both write the same total, and one consumption is gone.
+   * Read-modify-write loses consumptions: two requests that read the same
+   * consumed value both write the same total. The increment is handed to the
+   * database as `$inc` instead, evaluated against the stored document.
    *
-   * The database is the only place that can settle this, so the increment is
-   * handed to it as `$inc` and evaluated against the stored document. Whatever
-   * order concurrent calls arrive in, every one of them is added.
+   * The limits are part of the same update. Checking them on the contract that
+   * was read and incrementing afterwards let two requests both see room for one
+   * more and both consume it; now a level is only incremented while
+   * `consumed + amount` stays within its limit (`options.limits`, the limits
+   * of the contract's current subscription as the evaluation computed them),
+   * for every level of the consumption at once. With `options.contract`, the
+   * update is also conditional on that contract's subscription still being the
+   * stored one (`contractVersionGuard`), so the limits used are never those of
+   * a subscription replaced in between.
+   *
+   * With `options.featureId` the consumption is recorded (collection
+   * `usageConsumptions`) and its id returned, so that it can be reverted by id
+   * (`revertConsumption`).
    */
   async _applyExpectedConsumptions(
     userId: string,
     expectedConsumptions: Record<string, number>,
-    organizationId?: string
-  ): Promise<void> {
-    const usageLimitIds = Object.keys(expectedConsumptions);
-    if (usageLimitIds.length === 0) {
-      return;
+    organizationId: string,
+    options: { limits?: Record<string, unknown>; contract?: LeanContract; featureId?: string; evaluation?: any } = {}
+  ): Promise<ConsumptionOutcome> {
+    if (!organizationId) {
+      throw new Error(`An organization is required to consume the usage levels of userId ${userId}`);
     }
-
-    const targets = usageLimitIds.map(usageLimitId => {
-      const serviceName: string = usageLimitId.split('-')[0];
-      const usageLimit: string = usageLimitId.split('-')[1];
-
-      return { serviceName, usageLimit, amount: expectedConsumptions[usageLimitId] };
-    });
+    const targets = consumptionTargets(expectedConsumptions, options.limits);
+    if (targets.length === 0) {
+      return { status: 'applied', contract: options.contract as LeanContract };
+    }
 
     const increments: Record<string, number> = {};
-    for (const { serviceName, usageLimit, amount } of targets) {
+    const ceilings: Record<string, number> = {};
+    for (const { serviceName, usageLimit, amount, ceiling } of targets) {
       increments[`${serviceName}.${usageLimit}`] = amount;
+      if (ceiling !== null) ceilings[`${serviceName}.${usageLimit}`] = ceiling;
     }
 
-    const updatedContract = await this.contractRepository.incrementUsageLevels(
-      userId,
-      increments,
-      organizationId
-    );
+    if (!options.featureId) {
+      const updated = await this.contractRepository.incrementUsageLevels(userId, increments, organizationId,
+        { ceilings, ...(options.contract ? { guard: contractVersionGuard(options.contract) } : {}) });
+      if (!updated) return this._explainRejectedConsumption(userId, targets, organizationId, options.contract);
+      await this.cacheService.del(contractCacheKey(organizationId, userId));
+      return { status: 'applied', contract: updated };
+    }
 
+    // Persist the intent before touching usage. The atomic increment carries
+    // its receipt; an ambiguous write is never compensated against a newer
+    // billing period, subscription, or recreated contract.
+    const source = options.contract ?? await this.contractRepository.findByUserId(userId, organizationId);
+    if (!source) throw new Error(`Contract with userId ${userId} not found`);
+    const consumptionId = options.featureId ? randomUUID() : undefined;
+    const createdAt = new Date(), expiresAt = new Date(createdAt.getTime() + consumptionRetentionSeconds() * 1000);
+    const resetTimeStamps = Object.fromEntries(targets.map(({ serviceName, usageLimit }) =>
+      [`${serviceName}.${usageLimit}`, source.usageLevels?.[serviceName]?.[usageLimit]?.resetTimeStamp == null ? null : new Date(source.usageLevels[serviceName][usageLimit].resetTimeStamp!)]));
+    if (currentIdempotencyExecution() && options.evaluation) return executeIdempotentAction({ kind: 'consume', organizationId,
+      evaluation: options.evaluation, increments,
+      consumption: { id: consumptionId, contractId: source.id, state: 'prepared', organizationId, userId,
+        featureId: normalizeFeatureId(options.featureId), createdAt, expiresAt, source,
+        levels: targets.map(({ serviceName, usageLimit, amount }) => ({ serviceName, usageLimit, amount,
+          resetTimeStamp: resetTimeStamps[`${serviceName}.${usageLimit}`] ? new Date(resetTimeStamps[`${serviceName}.${usageLimit}`]!) : null })) },
+      writes: [{ contractId: source.id!, organizationId, userId, increments, guard: contractVersionGuard(source),
+        consume: { id: consumptionId!, expiresAt, ceilings, resetTimeStamps } }] });
+    if (consumptionId) {
+      try {
+        await this.usageConsumptionRepository.create({ id: consumptionId, contractId: source.id, state: 'prepared',
+          organizationId, userId, featureId: normalizeFeatureId(options.featureId!), createdAt, expiresAt,
+          levels: targets.map(({ serviceName, usageLimit, amount }) => ({ serviceName, usageLimit, amount,
+            resetTimeStamp: resetTimeStamps[`${serviceName}.${usageLimit}`] ? new Date(resetTimeStamps[`${serviceName}.${usageLimit}`]!) : null })) });
+      } catch (error) {
+        // A response lost after insert does not mean the durable intent is absent.
+        if (!await this.usageConsumptionRepository.find(consumptionId, { organizationId, userId, featureId: normalizeFeatureId(options.featureId!) })) throw error;
+      }
+    }
+    const updatedContract = await this.contractRepository.incrementUsageLevels(userId, increments, organizationId, {
+      ceilings, guard: contractVersionGuard(source),
+      ...(consumptionId ? { receipt: { id: consumptionId, expiresAt, contractId: source.id, resetTimeStamps } } : {}),
+    });
     if (!updatedContract) {
-      // The update requires the contract and every named usage level to exist,
-      // so it matched nothing. Which of the two is missing only matters for the
-      // message, and is worth a read to get right.
-      await this._explainMissingUsageLevels(userId, targets, organizationId);
+      if (consumptionId) await this.usageConsumptionRepository.delete(consumptionId);
+      return this._explainRejectedConsumption(userId, targets, organizationId, source);
     }
+    if (consumptionId) await this.usageConsumptionRepository.applied(consumptionId);
 
-    const appliedAt = new Date().getTime();
-
-    for (const { serviceName, usageLimit, amount } of targets) {
-      // What the level held before this call, for `_revertExpectedConsumption`.
-      // Derived from the result rather than from a prior read, so it is this
-      // caller's own contribution that gets taken back even if others landed in
-      // between.
-      await this.cacheService.set(
-        `${appliedAt}.usageLevels.${userId}.${serviceName}.${usageLimit}`,
-        updatedContract!.usageLevels[serviceName][usageLimit].consumed - amount,
-        120
-      ); // 120 secs = 2 mins
-    }
-
-    // A novation may have changed the subscription since the increment. Avoid
-    // restoring its previous plan from this consumption snapshot.
-    await this.cacheService.del(`contracts.${userId}`);
+    // Invalidate rather than restore a snapshot that a concurrent novation replaced.
+    await this.cacheService.del(contractCacheKey(organizationId, userId));
+    return { status: 'applied', contract: updatedContract, consumptionId };
   }
 
   /**
-   * Say which part of the contract was missing, having established that one was.
+   * Why a conditional consumption matched nothing, read from the stored
+   * contract: no contract or a missing usage level (errors, as before), a
+   * different subscription (`changed`), or a level that the consumption would
+   * take over its limit (`limit`). If none of these holds any more, the room
+   * was freed right after the write (a revert, a reset): `changed`, so that the
+   * caller evaluates again.
    */
-  private async _explainMissingUsageLevels(
+  private async _explainRejectedConsumption(
     userId: string,
-    targets: { serviceName: string; usageLimit: string }[],
-    organizationId?: string
-  ): Promise<never> {
+    targets: ConsumptionTarget[],
+    organizationId: string,
+    evaluated?: LeanContract
+  ): Promise<ConsumptionOutcome> {
     const contract = await this.contractRepository.findByUserId(userId, organizationId);
 
     if (!contract) {
@@ -988,7 +1225,7 @@ class ContractService {
     }
 
     const missing = targets.find(
-      ({ serviceName, usageLimit }) => !contract.usageLevels[serviceName]?.[usageLimit]
+      ({ serviceName, usageLimit }) => !contract.usageLevels?.[serviceName]?.[usageLimit]
     );
 
     if (missing) {
@@ -997,60 +1234,228 @@ class ContractService {
       );
     }
 
-    throw new Error(`Failed to update contract for userId ${userId}`);
+    await this.cacheService.set(contractCacheKey(organizationId, userId), contract, 3600, true);
+
+    if (evaluated && computeContractVersion(contract) !== computeContractVersion(evaluated)) {
+      return { status: 'changed' };
+    }
+
+    const overLimit = targets.some(
+      ({ serviceName, usageLimit, amount, ceiling }) =>
+        ceiling !== null && contract.usageLevels[serviceName][usageLimit].consumed + amount > ceiling
+    );
+
+    return overLimit ? { status: 'limit', contract } : { status: 'changed' };
   }
 
+  /**
+   * Revert one consumption by its id (`consumptionId` of the evaluation that
+   * applied it): its amounts are subtracted from the usage levels it
+   * incremented, once, never below zero, and nothing else is touched. Usage
+   * recorded since (other consumptions, increments) is kept.
+   *
+   * Reverting a consumption that was already reverted does nothing. One that
+   * does not exist in the caller's organization for this userId and feature,
+   * or whose record expired, is not found.
+   *
+   * Each usage level of the consumption is looked up by its service:
+   * - a service that the contract no longer has (a rename or move that raced
+   *   with the consumption, or the service was removed from the contract):
+   *   the consumption cannot be reverted exactly, so it is refused
+   *   (`CONFLICT:`, 409), nothing is subtracted and the record is not claimed;
+   * - a usage level that its service, still in the contract, no longer has (for
+   *   example, the pricing version was archived with a fallback that has no such
+   *   limit, which regenerates the service's levels): there is nothing to
+   *   give back for it, so it is skipped and the other levels are reverted.
+   * Renaming, moving and deleting services keep the records in step with the
+   * contracts (see `ServiceService`).
+   *
+   * @returns what was reverted and skipped when a level was skipped, so that
+   *          the caller can say so; null otherwise (every level reverted, or
+   *          the consumption had already been reverted).
+   */
+  async revertConsumption(
+    userId: string,
+    featureId: string,
+    consumptionId: string,
+    organizationId: string
+  ): Promise<ConsumptionRevertResult | null> {
+    if (!organizationId) {
+      throw new Error('INTERNAL ERROR: a consumption is reverted within the organization of its contract');
+    }
+    const scope = { organizationId, userId, featureId: normalizeFeatureId(featureId) };
+
+    const contract = await this._findContract(userId, organizationId);
+    await this._refuseDormantRevert(contract, featureId);
+
+    // Refused before it is claimed, so that it is never seen as reverted.
+    const existing = await this.usageConsumptionRepository.find(consumptionId, scope);
+    if (existing?.state === 'prepared') {
+      if (!await this.contractRepository.hasUsageConsumption(userId, organizationId, consumptionId, existing.contractId)) throw new Error(`Consumption ${consumptionId} not found for this contract`);
+      await this.usageConsumptionRepository.applied(consumptionId);
+    }
+    if (existing && !existing.revertedAt && !await this.contractRepository.hasUsageRevert(userId, organizationId, existing.id, existing.contractId)) {
+      const stored = await this.contractRepository.findByUserId(userId, organizationId);
+      if (stored) this._resolveConsumption(existing, stored);
+    }
+
+    const claimed = await this.usageConsumptionRepository.claim(consumptionId, scope);
+    if (!claimed) {
+      const existing = await this.usageConsumptionRepository.find(consumptionId, scope);
+      if (existing?.revertedAt) {
+        await this.cacheService.del(contractCacheKey(organizationId, userId));
+        await this.cacheService.del(featuresCachePattern(organizationId, userId));
+        return null;
+      }
+      throw new Error(`Consumption ${consumptionId} not found for userId ${userId} and feature ${featureId}`);
+    }
+
+    return this._takeBackConsumption(claimed);
+  }
+
+  /**
+   * Legacy revert (`?revert=true[&latest=true]` without `consumptionId`),
+   * deprecated in favour of `revertConsumption`: it picks one consumption of
+   * this userId and feature made in the last two minutes, the oldest one or,
+   * with `latest`, the most recent one, and reverts it like
+   * `revertConsumption`. It used to set the usage levels back to a cached
+   * snapshot and write the whole contract, which also undid everything
+   * recorded after that snapshot.
+   *
+   * @returns as `revertConsumption`; null also when there was nothing to revert.
+   */
   async _revertExpectedConsumption(
     userId: string,
     featureId: string,
     latest: boolean = false,
-    organizationId?: string
-  ): Promise<void> {
+    organizationId: string
+  ): Promise<ConsumptionRevertResult | null> {
     const contract = await this._findContract(userId, organizationId);
+    const scope = {
+      organizationId: contract.organizationId,
+      userId,
+      featureId: normalizeFeatureId(featureId),
+    };
 
-    const serviceName: string = featureId.split('-')[0].toLowerCase();
-    const featureName: string = featureId.split('-')[1];
+    await this._refuseDormantRevert(contract, featureId);
 
-    const pricing: LeanPricing = await this.serviceService.showPricing(
-      serviceName,
-      contract.contractedServices[serviceName],
-      contract.organizationId
+    const claimed = await this.usageConsumptionRepository.claimRecent(
+      scope,
+      new Date(Date.now() - LEGACY_REVERT_WINDOW_MS),
+      latest
     );
 
-    const affectedUsageLimits = Object.values(pricing.usageLimits || {})
-      .filter((usageLimit: LeanUsageLimit) => usageLimit.linkedFeatures?.includes(featureName))
-      .map(ul => ul.name!);
+    if (!claimed) {
+      console.log(
+        `WARNING: No recent consumption of feature ${featureId} found for userId ${userId}. Unable to perform revert operation.`
+      );
+      return null;
+    }
 
-    for (const usageLimitName of affectedUsageLimits) {
-      if (contract.usageLevels[serviceName][usageLimitName]) {
-        const previousCachedValue = await this._getCachedUsageLevel(
-          userId,
-          serviceName,
-          usageLimitName,
-          latest
-        );
+    return this._takeBackConsumption(claimed);
+  }
 
-        if (previousCachedValue === null || previousCachedValue === undefined) {
-          console.log(
-            `WARNING: No previous cached value found for limit: ${serviceName}-${usageLimitName}. Unable to perform revert operation.`
-          );
-        }else{
-          contract.usageLevels[serviceName][usageLimitName].consumed = previousCachedValue;
+  /**
+   * A consumption of a feature of a dormant (disabled or gone) service of the
+   * contract is not reverted: the usage levels of a dormant service are kept as
+   * they are until it is enabled again, so a revert is refused like a
+   * consumption (`DormantServiceError`, 409). Checked before the consumption
+   * is claimed, so that it can still be reverted once the service is enabled.
+   */
+  private async _refuseDormantRevert(contract: LeanContract, featureId: string): Promise<void> {
+    const serviceName: string = featureId.split('-')[0].toLowerCase();
+    const dormant = (await this.serviceService.dormantServices([serviceName], contract.organizationId))[serviceName];
+    if (dormant && contract.contractedServices[serviceName] !== undefined) {
+      throw new DormantServiceError(serviceName, dormant);
+    }
+  }
+
+  /**
+   * Which levels of a consumption the contract can take back: those of a
+   * service of the contract that still has the level (`present`), and those
+   * that the service no longer has (`skipped`: nothing to give back).
+   * `services` are the keys of those services in `contractedServices`.
+   *
+   * @throws `CONFLICT:` (409) when a level belongs to a service that the
+   *         contract no longer has: the consumption cannot be reverted
+   *         exactly. The message must not say "not found", which would be
+   *         answered as an unknown consumption (404) and keep the claim.
+   */
+  private _resolveConsumption(
+    consumption: UsageConsumption,
+    contract: LeanContract
+  ): { present: UsageConsumption['levels']; skipped: UsageConsumption['levels']; services: string[] } {
+    const contracted = contract.contractedServices instanceof Map
+      ? Object.fromEntries(contract.contractedServices as Map<string, string>)
+      : contract.contractedServices ?? {};
+    const serviceKeys = new Map(Object.keys(contracted).map(key => [key.toLowerCase(), key]));
+
+    const gone = consumption.levels.filter(({ serviceName }) => !serviceKeys.has(serviceName.toLowerCase()));
+    if (gone.length > 0) {
+      const names = [...new Set(gone.map(({ serviceName }) => serviceName))];
+      throw new Error(
+        `CONFLICT: Consumption ${consumption.id} cannot be reverted: the contract of userId ${consumption.userId} ` +
+          `no longer has service ${names.join(', ')} (usage level ` +
+          `${gone.map(({ serviceName, usageLimit }) => `${serviceName}.${usageLimit}`).join(', ')}); nothing was subtracted`
+      );
+    }
+
+    const has = ({ serviceName, usageLimit }: UsageConsumption['levels'][number]) =>
+      !!contract.usageLevels?.[serviceName]?.[usageLimit];
+    return {
+      present: consumption.levels.filter(has),
+      skipped: consumption.levels.filter(level => !has(level)),
+      services: [...new Set(consumption.levels.map(({ serviceName }) => serviceKeys.get(serviceName.toLowerCase())!))],
+    };
+  }
+
+  /**
+   * Subtract a claimed consumption; the claim is given back if that fails, so that the revert can be retried.
+   *
+   * @returns what was reverted and skipped when a level was skipped (see
+   *          `revertConsumption`), null when every level was reverted.
+   */
+  private async _takeBackConsumption(consumption: UsageConsumption): Promise<ConsumptionRevertResult | null> {
+    const { userId, organizationId } = consumption;
+    if (currentIdempotencyExecution()) {
+      const contract = await this.contractRepository.findByUserId(userId, organizationId);
+      if (!contract) throw new Error('Contract not found');
+      const { present, skipped, services } = this._resolveConsumption(consumption, contract);
+      return executeIdempotentAction({ kind: 'revert', organizationId, consumption,
+        writes: [{ contractId: consumption.contractId ?? contract.id!, organizationId, userId, refund: { id: consumption.id, expiresAt: consumption.expiresAt, services, absent: skipped.map(level => `${level.serviceName}.${level.usageLimit}`), levels: present.map(level => ({ path: `${level.serviceName}.${level.usageLimit}`, amount: level.amount, resetTimeStamp: level.resetTimeStamp })) } }],
+        result: skipped.length === 0 ? null : { consumptionId: consumption.id,
+          reverted: Object.fromEntries(present.map(({ serviceName, usageLimit, amount }) => [`${serviceName}-${usageLimit}`, amount])),
+          skipped: skipped.map(({ serviceName, usageLimit }) => `${serviceName}-${usageLimit}`) } });
+    }
+    // Requested and completed are separate states. The receipt is persisted in
+    // the SAME contract write as the subtraction, so interrupted acknowledgement
+    // or cache invalidation can never make a retry subtract twice.
+    if (!await this.contractRepository.hasUsageRevert(userId, organizationId, consumption.id, consumption.contractId)) {
+      let done = false;
+      for (let attempt = 0; attempt < 3 && !done; attempt++) {
+        const contract = await this.contractRepository.findByUserId(userId, organizationId);
+        if (!contract || (consumption.contractId && contract.id !== consumption.contractId)) throw new Error(`Consumption ${consumption.id} not found for this contract`);
+        const { present, skipped, services } = this._resolveConsumption(consumption, contract);
+        done = await this.contractRepository.decrementUsageLevels(userId, organizationId,
+          present.map(({ serviceName, usageLimit, amount, resetTimeStamp }) => ({ path: `${serviceName}.${usageLimit}`, amount, resetTimeStamp: resetTimeStamp ? new Date(resetTimeStamp) : null })),
+          { services, absent: skipped.map(({ serviceName, usageLimit }) => `${serviceName}.${usageLimit}`),
+            receipt: { id: consumption.id, expiresAt: consumption.expiresAt, contractId: consumption.contractId } });
+        if (done) {
+          await this.usageConsumptionRepository.complete(consumption.id);
+          await this.cacheService.del(contractCacheKey(organizationId, userId));
+          await this.cacheService.del(featuresCachePattern(organizationId, userId));
+          return skipped.length === 0 ? null : { consumptionId: consumption.id,
+            reverted: Object.fromEntries(present.map(({ serviceName, usageLimit, amount }) => [`${serviceName}-${usageLimit}`, amount])),
+            skipped: skipped.map(({ serviceName, usageLimit }) => `${serviceName}-${usageLimit}`) };
         }
-      } else {
-        throw new Error(
-          `Usage level ${serviceName}-${usageLimitName} not found in contract for user ${contract.userContact.username}`
-        );
+        done = await this.contractRepository.hasUsageRevert(userId, organizationId, consumption.id, consumption.contractId);
       }
+      if (!done) throw new Error(`Failed to revert consumption ${consumption.id} for userId ${userId}`);
     }
-
-    const updatedContract = await this.contractRepository.update(userId, contract, contract.organizationId);
-
-    if (!updatedContract) {
-      throw new Error(`Failed to update contract for userId ${userId}`);
-    }
-
-    await this.cacheService.set(`contracts.${userId}`, updatedContract, 3600, true); // Cache for 1 hour
+    await this.usageConsumptionRepository.complete(consumption.id);
+    await this.cacheService.del(contractCacheKey(organizationId, userId));
+    await this.cacheService.del(featuresCachePattern(organizationId, userId));
+    return null;
   }
 
   async prune(organizationId?: string, reqUser?: LeanUser): Promise<number> {
@@ -1067,48 +1472,37 @@ class ContractService {
     for (const org of organizations) {
       const clean = async (assertOwned: () => Promise<void>) => {
         await assertOwned();
+        // What each deleted contract was, for its CONTRACT_DELETED event.
+        const deleted = await this.contractRepository.findEventSummaries(org);
         removed += await this.contractRepository.prune(org);
+        const occurredAt = new Date();
+        for (const contract of deleted) this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true, occurredAt });
         const services = await ServiceModel.find({ organizationId: org, source: 'sphere' }).select('_id').lean();
         for (const service of services) await container.resolve('sphereSyncService').cleanup(String(service._id), assertOwned);
+        await this.usageConsumptionRepository.deleteAll(org);
       };
       if (await ServiceModel.exists({ organizationId: org, source: 'sphere' })) await withOrganizationLock(org, clean);
       else await clean(async () => {});
     }
-    await this.cacheService.del('contracts.*');
-    await this.cacheService.del('features.*');
+    if (organizationId) {
+      await this.cacheService.delMany(organizationContractCachePatterns(organizationId));
+    } else {
+      await this.cacheService.del('contracts.*');
+      await this.cacheService.del('features.*');
+    }
     return removed;
   }
 
-  async destroy(userId: string, organizationId?: string): Promise<void> {
+  async destroy(userId: string, organizationId: string): Promise<void> {
     const contract = await this._findContract(userId, organizationId);
 
     await this.contractRepository.destroy(userId, contract.organizationId);
+    const occurredAt = new Date();
 
-    this.cacheService.del(`contracts.${userId}`);
-  }
-
-  async _getCachedUsageLevel(
-    userId: string,
-    serviceName: string,
-    usageLimit: string,
-    latest: boolean = false
-  ): Promise<number | null> {
-    let cachedValues: string[] = await this.cacheService.match(
-      `*.usagelevels.${userId}.${serviceName}.${usageLimit}`
-    );
-    cachedValues = cachedValues.sort((a, b) => {
-      const aTimestamp = parseInt(a.split('.')[0]);
-      const bTimestamp = parseInt(b.split('.')[0]);
-      return aTimestamp - bTimestamp;
-    });
-
-    if (cachedValues.length === 0) {
-      return null;
-    }
-
-    return await this.cacheService.get(
-      latest ? cachedValues[cachedValues.length - 1] : cachedValues[0]
-    );
+    // A contract created later with this userId starts without revertible consumptions.
+    await this.usageConsumptionRepository.deleteAll(contract.organizationId, userId);
+    await this.cacheService.delMany(contractCacheKeys(contract));
+    this._events()?.emitContractEvent('CONTRACT_DELETED', contract, { deleted: true, occurredAt });
   }
 
   async _createUsageLevels(
@@ -1134,9 +1528,14 @@ class ContractService {
     return usageLevels;
   }
 
-  _discoverUsageLimitServices(contract: LeanContract, usageLimit: string): string[] {
+  _discoverUsageLimitServices(
+    contract: LeanContract,
+    usageLimit: string,
+    dormant: Record<string, DormantReason> = {}
+  ): string[] {
     const serviceNames: string[] = [];
     for (const serviceName in contract.usageLevels) {
+      if (dormant[serviceName.toLowerCase()]) continue;
       if (contract.usageLevels[serviceName][usageLimit]) {
         serviceNames.push(serviceName);
       }
@@ -1147,11 +1546,14 @@ class ContractService {
   async _resetUsageLimitUsageLevels(
     contract: LeanContract,
     usageLimit: string,
-    organizationId: string
+    organizationId: string,
+    dormant: Record<string, DormantReason> = {}
   ): Promise<void> {
-    const serviceNames: string[] = this._discoverUsageLimitServices(contract, usageLimit);
+    const serviceNames: string[] = this._discoverUsageLimitServices(contract, usageLimit, dormant);
 
     if (serviceNames.length === 0) {
+      const [dormantService] = this._discoverUsageLimitServices(contract, usageLimit);
+      if (dormantService) throw new DormantServiceError(dormantService.toLowerCase(), dormant[dormantService.toLowerCase()]);
       throw new Error(
         `Usage limit: ${usageLimit} not found in the contract. Maybe it's not being tracked as usage level`
       );
@@ -1189,9 +1591,11 @@ class ContractService {
   async _resetUsageLevels(
     contract: LeanContract,
     renewableOnly: boolean,
-    organizationId: string
+    organizationId: string,
+    dormant: Record<string, DormantReason> = {}
   ): Promise<void> {
     for (const serviceName in contract.usageLevels) {
+      if (dormant[serviceName.toLowerCase()]) continue;
       for (const usageLimit in contract.usageLevels[serviceName]) {
         if (renewableOnly && !contract.usageLevels[serviceName][usageLimit].resetTimeStamp) {
           continue;
@@ -1204,6 +1608,20 @@ class ContractService {
     }
   }
 
+  /**
+   * Renew the renewable usage levels whose period ended: `consumed` back to 0
+   * and `resetTimeStamp` moved forward by whole periods until it is in the
+   * future. Each level is written on its own and only while its stored
+   * `resetTimeStamp` is still the one that ended, so it is renewed once per
+   * period even when several evaluations notice the end at the same time
+   * (consumptions applied right after the first renewal are not reset by the
+   * others), and nothing else of the contract is written.
+   *
+   * Before, the new `resetTimeStamp` was computed but never stored: once a
+   * period had ended, every evaluation reset the level again.
+   *
+   * @returns the stored contract after the renewals.
+   */
   async _resetRenewableUsageLevels(
     contract: LeanContract,
     usageLimitsToRenew: string[],
@@ -1213,36 +1631,46 @@ class ContractService {
       return contract;
     }
 
-    const contractToUpdate = { ...contract };
+    const userId = contract.userContact.userId;
+    const now = new Date();
 
     for (const usageLimitId of usageLimitsToRenew) {
       const serviceName: string = usageLimitId.split('-')[0];
       const usageLimitName: string = usageLimitId.split('-')[1];
-      let currentResetTimeStamp =
-        contractToUpdate.usageLevels[serviceName][usageLimitName].resetTimeStamp;
+      const stored = contract.usageLevels?.[serviceName]?.[usageLimitName]?.resetTimeStamp;
 
-      if (currentResetTimeStamp && isAfter(new Date(), currentResetTimeStamp)) {
-        const pricing: LeanPricing = await this.serviceService.showPricing(
-          serviceName,
-          contractToUpdate.contractedServices[serviceName],
-          organizationId
-        );
-        currentResetTimeStamp = addPeriodToDate(
-          currentResetTimeStamp,
-          pricing.usageLimits![usageLimitName].period!
-        );
-        contractToUpdate.usageLevels[serviceName][usageLimitName].consumed = 0;
+      if (!stored || !isAfter(now, new Date(stored))) continue;
+
+      const pricing: LeanPricing = await this.serviceService.showPricing(
+        serviceName,
+        contract.contractedServices[serviceName],
+        organizationId
+      );
+      const period = pricing.usageLimits?.[usageLimitName]?.period;
+      if (!period) continue;
+
+      const ended = new Date(stored);
+      let next = addPeriodToDate(ended, period);
+      for (let periods = 1; !isAfter(next, now) && periods < 100_000; periods++) {
+        next = addPeriodToDate(next, period);
       }
+      if (!isAfter(next, now)) next = addPeriodToDate(now, period);
+
+      const path = `${serviceName}.${usageLimitName}`;
+      // No match: another evaluation renewed it first (or it is gone).
+      await this.contractRepository.setUsageLevels(
+        userId,
+        contract.organizationId,
+        { [path]: { consumed: 0, resetTimeStamp: next } },
+        { [path]: ended }
+      );
     }
 
-    const updatedContract = await this.contractRepository.update(
-      contract.userContact.userId,
-      contractToUpdate,
-      contract.organizationId
-    );
+    await this.cacheService.del(contractCacheKey(contract.organizationId, userId));
+    const updatedContract = await this.contractRepository.findByUserId(userId, contract.organizationId);
 
     if (!updatedContract) {
-      throw new Error(`Failed to update contract for userId ${contract.userContact.userId}`);
+      throw new Error(`Failed to update contract for userId ${userId}`);
     }
 
     return updatedContract;

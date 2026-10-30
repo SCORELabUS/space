@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import mongoose from 'mongoose';
 import nock from 'nock';
 import fs from 'node:fs/promises';
+import { AsyncResource } from 'node:async_hooks';
 const mocks = vi.hoisted(() => ({ cache: { del: vi.fn(async () => {}), get: vi.fn(async () => null), set: vi.fn(async () => {}) }, events: { emitPricingActivedMessage: vi.fn(), emitServiceDisabledMessage: vi.fn() } }));
 vi.mock('../main/config/container', async () => {
   const Repository = (await import('../main/repositories/mongoose/SphereSyncRepository')).default;
@@ -15,7 +16,8 @@ import Pricing from '../main/repositories/mongoose/models/PricingMongoose';
 import Contract from '../main/repositories/mongoose/models/ContractMongoose';
 import { SphereLease, SphereRun } from '../main/repositories/mongoose/models/SphereSyncMongoose';
 import { enforceSpherePolicy } from '../main/services/sphere/contractPolicy';
-import { withOrganizationLock } from '../main/services/sphere/lock';
+import { withOrganizationLock, withOrganizationLocks } from '../main/services/sphere/lock';
+import { featuresCachePattern } from '../main/utils/contracts/cacheKeys';
 import { pricingYamlFile } from '../main/services/pricingFiles';
 const id = '111111111111111111111111', one = '222222222222222222222222', two = '333333333333333333333333';
 const origin = 'https://sphere.score.us.es';
@@ -99,7 +101,7 @@ describe('SPHERE synchronization with isolated MongoDB', () => {
     expect(current.billingPeriod.startDate).toEqual(new Date('2024-01-01'));
     expect(current.synchronizationHistory).toHaveLength(1);
     expect(await Pricing.countDocuments()).toBe(1);
-    expect(mocks.cache.del).toHaveBeenCalledWith('features.user.*');
+    expect(mocks.cache.del).toHaveBeenCalledWith(featuresCachePattern('org', 'user'));
   });
   it('blocks an impossible fallback before modifying contracts and removes staged copies', async () => {
     const service = await create('all_last'); await contract(); await update(service, yaml('2.0', 'sales', 'Contact sales'));
@@ -206,11 +208,75 @@ describe('SPHERE synchronization with isolated MongoDB', () => {
     const service = await create(); const existing = await contract();
     await withOrganizationLock('org', owned => sync.removeLinkedService(String(service.id), disable, owned));
     const updated: any = await Contract.findById(existing._id).lean();
-    expect(updated.contractedServices).toEqual({ other: 'old' });
-    expect(updated.subscriptionPlans).toEqual({ other: 'keep' });
-    expect(updated.billingPeriod.startDate).toEqual(existing.billingPeriod!.startDate);
+    if (disable) {
+      expect(updated).toEqual(existing.toObject({ flattenMaps: true }));
+      expect((await Service.findById(service.id).lean())?.disabled).toBe(true);
+    } else {
+      expect(updated.contractedServices).toEqual({ other: 'old' });
+      expect(updated.subscriptionPlans).toEqual({ other: 'keep' });
+      expect(updated.usageLevels.demo).toBeUndefined();
+      expect(updated.billingPeriod.startDate).toEqual(existing.billingPeriod!.startDate);
+    }
     expect(await Pricing.countDocuments()).toBe(disable ? 1 : 0);
     expect(await Service.countDocuments()).toBe(disable ? 1 : 0);
+  });
+  it('pauses without changing contracts, retained snapshots or credential and performs no remote check while disabled', async () => {
+    const service = await create(); await contract(); await update(service, yaml('2.0', 'basic'));
+    const encryptedApiKey = { v: 1, iv: 'opaque-iv', tag: 'opaque-tag', data: 'encrypted-secret', origin, pricingId: id };
+    await Service.collection.updateOne({ _id: new mongoose.Types.ObjectId(service.id) }, { $set: { 'sphere.encryptedApiKey': encryptedApiKey } });
+    const before = await Contract.findOne({}).lean();
+    const configuration = (await Service.findById(service.id).lean() as any).sphere;
+    const copies = await Pricing.find({}).sort({ version: 1 }).lean();
+    expect(copies.map(copy => copy.version)).toEqual(['1_0', '2_0']);
+    const bytes = await Promise.all(copies.map(copy => fs.readFile(pricingYamlFile(copy.yamlPath!)!, 'utf8')));
+
+    await withOrganizationLock('org', owned => sync.removeLinkedService(String(service.id), true, owned));
+    const remoteCheck = nock(origin).get(`/api/v1/public/pricings/${id}`).reply(503);
+    await sync.synchronize(String(service.id));
+    expect(remoteCheck.isDone()).toBe(false);
+    expect(await Contract.findOne({}).lean()).toEqual(before);
+    expect((await Service.findById(service.id).lean() as any).sphere).toEqual(configuration);
+    expect(await Pricing.find({}).sort({ version: 1 }).lean()).toEqual(copies);
+    expect(await Promise.all(copies.map(copy => fs.readFile(pricingYamlFile(copy.yamlPath!)!, 'utf8')))).toEqual(bytes);
+    expect(mocks.cache.del).toHaveBeenCalledWith('features.org.*');
+  });
+  it.each(['new_last', 'all_last'] as const)('resumes %s through the normal synchronization policy without resetting billing or consumption', async policy => {
+    const service = await create(policy); const existing = await contract();
+    const before: any = await Contract.findById(existing._id).lean();
+    await withOrganizationLock('org', owned => sync.removeLinkedService(String(service.id), true, owned));
+    const resumed = await sync.resume('org', 'demo');
+    expect(resumed.disabled).toBe(false);
+    expect(resumed.configuration.policy).toBe(policy);
+    expect(resumed.configuration.status).toBe('queued');
+    expect(await Contract.findById(existing._id).lean()).toEqual(before);
+
+    const text = yaml('2.0', 'basic');
+    remote([v(one, '1.0', yaml('1.0')), v(two, '2.0', text)], { [two]: text });
+    await sync.synchronize(String(service.id));
+    const after: any = await Contract.findById(existing._id).lean();
+    expect((await sync.get('org', 'demo')).configuration.target.version).toBe('2.0');
+    expect(after.contractedServices.demo).toBe(policy === 'all_last' ? '2_0' : '1_0');
+    expect(after.contractedServices.other).toBe('old');
+    expect(after.usageLevels).toEqual(before.usageLevels);
+    expect(after.billingPeriod).toEqual(before.billingPeriod);
+    expect(after.subscriptionPlans).toEqual(before.subscriptionPlans);
+    expect(after.subscriptionAddOns).toEqual(before.subscriptionAddOns);
+    expect(await Pricing.countDocuments()).toBe(policy === 'all_last' ? 1 : 2);
+  });
+  it('explicitly deleting a paused linked service still removes its binding and snapshots', async () => {
+    const service = await create(); const existing = await contract();
+    await withOrganizationLock('org', owned => sync.removeLinkedService(String(service.id), true, owned));
+    expect((await Contract.findById(existing._id).lean() as any).contractedServices.demo).toBe('1_0');
+    const copies = await Pricing.find({}).lean();
+    await withOrganizationLock('org', owned => sync.removeLinkedService(String(service.id), false, owned));
+    const after: any = await Contract.findById(existing._id).lean();
+    expect(after.contractedServices).toEqual({ other: 'old' });
+    expect(after.subscriptionPlans).toEqual({ other: 'keep' });
+    expect(after.usageLevels.demo).toBeUndefined();
+    expect(after.synchronizationHistory.at(-1).reason).toBe('service_removed');
+    expect(await Service.countDocuments()).toBe(0);
+    expect(await Pricing.countDocuments()).toBe(0);
+    for (const copy of copies) await expect(fs.access(pricingYamlFile(copy.yamlPath!)!)).rejects.toThrow();
   });
   it('rejects writes from a worker that has lost its lease', async () => {
     const service = await create();
@@ -220,10 +286,22 @@ describe('SPHERE synchronization with isolated MongoDB', () => {
     });
     expect((await Service.findById(service.id).lean())?.disabled).toBe(false);
   });
-  it('excludes simultaneous organization writers' , async () => {
-    await withOrganizationLock('org', async () => {
-      await expect(withOrganizationLock('org', async () => {})).rejects.toThrow('busy');
+  it('allows nested ownership while excluding independent organization writers', async () => {
+    const competing = new AsyncResource('independent-organization-writer');
+    try {
+      await withOrganizationLock('org', async () => {
+        await expect(withOrganizationLock('org', async () => true)).resolves.toBe(true);
+        await expect(competing.runInAsyncScope(() => withOrganizationLock('org', async () => {}))).rejects.toThrow('busy');
+      });
+      await expect(withOrganizationLock('org', async () => true)).resolves.toBe(true);
+    } finally { competing.emitDestroy(); }
+  });
+  it('checks every acquired organization lease before a write', async () => {
+    const service = await create();
+    await withOrganizationLocks(['org', 'another'], async () => {
+      await SphereLease.updateOne({ _id: 'sphere:another' }, { $set: { owner: 'replacement' } });
+      await expect(Service.updateOne({ _id: service.id }, { $set: { disabled: true } })).rejects.toThrow('lock lost');
     });
-    await expect(withOrganizationLock('org', async () => true)).resolves.toBe(true);
+    expect((await Service.findById(service.id).lean())?.disabled).toBe(false);
   });
 });

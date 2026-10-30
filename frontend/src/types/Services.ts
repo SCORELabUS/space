@@ -122,6 +122,7 @@ export interface SubscriptionConstraint {
 }
 
 export type ServiceQueryFilters = {
+  disabled?: boolean;
   name?: string;
   page?: number;
   offset?: number;

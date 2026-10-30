@@ -7,7 +7,15 @@ import { LeanPricing } from '../../types/models/Pricing';
 /** Escape a string for use as a literal inside a regular expression. */
 const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/**
+ * Condition that matches exactly this service name, case-insensitively.
+ * Names come from URLs, pricings and contracts: they are never patterns, and
+ * one must not match another that contains it (`zoom` and `zoom-pro`).
+ */
+export const exactName = (name: string) => ({ $regex: `^${escapeRegex(name)}$`, $options: 'i' });
+
 export type ServiceQueryFilters = {
+  disabled?: boolean;
   name?: string;
   page?: number;
   offset?: number;
@@ -17,11 +25,12 @@ export type ServiceQueryFilters = {
 
 class ServiceRepository extends RepositoryBase {
   async findAll(organizationId?: string, queryFilters?: ServiceQueryFilters, disabled = false) {
-    const { name, page = 1, offset = 0, limit = 20, order = 'asc' } = queryFilters || {};
+    const { name, page = 1, offset = 0, limit = 20, order = 'asc', disabled: selectedDisabled = disabled } = queryFilters || {};
 
     const query: any = {
-      ...(name ? { name: { $regex: name, $options: 'i' } } : {}),
-      disabled: disabled,
+      // Partial match ("contains"), of the text as written.
+      ...(name ? { name: { $regex: escapeRegex(name), $options: 'i' } } : {}),
+      disabled: selectedDisabled,
       ...(organizationId ? { organizationId: organizationId } : {}),
     };
 
@@ -51,6 +60,15 @@ class ServiceRepository extends RepositoryBase {
     return services.map(service => service.toObject() as unknown as LeanService);
   }
 
+  /** Every service of the organization, enabled or disabled, with its pricing locators only. */
+  async findPricingLocators(organizationId: string): Promise<LeanService[]> {
+    const services = await ServiceMongoose.find(
+      { organizationId: organizationId },
+      { name: 1, activePricings: 1, archivedPricings: 1 }
+    );
+    return services.map(service => service.toObject() as unknown as LeanService);
+  }
+
   async findByName(
     name: string,
     organizationId: string,
@@ -58,7 +76,7 @@ class ServiceRepository extends RepositoryBase {
   ): Promise<LeanService | null> {
     // Exact, case-insensitive: the name comes from the URL and is not a pattern.
     const query: any = {
-      name: { $regex: `^${escapeRegex(name)}$`, $options: 'i' },
+      name: exactName(name),
       disabled: disabled,
       organizationId: organizationId,
     };
@@ -91,11 +109,11 @@ class ServiceRepository extends RepositoryBase {
   async findPricingsByServiceName(
     serviceName: string,
     versionsToRetrieve: string[],
-    organizationId?: string,
-    disabled = false
+    organizationId: string
   ): Promise<LeanPricing[] | null> {
+    // Exact: the pricings of `zoom` are not those of `zoom-pro`.
     const query: any = {
-      _serviceName: { $regex: serviceName, $options: 'i' },
+      _serviceName: exactName(serviceName),
       version: { $in: versionsToRetrieve },
       _organizationId: organizationId,
     };
@@ -114,10 +132,8 @@ class ServiceRepository extends RepositoryBase {
   }
 
   async update(name: string, data: any, organizationId: string) {
-    const query: any = { name: { $regex: `^${escapeRegex(name)}$`, $options: 'i' }, organizationId };
-    if (organizationId) {
-      query.organizationId = organizationId;
-    }
+    // Exact, case-insensitive: another service whose name contains this one must not match.
+    const query: any = { name: exactName(name), organizationId: organizationId };
 
     // 1. Separate the $set operations (update) and $unset operations (delete)
     const $set: any = {};
@@ -149,7 +165,7 @@ class ServiceRepository extends RepositoryBase {
   }
 
   async disable(name: string, organizationId: string) {
-    const query: any = { name: { $regex: name, $options: 'i' }, organizationId: organizationId };
+    const query: any = { name: exactName(name), organizationId: organizationId };
     const service = await ServiceMongoose.findOne(query);
 
     if (!service) {
@@ -187,35 +203,28 @@ class ServiceRepository extends RepositoryBase {
     return service.toObject() as unknown as LeanService;
   }
 
-  async destroy(name: string, organizationId: string, ...args: any) {
-    const query: any = { name: { $regex: name, $options: 'i' }, organizationId: organizationId };
-    const result = await ServiceMongoose.deleteOne(query);
-
-    if (!result) {
-      return null;
-    }
-    if (result.deletedCount === 0) {
-      return null;
-    }
-
-    if (result.deletedCount === 1) {
-      await PricingMongoose.deleteMany({ _serviceName: name });
-    }
-
-    return true;
+  /**
+   * Delete one service of the organization (exact name, case-insensitive).
+   * Its pricing documents are not deleted here: see
+   * `ServiceService._deletePricingsOfServices`, which deletes those of exactly
+   * the deleted services, with their files.
+   *
+   * @returns the deleted service, or null when there was none.
+   */
+  async destroy(name: string, organizationId: string): Promise<LeanService | null> {
+    const service = await ServiceMongoose.findOneAndDelete({ name: exactName(name), organizationId: organizationId });
+    return service ? (service.toObject() as unknown as LeanService) : null;
   }
 
-  async prune(organizationId?: string): Promise<number | null> {
-    const query: any = {};
-    if (organizationId) {
-      query.organizationId = organizationId;
-    }
-    const result = await ServiceMongoose.deleteMany(query);
-
-    if (result.deletedCount === 0) {
-      return null;
-    }
-
+  /**
+   * Delete these services (by id) of the organization, and no other: a
+   * service created after they were read is left alone.
+   *
+   * @returns how many were deleted.
+   */
+  async destroyByIds(ids: string[], organizationId: string): Promise<number> {
+    if (ids.length === 0) return 0;
+    const result = await ServiceMongoose.deleteMany({ _id: { $in: ids }, organizationId: organizationId });
     return result.deletedCount;
   }
 }
