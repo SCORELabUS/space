@@ -16,3 +16,11 @@ export class SphereAuthError extends Error {
     this.name = 'SphereAuthError';
   }
 }
+
+/** SPHERE hides both missing resources and resources the caller cannot read. */
+export class SphereResourceUnavailableError extends Error {
+  constructor() {
+    super('SPHERE pricing is unavailable or requires access');
+    this.name = 'SphereResourceUnavailableError';
+  }
+}

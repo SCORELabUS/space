@@ -166,7 +166,7 @@ paths:
     post:
       security:
         - ApiKeyAuth: []
-      summary: Preview a public SPHERE permanent link
+      summary: Preview a SPHERE pricing and validate access
       requestBody:
         content:
           application/json:
@@ -181,12 +181,19 @@ paths:
                   enum: [all_last, new_last, all_pick, new_pick]
                 selectedVersionId:
                   type: string
+                serviceName:
+                  type: string
+                  description: >-
+                    Optional existing linked service in the authenticated organization. The permanent link must
+                    match its stored pricing identity. If sphereApiKey is omitted, the server uses its stored
+                    credential without returning it to the caller.
                 sphereApiKey:
                   type: string
+                  nullable: true
                   writeOnly: true
                   description: >-
-                    Optional SPHERE API key (`sk-...`) used for this preview only, never stored. With it SPHERE also
-                    lists the private versions the key may read, flagged `private: true`.
+                    Optional SPHERE API key used for this preview only, never stored. With it SPHERE also lists
+                    permitted private versions. Null previews anonymous access, even when serviceName has a saved key.
       responses:
         "200":
           description: Successful response
@@ -195,7 +202,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/SphereManifest'
         "400":
-          description: Invalid source or configuration
+          description: Invalid configuration, restricted or unavailable SPHERE pricing, rejected key or unavailable credential storage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  code:
+                    type: string
+                    enum: [SPHERE_ACCESS_REQUIRED, SPHERE_KEY_REJECTED, SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE]
+                    description: >-
+                      Present for access/key/storage failures. ACCESS_REQUIRED does not prove a resource is private:
+                      SPHERE also hides missing resources with 404. Network and upstream 500 failures do not use an access code.
         "404":
           description: Resource not available
         "202":
@@ -323,7 +342,7 @@ paths:
     post:
       security:
         - ApiKeyAuth: []
-      summary: Preview a public SPHERE permanent link
+      summary: Preview a SPHERE pricing and validate access
       parameters:
         - in: path
           name: organizationId
@@ -344,12 +363,19 @@ paths:
                   enum: [all_last, new_last, all_pick, new_pick]
                 selectedVersionId:
                   type: string
+                serviceName:
+                  type: string
+                  description: >-
+                    Optional existing linked service in the authenticated organization. The permanent link must
+                    match its stored pricing identity. If sphereApiKey is omitted, the server uses its stored
+                    credential without returning it to the caller.
                 sphereApiKey:
                   type: string
+                  nullable: true
                   writeOnly: true
                   description: >-
-                    Optional SPHERE API key (`sk-...`) used for this preview only, never stored. With it SPHERE also
-                    lists the private versions the key may read, flagged `private: true`.
+                    Optional SPHERE API key used for this preview only, never stored. With it SPHERE also lists
+                    permitted private versions. Null previews anonymous access, even when serviceName has a saved key.
       responses:
         "200":
           description: Successful response
@@ -358,7 +384,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/SphereManifest'
         "400":
-          description: Invalid source or configuration
+          description: Invalid configuration, restricted or unavailable SPHERE pricing, rejected key or unavailable credential storage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  code:
+                    type: string
+                    enum: [SPHERE_ACCESS_REQUIRED, SPHERE_KEY_REJECTED, SPHERE_CREDENTIAL_STORAGE_UNAVAILABLE]
+                    description: >-
+                      Present for access/key/storage failures. ACCESS_REQUIRED does not prove a resource is private:
+                      SPHERE also hides missing resources with 404. Network and upstream 500 failures do not use an access code.
         "404":
           description: Resource not available
         "202":

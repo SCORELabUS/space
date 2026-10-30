@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import yaml from 'js-yaml';
 import { SphereManifest } from './types';
 import { escapeVersion } from '../../utils/helpers';
-import { SphereAuthError } from './errors';
+import { SphereAuthError, SphereResourceUnavailableError } from './errors';
 import { proxyAgentFor } from '../../utils/proxy';
 
 export function functionalHash(text: string): string {
@@ -70,9 +70,10 @@ export default class SphereClient {
         agent: proxyAgentFor(url), signal: controller.signal, redirect: 'error', size: 5 * 1024 * 1024,
         headers: apiKey ? { 'x-api-key': apiKey, 'cache-control': 'no-store' } : undefined,
       });
-      if (apiKey && (response.status === 401 || response.status === 403)) {
+      if (response.status === 401 || response.status === 403) {
         throw new SphereAuthError(response.status);
       }
+      if (response.status === 404) throw new SphereResourceUnavailableError();
       if (!response.ok) throw new Error(`SPHERE unavailable (${response.status}); keeping local copies`);
       return await response.text();
     } finally { clearTimeout(timeout); }

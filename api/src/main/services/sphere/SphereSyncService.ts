@@ -28,11 +28,24 @@ export default class SphereSyncService {
   /**
    * `config.sphereApiKey` (optional) is used for this request only: preview
    * never stores it, so private versions can be inspected before linking.
+   * A scoped service preview may reuse its stored credential without exposing
+   * it to the caller. Explicit null still previews anonymous access.
    */
-  async preview(config: SphereConfiguration) {
+  async preview(config: SphereConfiguration, organizationId?: string, serviceName?: string) {
     const link = this.client.parseLink(config.permanentUrl);
     if (config.sphereApiKey != null && !isValidSphereApiKey(config.sphereApiKey)) throw new Error('Invalid sphereApiKey');
-    const apiKey = config.sphereApiKey ?? undefined;
+    let apiKey = config.sphereApiKey ?? undefined;
+    if (serviceName !== undefined) {
+      if (typeof serviceName !== 'string' || !serviceName.trim()) throw new Error('Invalid serviceName');
+      if (typeof organizationId !== 'string' || !organizationId) throw new Error('Organization ID is required');
+      const service: any = await this.repository.service({ organizationId, name: serviceName, source: 'sphere', disabled: false });
+      if (!service) throw new Error('Linked service not found');
+      const storedLink = this.client.parseLink(service.sphere.permanentUrl);
+      if (link.pricingId !== service.sphere.pricingId || link.permanentUrl !== storedLink.permanentUrl) {
+        throw new Error('Changing pricing identity is not supported');
+      }
+      if (config.sphereApiKey === undefined) apiKey = await this.apiKey(service);
+    }
     const manifest = await this.client.manifest(link.pricingId, apiKey);
     const target = selectVersion(manifest, config);
     return { ...manifest, ...link, syntaxUpgrade: await this.inspectSyntaxUpgrade(link.pricingId, target, apiKey) };
