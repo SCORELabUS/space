@@ -71,6 +71,24 @@ for (const operation of ['save', 'updateOne', 'updateMany', 'findOneAndUpdate', 
   contractSchema.pre(operation, async function () { await assertOrganizationLease(); });
 }
 
+// Deleting a contract must not erase the only proof of a persisted operation.
+// Checkpoint that proof first, so retrying its key cannot recreate a deleted
+// contract or apply an old delta to a new contract with the same userId.
+for (const operation of ['deleteOne', 'deleteMany', 'findOneAndDelete'] as const) {
+  contractSchema.pre(operation, async function (this: any) {
+    const documents: any[] = await this.model.find({ $and: [this.getFilter(), { 'idempotencyReceipt.acknowledged': false }] })
+      .select('+idempotencyReceipt').lean();
+    for (const document of documents) {
+      const receipt = document.idempotencyReceipt;
+      if (!receipt?.key) continue;
+      const { default: Journal } = await import('../IdempotencyKeyRepository');
+      const saved = await new Journal().recoverAppliedStep(receipt.organizationId, receipt.key,
+        receipt.operationId, receipt.stepId, receipt.result, true);
+      if (!saved) throw new Error('Cannot delete a contract before its pending operation receipt is checkpointed; retry');
+    }
+  });
+}
+
 const contractModel = mongoose.model('Contract', contractSchema, 'contracts');
 
 export default contractModel;

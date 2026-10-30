@@ -1,3 +1,4 @@
+import { IdempotencyStateChangedError } from '../services/idempotencyExecution';
 import { ServiceRelocationPendingError } from '../services/serviceRelocationState';
 import container from '../config/container';
 import ContractService, { NovationOptions } from '../services/ContractService';
@@ -304,6 +305,7 @@ class ContractController {
       });
       sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (err instanceof IdempotencyStateChangedError) return res.status(409).json({ code: err.code, error: err.message, contractVersion: err.contractVersion, ...(err.novated ? { novated: err.novated } : {}) });
       if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err instanceof SubscriptionValidationError) {
@@ -375,6 +377,7 @@ class ContractController {
       });
       res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
+      if (err instanceof IdempotencyStateChangedError) return res.status(409).json({ code: err.code, error: err.message, contractVersion: err.contractVersion, ...(err.novated ? { novated: err.novated } : {}) });
       if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err instanceof SubscriptionValidationError) {
@@ -481,6 +484,7 @@ class ContractController {
       );
       sendContract(req, res, 200, novatedContract);
     } catch (err: any) {
+      if (err instanceof IdempotencyStateChangedError) return res.status(409).json({ code: err.code, error: err.message, contractVersion: err.contractVersion, ...(err.novated ? { novated: err.novated } : {}) });
       if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (sendScopeError(res, err)) return;
       if (err instanceof DormantServiceError) {

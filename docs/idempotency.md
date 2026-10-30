@@ -15,3 +15,9 @@ A prepared immutable plan and stable contract identities are journaled before bu
 The 60-second worker lease is renewed while execution continues. MongoDB time fences contract writes and reservation ownership. A successor retains the same operation, fingerprint and progress. Completed HTTP status, body and selected headers are stored before success is sent; inability to confirm that persistence returns 503. A 5xx after a prepared action retains that action for a same-key retry.
 
 Completed responses expire after IDEMPOTENCY_KEY_TTL_SECONDS (default 86400 seconds), counted from completion. Unfinished journals have no TTL because forgetting an uncertain write would allow it to execute twice. Do not manually delete a pending journal as a retry strategy. Responses above the 4 MiB storage bound fail closed while preserving their prepared operation. Contract receipts expose no recovery metadata in REST responses, lists or pricing tokens.
+
+## Conflicting later changes and deletion
+
+A saved novation keeps an internal version guard even without caller If-Match; a counter reset keeps its original period guard. If an unapplied step conflicts with a later change, 409 IDEMPOTENCY_STATE_CHANGED preserves that later state and reports current contractVersion and any group members already novated. Review current state and use a new key for a corrected action. Explicit caller preconditions retain 412 CONTRACT_CHANGED.
+
+A different request may checkpoint an abandoned, already persisted receipt without applying the original plan's remaining changes. Deleting a contract first checkpoints any pending applied receipt; a late retry cannot recreate that deleted contract or apply an old delta to its replacement. Expiry of a completed HTTP replay does not extend the original consumptionId's refund retention.

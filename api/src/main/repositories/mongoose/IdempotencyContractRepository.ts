@@ -1,3 +1,4 @@
+import IdempotencyKeyRepository from './IdempotencyKeyRepository';
 import mongoose from 'mongoose';
 import Contract from './models/ContractMongoose';
 
@@ -10,6 +11,7 @@ export interface IdempotentContractWrite {
   set?: Record<string, any>;
   increments?: Record<string, number>;
   guard?: Record<string, any>;
+  refund?: { id: string; expiresAt: Date; services: string[]; absent: string[]; levels: { path: string; amount: number; resetTimeStamp: Date | null }[] };
   consume?: { id: string; expiresAt: Date; ceilings: Record<string, number>; resetTimeStamps: Record<string, Date | null> };
 }
 
@@ -22,11 +24,18 @@ export class IdempotencyStepBusyError extends Error {
 }
 
 class IdempotencyContractRepository {
-  async apply(write: IdempotentContractWrite, stepId: string, validUntil: Date): Promise<any | null> {
+  async apply(write: IdempotentContractWrite, stepId: string, validUntil: Date,
+    owner?: { operationId: string; key: string; organizationId: string }): Promise<any | null> {
     const identity = { _id: new mongoose.Types.ObjectId(write.contractId), organizationId: write.organizationId, 'userContact.userId': write.userId };
     const previous: any = await Contract.findOne(identity).select('+idempotencyReceipt').lean();
     if (previous?.idempotencyReceipt?.stepId === stepId) return previous.idempotencyReceipt.result;
-    if (previous?.idempotencyReceipt && !previous.idempotencyReceipt.acknowledged) throw new IdempotencyStepBusyError();
+    if (previous?.idempotencyReceipt && !previous.idempotencyReceipt.acknowledged) {
+      const receipt = previous.idempotencyReceipt;
+      const recovered = receipt.key && await new IdempotencyKeyRepository().recoverAppliedStep(
+        receipt.organizationId, receipt.key, receipt.operationId, receipt.stepId, receipt.result);
+      if (!recovered) throw new IdempotencyStepBusyError();
+      await this.acknowledge(write, receipt.stepId);
+    }
     if (write.create) {
       if (write.create.organizationId !== write.organizationId || write.create.userContact?.userId !== write.userId) throw new Error('CONFLICT: Prepared contract identity does not match its scope');
       // A stable preallocated _id and immutable document also fence an ambiguous
@@ -34,7 +43,7 @@ class IdempotencyContractRepository {
       const data = { ...write.create, _id: identity._id };
       const document = new Contract(data);
       const snapshot: any = document.toJSON({ minimize: false });
-      document.set('idempotencyReceipt', { stepId, acknowledged: false, result: snapshot });
+      document.set('idempotencyReceipt', { ...owner, stepId, acknowledged: false, result: snapshot });
       await document.validate();
       const persisted = document.toObject({ flattenMaps: true, virtuals: false, versionKey: false, minimize: false });
       try {
@@ -75,15 +84,37 @@ class IdempotencyContractRepository {
       if (write.consume && write.consume.ceilings[path] !== undefined) expressions.push({ $lte: [{ $add: [`$usageLevels.${path}.consumed`, amount] }, write.consume.ceilings[path]] });
       if (write.consume) filter[`usageLevels.${path}.resetTimeStamp`] = write.consume.resetTimeStamps[path] ?? null;
     }
+    const prune: Record<string, any> = {};
+    const { createHash } = await import('node:crypto');
+    if (write.refund) {
+      const refund = write.refund;
+      const key = createHash('sha256').update(refund.id).digest('hex');
+      filter[`usageRevertReceipts.${key}`] = { $exists: false };
+      for (const service of refund.services) filter[`contractedServices.${service}`] = { $exists: true };
+      for (const path of refund.absent) filter[`usageLevels.${path}`] = { $exists: false };
+      for (const level of refund.levels) {
+        const path = `usageLevels.${level.path}.consumed`;
+        filter[path] = { $exists: true };
+        set[path] = { $cond: [{ $eq: [{ $ifNull: [`$usageLevels.${level.path}.resetTimeStamp`, null] }, level.resetTimeStamp ?? null] },
+          { $max: [0, { $subtract: [`$${path}`, level.amount] }] }, `$${path}`] };
+      }
+      expressions.push({ $gt: [{ $literal: refund.expiresAt }, '$$NOW'] });
+      set[`usageRevertReceipts.${key}`] = { $literal: refund.expiresAt };
+      prune.usageRevertReceipts = { $arrayToObject: { $filter: { input: { $objectToArray: { $ifNull: ['$usageRevertReceipts', {}] } }, as: 'receipt', cond: { $gt: ['$$receipt.v', '$$NOW'] } } } };
+    }
     if (write.consume) {
       const { createHash } = await import('node:crypto');
       const receiptKey = createHash('sha256').update(write.consume.id).digest('hex');
+      filter[`usageConsumptionReceipts.${receiptKey}`] = { $exists: false };
+      expressions.push({ $gt: [{ $literal: write.consume.expiresAt }, '$$NOW'] });
       set[`usageConsumptionReceipts.${receiptKey}`] = { $literal: write.consume.expiresAt };
+      prune.usageConsumptionReceipts = { $arrayToObject: { $filter: { input: { $objectToArray: { $ifNull: ['$usageConsumptionReceipts', {}] } }, as: 'receipt', cond: { $gt: ['$$receipt.v', '$$NOW'] } } } };
     }
     filter.$expr = { $and: expressions };
     const document: any = await Contract.findOneAndUpdate(filter, [
+      ...(Object.keys(prune).length ? [{ $set: prune }] : []),
       ...(Object.keys(set).length ? [{ $set: set }] : []),
-      { $set: { idempotencyReceipt: { stepId: { $literal: stepId }, acknowledged: false, result: publicSnapshot } } },
+      { $set: { idempotencyReceipt: { ...(owner ? { operationId: { $literal: owner.operationId }, key: { $literal: owner.key }, organizationId: { $literal: owner.organizationId } } : {}), stepId: { $literal: stepId }, acknowledged: false, result: publicSnapshot } } },
     ], { new: true }).select('+idempotencyReceipt').lean();
     if (document) return document.idempotencyReceipt.result;
     const raced: any = await Contract.findOne(identity).select('+idempotencyReceipt').lean();

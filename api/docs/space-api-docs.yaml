@@ -154,6 +154,13 @@ info:
     - Completed keys are kept for `IDEMPOTENCY_KEY_TTL_SECONDS` (default 24 hours), starting at completion;
       after that the same key starts a new request. Unfinished prepared operations do not expire by TTL:
       deleting their journal could duplicate a previously applied effect.
+    - Prepared novations and counter resets also keep internal version/period guards. If a later change
+      makes an unapplied step unsafe, it returns `409 IDEMPOTENCY_STATE_CHANGED` with current contract
+      versions and, for a group, `novated` members already applied. Re-read current state before issuing
+      a corrected operation with a new key. Explicit If-Match failures retain `412 CONTRACT_CHANGED`.
+    - An abandoned persisted receipt can be checkpointed without executing its remaining plan, allowing
+      a later operation to proceed. Contract deletion checkpoints pending applied receipts before removing
+      their proof, so retrying an old creation cannot recreate a contract the user deleted.
     - Group novations freeze the original member list and prepared changes. Recovery resumes each
       contract, preserving concurrent usage and contact changes; it is not a multi-contract transaction.
       Cache invalidation and event delivery are recovered after persistence; events may be attempted again.
@@ -3569,6 +3576,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCreation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '201':
           description: Contract created
           headers:
@@ -3630,6 +3639,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           description: Contracts updated
           headers:
@@ -3757,6 +3768,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           description: Contract updated
           headers:
@@ -4109,6 +4122,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCreation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '201':
           description: Contract created
           headers:
@@ -4164,6 +4179,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           description: Contracts updated
           headers:
@@ -4330,6 +4347,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionCompositionNovation'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           description: Contract updated
           headers:
@@ -4510,6 +4529,8 @@ paths:
       requestBody:
         $ref: '#/components/requestBodies/SubscriptionUsageLevelsUpdate'
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           description: Usage levels reset
           headers:
@@ -4938,6 +4959,8 @@ paths:
               example:
                 petclinic-maxPets: 1
       responses:
+        '503':
+          $ref: '#/components/responses/IdempotencyUnavailable'
         '200':
           headers:
             Idempotent-Replayed:
@@ -5419,7 +5442,19 @@ components:
           type: string
         code:
           type: string
-          enum: [IDEMPOTENCY_CONFLICT, IDEMPOTENCY_IN_PROGRESS, IDEMPOTENCY_KEY_INVALID]
+          enum: [IDEMPOTENCY_CONFLICT, IDEMPOTENCY_IN_PROGRESS, IDEMPOTENCY_KEY_INVALID, IDEMPOTENCY_STATE_CHANGED]
+        contractVersion:
+          description: Current version(s) for an unsafe prepared mutation, like a contract precondition response.
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties:
+                type: string
+                nullable: true
+        novated:
+          type: array
+          items:
+            type: string
       required:
         - error
         - code
@@ -6522,7 +6557,9 @@ components:
         `IDEMPOTENCY_CONFLICT`: the `Idempotency-Key` was already used for a different request (method,
         route, path parameters, query, body or `If-Match`); nothing was applied. Use a new key for a new
         request. `IDEMPOTENCY_IN_PROGRESS`: a request with this key is still being processed; retry after
-        `Retry-After` seconds with the same key.
+        `Retry-After` seconds with the same key. `IDEMPOTENCY_STATE_CHANGED`: a prepared but unapplied
+        mutation conflicts with a later contract change; inspect `contractVersion` and any already
+        `novated` group members before submitting a corrected operation with a new key.
       headers:
         Retry-After:
           description: Seconds to wait before retrying (`IDEMPOTENCY_IN_PROGRESS` only).
@@ -6532,6 +6569,22 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/IdempotencyProblem'
+    IdempotencyUnavailable:
+      description: The operation could not be safely acknowledged; retry the same Idempotency-Key. A prepared action is preserved.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              code:
+                type: string
+                enum: [IDEMPOTENCY_UNAVAILABLE, IDEMPOTENCY_RESPONSE_TOO_LARGE]
     InvalidSubscription:
       description: |
         The subscription is not valid. `errors` lists every problem with a stable `code`. Contract creation always
