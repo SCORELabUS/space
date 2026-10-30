@@ -94,6 +94,7 @@ info:
     - `contract-pricings`: `GET /contracts/{userId}/pricings`.
     - `novation-preview`: `POST /contracts/{userId}/novation/preview`.
     - `token-subscription`: the pricing token carries the `subscription` claim.
+    - `contract-events`: authenticated Socket.IO namespace `/contracts` with contract events.
 
   contact:
     email: agarcia29@us.es
@@ -131,7 +132,31 @@ tags:
   - name: Cache
     description: Cache management (User ADMIN only)
   - name: Events
-    description: WebSocket event management (Public)
+    description: |
+      WebSocket events (Socket.IO, path `/events`, transport `websocket`).
+
+      - Namespace `/pricings` (public): `message` events `{ code: PRICING_CREATED | PRICING_ARCHIVED |
+        PRICING_ACTIVED | SERVICE_DISABLED, details: { serviceName, pricingVersion? } }`.
+      - Namespace `/contracts` (authenticated): handshake `auth: { apiKey }` or an `x-api-key` header. Organization
+        API keys of any scope receive the events of their organization; user API keys must also send
+        `auth.organizationId` of an organization they own or belong to (ADMIN users: any organization). Only events
+        of that organization are delivered, as `message` events
+        `{ code: CONTRACT_CREATED | CONTRACT_NOVATED | CONTRACT_DELETED | CONTRACT_RENEWED,
+        details: { userId, organizationId, contractVersion, services } }` (`contractVersion` is `null` for
+        `CONTRACT_DELETED`; `services` are the contracted services). Events are emitted after the change is stored,
+        including novations by group (also the contracts a partly rejected guarded group novation did write),
+        billing period changes (`CONTRACT_NOVATED`, since they change `contractVersion`), SPHERE synchronization,
+        archiving a pricing version, and deleting all contracts of the organization (one `CONTRACT_DELETED` per
+        contract). A novation preview emits nothing. A rejected handshake fails with `connect_error`; when the
+        credential could not be checked (database unavailable) the message says so instead of reporting an
+        invalid key, and the client may retry.
+
+        Authorization is checked at the handshake and again before each private event is delivered. Removing or
+        rotating a key, removing a membership, deleting a user or losing ADMIN authority disconnects affected
+        subscriptions. Authority changes are propagated between API instances through the Redis adapter; a missed
+        notification cannot authorize a later event because each receiving instance checks its local connections.
+        If authority cannot be checked, delivery is refused and the subscription disconnects. Authorized
+        subscriptions to other organizations remain connected. Clients may reconnect with a valid credential.
   - name: Healthcheck
     description: Service health verification (Public)
 
@@ -4451,7 +4476,8 @@ paths:
     get:
       summary: Get event service status
       description: |
-        Checks if the WebSocket event service is running and operational.
+        Checks if the WebSocket event service is running and operational. See the `Events` tag for the Socket.IO
+        namespaces (`/pricings`, `/contracts`) and their messages.
 
         **Authentication**: Public (no API key required)
 
@@ -4469,44 +4495,55 @@ paths:
                     type: string
                     example: The WebSocket event service is active
 
-  # /events/test-event:
-  #   post:
-  #     summary: Send test event (for testing)
-  #     description: |
-  #       Sends a test event to all connected WebSocket clients (used for testing purposes).
+  /events/test-event:
+    post:
+      summary: Send test event (for testing)
+      description: |
+        Sends a test `PRICING_ARCHIVED` event to every client of the `/pricings` namespace (used for testing
+        purposes). Disabled (`404`) when `ENVIRONMENT=production` unless `ENABLE_TEST_EVENTS=true`.
 
-  #       **Authentication**: Public
+        **Authentication**: Organization API Key with scope ALL | User API Key (ADMIN)
 
-  #     tags:
-  #       - Events
-  #     requestBody:
-  #       required: true
-  #       content:
-  #         application/json:
-  #           schema:
-  #             type: object
-  #             required:
-  #               - serviceName
-  #               - pricingVersion
-  #             properties:
-  #               serviceName:
-  #                 type: string
-  #                 example: Zoom
-  #               pricingVersion:
-  #                 type: string
-  #                 example: "1.0"
-  #     responses:
-  #       '200':
-  #         description: Event sent successfully
-  #         content:
-  #           application/json:
-  #             schema:
-  #               type: object
-  #               properties:
-  #                 success:
-  #                   type: boolean
-  #                 message:
-  #                   type: string
+      tags:
+        - Events
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - serviceName
+                - pricingVersion
+              properties:
+                serviceName:
+                  type: string
+                  example: Zoom
+                pricingVersion:
+                  type: string
+                  example: "1.0"
+      responses:
+        '200':
+          description: Event sent successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        '400':
+          description: serviceName and pricingVersion are required
+        '401':
+          description: API key missing
+        '403':
+          description: Not an organization key with scope ALL nor an ADMIN user
+        '404':
+          description: Disabled in production
 
   /events/client:
     get:
@@ -4905,6 +4942,38 @@ components:
             $ref: '#/components/schemas/SubscriptionSnapshot'
         contractVersion:
           $ref: '#/components/schemas/ContractVersion'
+
+    ContractEvent:
+      type: object
+      description: Socket.IO `message` event of the `/contracts` namespace (not an HTTP response).
+      required: [code, details]
+      properties:
+        code:
+          type: string
+          enum: [CONTRACT_CREATED, CONTRACT_NOVATED, CONTRACT_DELETED, CONTRACT_RENEWED]
+        details:
+          type: object
+          required: [userId, organizationId, contractVersion, services]
+          properties:
+            userId:
+              type: string
+            organizationId:
+              type: string
+            contractVersion:
+              type: string
+              nullable: true
+              description: Version after the change; `null` for `CONTRACT_DELETED`.
+            services:
+              type: array
+              items:
+                type: string
+      example:
+        code: CONTRACT_NOVATED
+        details:
+          userId: 01c36d29-0d6a-4b41-83e9-8c6d9310c508
+          organizationId: 507f1f77bcf86cd799439012
+          contractVersion: 4-2c26b46b68ffc68f
+          services: [acme]
 
     PricingTokenPayload:
       type: object

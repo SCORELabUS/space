@@ -1363,6 +1363,9 @@ class ServiceService {
           `features.${contract.userContact.userId}.*`,
         ])
       );
+      for (const contract of pricingVersionContracts) {
+        this.eventService.emitContractEvent?.('CONTRACT_NOVATED', contract);
+      }
     }
   }
 

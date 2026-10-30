@@ -358,6 +358,16 @@ class ContractRepository extends RepositoryBase {
     return rejected;
   }
 
+  /** userId, organization and contracted services of every contract of an organization (for events). */
+  async findEventSummaries(
+    organizationId: string
+  ): Promise<Pick<LeanContract, 'userContact' | 'organizationId' | 'contractedServices'>[]> {
+    return ContractMongoose.find(
+      { organizationId },
+      { 'userContact.userId': 1, organizationId: 1, contractedServices: 1 }
+    ).lean() as any;
+  }
+
   async prune(organizationId?: string): Promise<number> {
     const filter = organizationId ? { organizationId } : {};
     const result = await ContractMongoose.deleteMany(filter);
