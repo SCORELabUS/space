@@ -15,13 +15,13 @@ export default function loadRoutes(app: express.Application) {
       else if (action === 'get') result = await sync.get(organizationId, req.params.serviceName);
       else if (action === 'configure') result = await sync.configure(organizationId, req.params.serviceName, req.body);
       else {
-        result = await sync.enqueue(organizationId, req.params.serviceName);
+        result = await (action === 'resume' ? sync.resume(organizationId, req.params.serviceName) : sync.enqueue(organizationId, req.params.serviceName));
         // Manual requests work even when the periodic worker is disabled.
         const Service = (await import('../repositories/mongoose/models/ServiceMongoose')).default;
         const service = await Service.findOne({ organizationId, name: req.params.serviceName });
         if (service) setImmediate(() => { void sync.synchronize(String(service._id)).catch((error: Error) => console.error(error.message)); });
       }
-      return res.status(action === 'run' ? 202 : 200).json(result);
+      return res.status(['run', 'resume'].includes(action) ? 202 : 200).json(result);
     } catch (error) {
       if (error instanceof SphereAuthError || error instanceof SphereResourceUnavailableError) {
         const suppliedKey = typeof req.body?.sphereApiKey === 'string' && req.body.sphereApiKey.length > 0;
@@ -50,5 +50,6 @@ export default function loadRoutes(app: express.Application) {
     app.get(base + '/:serviceName/synchronization', ...read, invoke('get'));
     app.put(base + '/:serviceName/synchronization', ...write, invoke('configure'));
     app.post(base + '/:serviceName/synchronization/run', ...write, invoke('run'));
+    app.post(base + '/:serviceName/synchronization/resume', ...write, invoke('resume'));
   }
 }

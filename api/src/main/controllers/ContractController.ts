@@ -8,6 +8,7 @@ import {
 } from '../types/models/Contract';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils';
 import { SubscriptionValidationError } from './validation/ContractValidation';
+import { DormantServiceError } from '../services/ServiceService';
 import {
   ContractChangedError,
   computeContractVersion,
@@ -470,7 +471,9 @@ class ContractController {
       sendContract(req, res, 200, novatedContract);
     } catch (err: any) {
       if (sendScopeError(res, err)) return;
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err instanceof DormantServiceError) {
+        res.status(409).send({ error: err.message, code: err.code, service: err.service });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('invalid query:')) {
         res.status(400).send({ error: err.message });

@@ -133,3 +133,12 @@ In Add service → Link to SPHERE, enter the permanent link and select Check pri
 The form discards validation after a link/key change, ignores cancelled or stale requests, and clears the key when closed. Keys are sent in request bodies, never URLs or browser storage. The server checks access again when creating the service and saves the key encrypted. A server must have `SPHERE_KEY_ENCRYPTION_KEY` configured before credentials can be saved.
 
 Edit synchronization uses the saved credential on the server without returning it. Managers can replace or remove it; each change must be validated before Save synchronization. The preview body accepts optional `serviceName` in the authenticated organization: the stored permanent-link identity must match. Omitting `sphereApiKey` then uses the saved key, null previews public access, and a string previews a replacement without saving it. Access errors have safe codes `SPHERE_ACCESS_REQUIRED`/`SPHERE_KEY_REJECTED`; transport/upstream 500 errors are kept distinct.
+
+
+## Pausing and reactivating linked services
+
+Disabling a linked service is reversible: SPACE retains its contracts, plans, add-ons, usage, billing dates, SPHERE identity, encrypted credential and referenced snapshots. Its features are unavailable while disabled, and the synchronization worker skips it. Explicit deletion still removes its bindings and snapshots. Services disabled by older releases may already have lost their bindings; reactivation does not reconstruct removed contract data.
+
+In Services Management, select Status → Disabled, open the service and select Reactivate service. `POST /services/{name}/synchronization/resume` (or its organization-scoped equivalent) returns 202, enables the existing service and queues synchronization using its current policy. New policies preserve existing contract versions; All policies migrate through the normal validated synchronization flow. Resume uses the same management permissions as synchronization. Manual YAML upload cannot reactivate a linked service.
+
+The synchronization response includes `disabled`. The services listing accepts a strict boolean `disabled` query parameter, default false. Pricing-token and single-feature cache reads check current service availability so an in-flight evaluation cannot restore a stale cached result after a pause or resume. Previously issued JWTs retain their existing expiration semantics.

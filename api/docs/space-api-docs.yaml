@@ -100,6 +100,36 @@ info:
     organization and, without it, cover every organization. Any other caller already has an organization:
     `organizationId` may repeat it, and anything else answers `403`.
 
+    ## Disabling and deleting services
+
+    **Disabling** a service (`DELETE /services/{serviceName}`, `DELETE /organizations/{organizationId}/services/{serviceName}`)
+    is reversible: its pricings are archived, `SERVICE_DISABLED` is announced on `/pricings`, and uploading a pricing with
+    the same `saasName` enables it again (the versions it had stay archived). Contracts are not changed: the service is
+    *dormant* in the contracts that have it, and every reader of a contract treats it so:
+    - Evaluation of all features (`POST /features/{userId}`) and the pricing token leave its features out, as for any
+      feature the subscription does not have; the other services of the contract evaluate normally. The token lists it
+      in the `dormantServices` claim; its `subscription` claim is still the contract.
+    - Evaluation of one of its features (`POST /features/{userId}/{featureId}`) answers `200` with `eval: false` and
+      `error.code: SERVICE_DISABLED`, like `FLAG_NOT_FOUND` for an unknown feature. Nothing is consumed: an expected
+      consumption gets the same answer, and `?revert=true` answers `409 SERVICE_DISABLED`.
+    - `PUT /contracts/{userId}/usageLevels` answers `409 SERVICE_DISABLED` for increments of its usage levels; resets leave them as they are (and so does the automatic renewal of renewable levels).
+    - `GET /contracts/{userId}/pricings` marks it with `serviceStatus: disabled`.
+    - Novations may keep it exactly as it is (same version, plan and add-ons; listed in the preview's `dormantServices`),
+      but not subscribe to it or change it (`VERSION_NOT_FOUND`, as for an unknown service). New contracts cannot use it.
+    - Cached evaluations and pricing tokens of the organization are dropped when it is disabled. Pricing tokens already
+      handed out stay valid until they expire.
+    When the service is enabled again, the contracts work as before, with their subscription and usage levels.
+
+    **Deleting** services (`DELETE /services`, `DELETE /organizations/{organizationId}/services`) is irreversible: they
+    are removed from every contract of the organization (`contractedServices`, `subscriptionPlans`,
+    `subscriptionAddOns`, `usageLevels`; names compared case-insensitively). The previous subscription is recorded in
+    the contract history and each changed contract gets a `CONTRACT_NOVATED` event. A contract left without services is
+    kept (user contact and history included): its billing period ends at that moment and it no longer renews, so it can
+    be novated to other services or deleted with `DELETE /contracts/{userId}`. Each contract is written only if it did
+    not change since it was read (a concurrent novation is never overwritten; the removal is retried). The contracts
+    are updated before the services are deleted, so a failure (`500`, or `409` when a contract keeps changing) deletes
+    nothing and the request can be repeated.
+
     ## Capabilities
 
     Every response (errors and CORS preflights included) carries `X-Space-Capabilities`, a comma-separated
@@ -119,6 +149,7 @@ info:
     - `contract-events`: authenticated Socket.IO namespace `/contracts` with contract events.
     - `sphere-private`: SPHERE-linked services accept a write-only `sphereApiKey` to read private versions (`sphere.hasApiKey`); private versions are never served statically.
     - `contract-userid-per-org`: a `userId` is unique per organization (see above), pricing tokens identify the contract by organization (`sub` = `urn:space:<organizationId>:<percent-encoded userId>`, `userId`, `organizationId`, `aud`, `iss`; see `PricingTokenPayload`), and platform ADMIN users name the organization (`organizationId`) on the direct routes that address contracts by `userId` or `groupId` (`400 ORGANIZATION_ID_REQUIRED` otherwise).
+    - `service-disable-dormant`: a disabled service is dormant in contracts and deleting services removes them from every contract (see "Disabling and deleting services").
 
   contact:
     email: agarcia29@us.es
@@ -361,6 +392,34 @@ paths:
           description: Synchronization queued
         "409":
           description: Synchronization is applying or configuration conflicts
+  /services/{serviceName}/synchronization/resume:
+    post:
+      security:
+        - ApiKeyAuth: []
+      summary: Reactivate a linked service and resume synchronization, preserving contracts
+      parameters:
+        - in: path
+          name: serviceName
+          required: true
+          schema:
+            type: string
+      description: >-
+        Reactivates the existing SPHERE service without changing its permanent link, credential, policy,
+        contracted versions, usage or billing dates. Queues synchronization under the existing new/all policy.
+        Requires the same organization management authority as synchronization. Repeated activation is safe.
+      responses:
+        "202":
+          description: Service reactivated and synchronization queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereSyncState'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
+        "409":
+          description: Synchronization is applying or configuration conflicts
   /organizations/{organizationId}/services/sphere/preview:
     post:
       security:
@@ -556,6 +615,39 @@ paths:
           description: Resource not available
         "202":
           description: Synchronization queued
+        "409":
+          description: Synchronization is applying or configuration conflicts
+  /organizations/{organizationId}/services/{serviceName}/synchronization/resume:
+    post:
+      security:
+        - ApiKeyAuth: []
+      summary: Reactivate a linked service and resume synchronization, preserving contracts
+      parameters:
+        - in: path
+          name: organizationId
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: serviceName
+          required: true
+          schema:
+            type: string
+      description: >-
+        Reactivates the existing SPHERE service without changing its permanent link, credential, policy,
+        contracted versions, usage or billing dates. Queues synchronization under the existing new/all policy.
+        Requires the same organization management authority as synchronization. Repeated activation is safe.
+      responses:
+        "202":
+          description: Service reactivated and synchronization queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SphereSyncState'
+        "400":
+          description: Invalid source or configuration
+        "404":
+          description: Resource not available
         "409":
           description: Synchronization is applying or configuration conflicts
   /users/authenticate:
@@ -1819,6 +1911,10 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - in: query
+          name: disabled
+          description: Select disabled services instead of active services (default false).
+          schema: { type: boolean, default: false }
         - name: organizationId
           in: path
           required: true
@@ -1903,7 +1999,9 @@ paths:
     delete:
       summary: Delete all services in organization
       description: |
-        Deletes all services and associated pricings in the organization (irreversible operation).
+        Deletes all services (enabled and disabled) and associated pricings in the organization (irreversible
+        operation), after removing them from every contract of the organization (see "Disabling and deleting
+        services"). A platform ADMIN user deletes the services of this organization only.
 
         **Authentication**: User API Key
 
@@ -1922,12 +2020,16 @@ paths:
           schema:
             type: string
       responses:
-        '204':
-          description: All services deleted successfully
+        '200':
+          description: All services deleted (`{ message }`)
         '403':
           description: Forbidden - insufficient permissions
         '404':
           description: Organization not found
+        '409':
+          description: A contract kept changing while the services were removed from it; nothing was deleted, retry
+        '500':
+          description: The contracts could not be updated; nothing was deleted, retry
 
   /organizations/{organizationId}/services/{serviceName}:
     get:
@@ -2040,7 +2142,11 @@ paths:
     delete:
       summary: Disable service
       description: |
-        Disables a service. Cannot be permanently deleted; use disable to mark unavailable.
+        Disables a service (reversible): its pricings are archived and `SERVICE_DISABLED` is announced. Uploading a
+        pricing with the same `saasName` enables it again. Contracts are not changed: the service is dormant in them
+        (its features are not available, the rest of each contract works normally) until it is enabled again; see
+        "Disabling and deleting services". To delete services for good, and remove them from contracts, use
+        `DELETE /services`.
 
         **Authentication**: User API Key
 
@@ -2468,6 +2574,10 @@ paths:
       security:
         - ApiKeyAuth: []
       parameters:
+        - in: query
+          name: disabled
+          description: Select disabled services instead of active services (default false).
+          schema: { type: boolean, default: false }
         - name: name
           in: query
           required: false
@@ -2571,7 +2681,9 @@ paths:
     delete:
       summary: Delete all services
       description: |
-        Deletes all services and associated pricings in the organization (irreversible operation).
+        Deletes all services (enabled and disabled) and associated pricings in the organization (irreversible
+        operation), after removing them from every contract of the organization (see "Disabling and deleting
+        services").
 
         **Authentication**: Organization API Key | User API Key
 
@@ -2585,10 +2697,14 @@ paths:
       security:
         - ApiKeyAuth: []
       responses:
-        '204':
-          description: All services deleted
+        '200':
+          description: All services deleted (`{ message }`)
         '403':
           description: Forbidden
+        '409':
+          description: A contract kept changing while the services were removed from it; nothing was deleted, retry
+        '500':
+          description: The contracts could not be updated; nothing was deleted, retry
 
   /services/{serviceName}:
     get:
@@ -2680,7 +2796,11 @@ paths:
     delete:
       summary: Disable service
       description: |
-        Disables a service. Cannot be permanently deleted; use disable to mark unavailable.
+        Disables a service (reversible): its pricings are archived and `SERVICE_DISABLED` is announced. Uploading a
+        pricing with the same `saasName` enables it again. Contracts are not changed: the service is dormant in them
+        (its features are not available, the rest of each contract works normally) until it is enabled again; see
+        "Disabling and deleting services". To delete services for good, and remove them from contracts, use
+        `DELETE /services`.
 
         **Authentication**: Organization API Key
 
@@ -4120,6 +4240,24 @@ paths:
           $ref: '#/components/responses/ContractNotFound'
         '400':
           $ref: '#/components/responses/OrganizationIdRequired'
+        '409':
+          description: |
+            Nothing was changed. `code` is `SERVICE_DISABLED` / `SERVICE_NOT_FOUND` when the body increments a
+            usage level of a service that is dormant in the contract (see "Disabling and deleting services"), or
+            when `usageLimit` only names usage levels of dormant services. Resets (`reset=true`) leave the usage
+            levels of dormant services as they are.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum: [SERVICE_DISABLED, SERVICE_NOT_FOUND]
+                  service:
+                    type: string
 
   /contracts/{userId}/userContact:
     put:
@@ -4466,7 +4604,6 @@ paths:
                   example: 1.5
       responses:
         '200':
-          description: Feature evaluation result
           content:
             application/json:
               schema:
@@ -4476,8 +4613,15 @@ paths:
                     type: boolean
                   reason:
                     type: string
+          description: |
+            Feature evaluation result. A feature of a service that is disabled (dormant in the contract) answers
+            `{ eval: false, limit: null, used: null, error: { code: SERVICE_DISABLED, message } }` (or
+            `SERVICE_NOT_FOUND` when the organization no longer has the service), like `FLAG_NOT_FOUND` for an
+            unknown feature, and nothing is consumed.
         '404':
           $ref: '#/components/responses/ContractNotFound'
+        '409':
+          $ref: '#/components/responses/DormantService'
 
   /analytics/api-calls:
     get:
@@ -4805,6 +4949,7 @@ components:
       type: object
       properties:
         source: { type: string, enum: [manual, sphere] }
+        disabled: { type: boolean, description: Whether the service is paused; existing contracts and retained snapshots are preserved. }
         configuration:
           allOf:
             - $ref: '#/components/schemas/SphereConfiguration'
@@ -5190,6 +5335,13 @@ components:
           type: object
         subscription:
           $ref: '#/components/schemas/PricingTokenSubscription'
+        dormantServices:
+          type: array
+          items:
+            type: string
+          description: |
+            Services of `subscription` that are disabled (or no longer exist) in the organization: their features
+            are not in `features`. Only present when there are any (`service-disable-dormant`).
 
     PricingTokenSubscription:
       type: object
@@ -5223,7 +5375,7 @@ components:
 
     NovationPreview:
       type: object
-      required: [valid, errors, effective, versionChanges, usageWarnings, billingPeriod, contractVersion]
+      required: [valid, errors, effective, versionChanges, usageWarnings, billingPeriod, contractVersion, dormantServices]
       properties:
         valid:
           type: boolean
@@ -5288,6 +5440,13 @@ components:
               description: '`false` with `keepBillingPeriod`.'
         contractVersion:
           $ref: '#/components/schemas/ContractVersion'
+        dormantServices:
+          type: array
+          items:
+            type: string
+          description: |
+            Services of `effective` that are disabled: kept exactly as the contract has them, their features stay
+            unavailable until they are enabled again (`service-disable-dormant`).
       example:
         valid: false
         errors:
@@ -5318,6 +5477,7 @@ components:
           endDate: "2026-11-26T10:00:00.000Z"
           restarts: true
         contractVersion: 3-9f86d081884c7d65
+        dormantServices: []
 
     ContractPricings:
       type: object
@@ -5340,11 +5500,12 @@ components:
             plan: growth
             addOns:
               extraStorage: 2
+            serviceStatus: enabled
         contractVersion: 3-9f86d081884c7d65
 
     ContractServicePricing:
       type: object
-      required: [version, status, yamlUrl, newContractsVersion, addOns]
+      required: [version, status, yamlUrl, newContractsVersion, addOns, serviceStatus]
       properties:
         version:
           type: string
@@ -5373,6 +5534,13 @@ components:
           description: '`subscriptionAddOns[service]` (empty object when none).'
           additionalProperties:
             type: integer
+        serviceStatus:
+          type: string
+          enum: [enabled, disabled, not-found]
+          description: |
+            The service itself: `disabled` while it is disabled (dormant in the contract: its features are not
+            available until a pricing with its saasName is uploaded again), `not-found` when the organization no
+            longer has it (`service-disable-dormant`).
 
     ContractVersion:
       type: string
@@ -5892,6 +6060,23 @@ components:
               error:
                 type: string
                 example: Contract with userId 01c4a3cb-0bd5-4d4f-bc1a-0d5bb3d1f6a3 not found
+    DormantService:
+      description: |
+        The request needs a service of the contract that is disabled (`SERVICE_DISABLED`; it is dormant until a
+        pricing with its saasName is uploaded again) or that the organization no longer has
+        (`SERVICE_NOT_FOUND`), e.g. `?revert=true` on one of its features. Nothing was changed.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              code:
+                type: string
+                enum: [SERVICE_DISABLED, SERVICE_NOT_FOUND]
+              service:
+                type: string
     OrganizationIdRequired:
       description: |
         Platform ADMIN on a direct route that addresses contracts by `userId` or `groupId`, without

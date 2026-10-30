@@ -8,6 +8,7 @@ export interface SyntaxUpgrade { versionId: string; from: string; to: string }
 export interface Manifest { pricingId: string; name: string; permanentUrl: string; versions: SphereVersion[]; latestVersionId: string; syntaxUpgrade?: SyntaxUpgrade }
 export interface SyncState {
   source: 'manual' | 'sphere';
+  disabled: boolean;
   configuration: (Omit<SphereConfig, 'sphereApiKey'> & { name: string; status: string; target: SphereVersion; hasApiKey?: boolean; lastCheckedAt?: string;
     lastSyncedAt?: string; error?: string; migrated?: number; replaced?: number }) | null;
   retainedVersions: { version: string }[];
@@ -30,4 +31,8 @@ export async function updateSynchronization(key: string, org: string, service: s
 }
 export async function runSynchronization(key: string, org: string, service: string): Promise<SyncState> {
   return (await axios.post(`${base(org)}/${encodeURIComponent(service)}/synchronization/run`, {}, options(key))).data;
+}
+
+export async function resumeSynchronization(key: string, org: string, service: string): Promise<SyncState> {
+  return (await axios.post(`${base(org)}/${encodeURIComponent(service)}/synchronization/resume`, {}, options(key))).data;
 }

@@ -20,6 +20,7 @@ export const SPACE_CAPABILITIES: readonly string[] = Object.freeze([
   'contract-events',
   'sphere-private',
   'contract-userid-per-org',
+  'service-disable-dormant',
 ]);
 
 export const CAPABILITIES_HEADER = 'X-Space-Capabilities';

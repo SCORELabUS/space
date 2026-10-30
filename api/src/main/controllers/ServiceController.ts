@@ -41,7 +41,7 @@ class ServiceController {
 
       res.json(services);
     } catch (err: any) {
-      res.status(500).send({ error: err.message });
+      res.status(err.message === 'Invalid disabled filter' ? 400 : 500).send({ error: err.message });
     }
   }
 
@@ -405,7 +405,7 @@ class ServiceController {
 
   async prune(req: any, res: any) {
     try {
-      let organizationId = req.org ? req.org.id : req.params.organizationId;
+      const organizationId = req.org ? req.org.id : req.params.organizationId;
       if (!organizationId && req.user && req.user.role !== "ADMIN"){
         return res.status(400).send({ error: 'Organization ID is required. You can either provide an organization scoped API key or use the /organizations/*/services/** paths' });
       }
@@ -414,14 +414,17 @@ class ServiceController {
         return res.status(403).send({ error: 'Forbidden: You do not have permission to prune services' });
       }
 
-      if (req.user && req.user.role === "ADMIN"){
-        organizationId = undefined;        
-      }
+      // A platform ADMIN prunes every organization on the direct route only;
+      // on /organizations/{organizationId}/services, that organization.
 
       const result = await this.serviceService.prune(organizationId);
-      res.json({ message: `Pruned ${result} services` });
+      res.json({ message: `Pruned ${result ?? 0} services` });
     } catch (err: any) {
-      res.status(500).send({ error: err.message });
+      if (err.message.startsWith('CONFLICT')) {
+        res.status(409).send({ error: err.message });
+      } else {
+        res.status(500).send({ error: err.message });
+      }
     }
   }
 
@@ -486,7 +489,9 @@ class ServiceController {
   _transformIndexQueryParams(
     indexQueryParams: Record<string, string | number>
   ): ServiceQueryFilters {
+    if (indexQueryParams.disabled !== undefined && (typeof indexQueryParams.disabled !== 'string' || !['true', 'false'].includes(indexQueryParams.disabled))) throw new Error('Invalid disabled filter');
     const transformedData: ServiceQueryFilters = {
+      disabled: indexQueryParams.disabled === 'true',
       name: indexQueryParams.name as string,
       page: parseInt(indexQueryParams['page'] as string) || 1,
       offset: parseInt(indexQueryParams['offset'] as string) || 0,

@@ -8,6 +8,7 @@ import { LeanPricing } from '../../types/models/Pricing';
 const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 export type ServiceQueryFilters = {
+  disabled?: boolean;
   name?: string;
   page?: number;
   offset?: number;
@@ -17,11 +18,11 @@ export type ServiceQueryFilters = {
 
 class ServiceRepository extends RepositoryBase {
   async findAll(organizationId?: string, queryFilters?: ServiceQueryFilters, disabled = false) {
-    const { name, page = 1, offset = 0, limit = 20, order = 'asc' } = queryFilters || {};
+    const { name, page = 1, offset = 0, limit = 20, order = 'asc', disabled: selectedDisabled = disabled } = queryFilters || {};
 
     const query: any = {
       ...(name ? { name: { $regex: name, $options: 'i' } } : {}),
-      disabled: disabled,
+      disabled: selectedDisabled,
       ...(organizationId ? { organizationId: organizationId } : {}),
     };
 

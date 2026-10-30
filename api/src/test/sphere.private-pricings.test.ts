@@ -208,6 +208,55 @@ describe('Private SPHERE pricings (sphereApiKey)', () => {
     });
   });
 
+  describe('pausing a private linked service', () => {
+    it('preserves its encrypted credential and identity through pause and resume', async () => {
+      await linkService(); sphereWithKey();
+      expect((await configure({ sphereApiKey: SPHERE_KEY })).status).toBe(200);
+      const before = await stored();
+      await container.resolve('serviceService').disable(serviceName, organization.id);
+      const paused = await stored();
+      expect(paused.disabled).toBe(true);
+      expect(paused.sphere).toEqual(before.sphere);
+      expect(paused.activePricings).toEqual(before.activePricings);
+      // A scoped preview can read with the saved key while the service is paused.
+      sphereWithKey(true);
+      const preview = await request(app).post(`${baseUrl}/services/sphere/preview`).set('x-api-key', allKey)
+        .send({ permanentUrl, serviceName, policy: 'new_last' });
+      expect(preview.status, JSON.stringify(preview.body)).toBe(200);
+      expect(JSON.stringify(preview.body)).not.toContain(SPHERE_KEY);
+      const resumed = await container.resolve('sphereSyncService').resume(organization.id, serviceName);
+      expect(resumed.disabled).toBe(false);
+      expect(resumed.configuration.hasApiKey).toBe(true);
+      const after = await stored();
+      expect(after.sphere.encryptedApiKey).toEqual(before.sphere.encryptedApiKey);
+      expect(after.sphere.permanentUrl).toBe(before.sphere.permanentUrl);
+      expect(after.sphere.policy).toBe(before.sphere.policy);
+      expect(after.activePricings).toEqual(before.activePricings);
+      expect(JSON.stringify(resumed)).not.toContain(SPHERE_KEY);
+      expect(JSON.stringify(resumed)).not.toContain('encryptedApiKey');
+    });
+
+    it.each(['file', 'url'])('does not reactivate a linked service through manual %s import', async source => {
+      await linkService();
+      await container.resolve('serviceService').disable(serviceName, organization.id);
+      const before = await stored();
+      const text = pricingYaml('3.0', '2026-01-01').replace('saasName: Secret', `saasName: ${serviceName}`);
+      let response;
+      if (source === 'file') {
+        response = await request(app).post(`${baseUrl}/services`).set('x-api-key', allKey)
+          .attach('pricing', Buffer.from(text), 'manual-pricing.yaml');
+      } else {
+        nock('https://manual-import.example').get('/pricing.yaml').reply(200, text);
+        response = await request(app).post(`${baseUrl}/services`).set('x-api-key', allKey)
+          .send({ pricing: 'https://manual-import.example/pricing.yaml' });
+      }
+      expect(response.status, JSON.stringify(response.body)).toBe(400);
+      expect(response.body.error).toContain('reactivate');
+      expect(await stored()).toEqual(before);
+      expect(await Pricing.countDocuments({ _organizationId: organization.id })).toBe(0);
+    });
+  });
+
   describe('reading the service', () => {
     it('shows sphere.hasApiKey on GET of the service, the list and the synchronization state', async () => {
       await linkService();

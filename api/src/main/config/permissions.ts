@@ -23,6 +23,8 @@ import { RoutePermission } from "../types/permissions";
  */
 export const ROUTE_PERMISSIONS: RoutePermission[] = [
   // SPHERE synchronization (before general service routes).
+  { path: '/organizations/*/services/*/synchronization/resume', methods: ['POST'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
+  { path: '/services/*/synchronization/resume', methods: ['POST'], allowedUserRoles: [], allowedOrgRoles: ['ALL', 'MANAGEMENT'] },
   { path: '/organizations/*/services/sphere/preview', methods: ['POST'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
   { path: '/services/sphere/preview', methods: ['POST'], allowedUserRoles: [], allowedOrgRoles: ['ALL', 'MANAGEMENT'] },
   { path: '/organizations/*/services/*/synchronization', methods: ['GET', 'PUT'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },

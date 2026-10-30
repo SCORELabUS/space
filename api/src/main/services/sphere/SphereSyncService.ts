@@ -39,7 +39,7 @@ export default class SphereSyncService {
     if (serviceName !== undefined) {
       if (typeof serviceName !== 'string' || !serviceName.trim()) throw new Error('Invalid serviceName');
       if (typeof organizationId !== 'string' || !organizationId) throw new Error('Organization ID is required');
-      const service: any = await this.repository.service({ organizationId, name: serviceName, source: 'sphere', disabled: false });
+      const service: any = await this.repository.service({ organizationId, name: serviceName, source: 'sphere' });
       if (!service) throw new Error('Linked service not found');
       const storedLink = this.client.parseLink(service.sphere.permanentUrl);
       if (link.pricingId !== service.sphere.pricingId || link.permanentUrl !== storedLink.permanentUrl) {
@@ -134,7 +134,7 @@ export default class SphereSyncService {
     if (!service) throw new Error('Service not found');
     const retained = await this.repository.pricings({ 'sphere.serviceId': String(service._id) });
     const run = service.sphere?.runId ? await this.repository.run(service.sphere.runId) : null;
-    return { source: service.source ?? 'manual', configuration: publicSphereSource(service.sphere ?? null), retainedVersions: retained.map((v: any) => ({ ...v, version: v.sphere?.version ?? resetEscapeVersion(v.version) })), run };
+    return { source: service.source ?? 'manual', disabled: Boolean(service.disabled), configuration: publicSphereSource(service.sphere ?? null), retainedVersions: retained.map((v: any) => ({ ...v, version: v.sphere?.version ?? resetEscapeVersion(v.version) })), run };
   }
   async configure(organizationId: string, name: string, config: SphereConfiguration) {
     validateConfiguration(config);
@@ -160,6 +160,21 @@ export default class SphereSyncService {
       else if (config.sphereApiKey === null) update.$unset = { 'sphere.encryptedApiKey': '' };
       await this.repository.updateService({ _id: service._id }, update);
       await this.invalidate(service);
+      return this.get(organizationId, name);
+    });
+  }
+  async resume(organizationId: string, name: string) {
+    return withOrganizationLock(organizationId, async assertOwned => {
+      const service: any = await this.repository.service({ organizationId, name, source: 'sphere' });
+      if (!service) throw new Error('Linked service not found');
+      if (service.sphere.status === 'applying') throw new Error('Synchronization is applying; retry after recovery');
+      await assertOwned();
+      await this.repository.updateService({ _id: service._id }, { $set: {
+        disabled: false, 'sphere.status': 'queued', 'sphere.nextCheckAt': new Date(),
+      } });
+      await this.invalidate(service);
+      await container.resolve('cacheService').del(`features.${organizationId}.*`);
+      if (service.disabled) container.resolve('eventService').emitPricingActivedMessage(service.name, service.sphere.target.version);
       return this.get(organizationId, name);
     });
   }
@@ -402,6 +417,15 @@ export default class SphereSyncService {
     const service: any = await this.repository.service({ _id: id });
     if (!service || service.source !== 'sphere') throw new Error('Linked service not found');
     if (service.sphere.status === 'applying') throw new Error('Synchronization is applying; retry after recovery');
+    if (disable) {
+      // Pausing never mutates contracts or runs retention cleanup: old versions stay referenced.
+      await assertOwned();
+      await this.repository.updateService({ _id: id }, { $set: { disabled: true } });
+      await this.invalidate(service);
+      await container.resolve('cacheService').del(`features.${service.organizationId}.*`);
+      container.resolve('eventService').emitServiceDisabledMessage(service.name);
+      return true;
+    }
     for (const contract of await this.contracts(service)) {
       await assertOwned();
       const update: any = { $unset: { [`contractedServices.${service.name}`]: '', [`subscriptionPlans.${service.name}`]: '',
@@ -414,15 +438,9 @@ export default class SphereSyncService {
       if (removed?.modifiedCount) await this.emitNovated(contract._id);
     }
     await assertOwned();
-    if (disable) {
-      await this.repository.updateService({ _id: id }, { $set: { disabled: true } });
-      await this.cleanup(id, assertOwned);
-      container.resolve('eventService').emitServiceDisabledMessage(service.name);
-    } else {
-      if (await this.repository.contractExists({ organizationId: service.organizationId, [`contractedServices.${service.name}`]: { $exists: true } })) throw new Error('Contract binding changed; retry removal');
-      for (const copy of await this.repository.pricings({ 'sphere.serviceId': id })) await this.removeCopy(copy);
-      await this.repository.deleteService({ _id: id });
-    }
+    if (await this.repository.contractExists({ organizationId: service.organizationId, [`contractedServices.${service.name}`]: { $exists: true } })) throw new Error('Contract binding changed; retry removal');
+    for (const copy of await this.repository.pricings({ 'sphere.serviceId': id })) await this.removeCopy(copy);
+    await this.repository.deleteService({ _id: id });
     await this.invalidate(service);
     return true;
   }

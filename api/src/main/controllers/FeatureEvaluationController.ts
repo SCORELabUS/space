@@ -1,6 +1,7 @@
 import container from '../config/container.js';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import FeatureEvaluationService from '../services/FeatureEvaluationService.js';
+import { DormantServiceError } from '../services/ServiceService.js';
 import { FeatureEvalQueryParams, FeatureEvaluationResult, FeatureIndexQueryParams, SingleFeatureEvalQueryParams } from '../types/models/FeatureEvaluation.js';
 
 class FeatureEvaluationController {
@@ -99,7 +100,9 @@ class FeatureEvaluationController {
       }
     }
     catch (err: any) {
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err instanceof DormantServiceError) {
+        res.status(409).send({ error: err.message, code: err.code, service: err.service });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       }else if (err.message.toLowerCase().includes('invalid')) {
         res.status(400).send({ error: err.message });

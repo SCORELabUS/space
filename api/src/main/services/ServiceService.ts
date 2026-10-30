@@ -16,7 +16,6 @@ import { LeanService } from '../types/models/Service';
 import { ExpectedPricingType, LeanPricing } from '../types/models/Pricing';
 import { FallBackSubscription, LeanContract } from '../types/models/Contract';
 import ContractRepository from '../repositories/mongoose/ContractRepository';
-import { performNovation } from '../utils/contracts/novation';
 import { isSubscriptionValidInPricing } from '../controllers/validation/ContractValidation';
 import { generateUsageLevels } from '../utils/contracts/helpers';
 import { escapeVersion, resetEscapeVersion } from '../utils/helpers';
@@ -45,6 +44,56 @@ export class PricingYamlUpstreamError extends Error {
     super(`SPHERE_UNAVAILABLE: The Pricing2Yaml file of version ${pricingVersion} of service ${serviceName} could not be retrieved from SPHERE (${(cause as Error)?.message ?? cause})`);
     this.name = 'PricingYamlUpstreamError';
   }
+}
+
+/** Why a service of a contract is dormant (see `ServiceService.dormantServices`). */
+export type DormantReason = 'SERVICE_DISABLED' | 'SERVICE_NOT_FOUND';
+
+/**
+ * The request needs a service of the contract that is dormant: disabled (it
+ * comes back when a pricing with its saasName is uploaded again) or no longer
+ * in the organization. Answered with 409 and `code`.
+ */
+export class DormantServiceError extends Error {
+  constructor(
+    public readonly service: string,
+    public readonly code: DormantReason
+  ) {
+    super(dormantServiceMessage(service, code));
+    this.name = 'DormantServiceError';
+  }
+}
+
+export function dormantServiceMessage(service: string, code: DormantReason): string {
+  return code === 'SERVICE_DISABLED'
+    ? `Service ${service} is disabled in this organization: its features are not available and its usage levels cannot change until it is enabled again (upload a pricing with saasName ${service})`
+    : `Service ${service} no longer exists in this organization: its features are not available`;
+}
+
+/**
+ * The pricings of a disabled service that is enabled again with `version`:
+ * every version it had stays archived (contracts keep pointing to them), and
+ * an entry that has the key of `version` is renamed to make room for it.
+ */
+function pricingsOnReenable(service: LeanService, version: string): Record<string, any> {
+  const plain = (value: any): Record<string, any> =>
+    value instanceof Map ? Object.fromEntries(value) : { ...(value ?? {}) };
+  const archived = plain(service.archivedPricings);
+  const stamp = Date.now();
+  const freeKey = (key: string) => {
+    let candidate = `${key}_${stamp}`;
+    for (let i = 1; candidate in archived; i++) candidate = `${key}_${stamp}_${i}`;
+    return candidate;
+  };
+
+  if (archived[version]) {
+    archived[freeKey(version)] = archived[version];
+    delete archived[version];
+  }
+  for (const [key, locator] of Object.entries(plain(service.activePricings))) {
+    archived[key === version || key in archived ? freeKey(key) : key] = locator;
+  }
+  return archived;
 }
 
 /**
@@ -150,7 +199,8 @@ class ServiceService {
     let service = await this.cacheService.get(cacheKey);
 
     if (!service) {
-      service = await this.serviceRepository.findByName(serviceName, organizationId);
+      service = await this.serviceRepository.findByName(serviceName, organizationId)
+        ?? await this.serviceRepository.findByName(serviceName, organizationId, true);
       await this.cacheService.set(cacheKey, service, 3600, true);
     }
 
@@ -485,6 +535,9 @@ class ServiceService {
     // Step 1: Parse and validate pricing
 
     const uploadedPricing: Pricing = await this._getPricingFromPath(pricingFile.path);
+    if (!serviceName && (await this.serviceRepository.findByName(uploadedPricing.saasName, organizationId, true))?.source === 'sphere') {
+      throw new Error('Invalid operation: reactivate this linked service through SPHERE synchronization');
+    }
     const pricingYamlPath = this._savePricingYamlFile(
       pricingFile.path,
       organizationId,
@@ -549,6 +602,7 @@ class ServiceService {
       if (existingEnabled) {
         throw new Error(`Invalid request: Service ${uploadedPricing.saasName} already exists`);
       }
+      if (existingDisabled?.source === 'sphere') throw new Error('Invalid operation: reactivate this linked service through SPHERE synchronization');
 
       // Step 3: Create the service as it does not exist and add the pricing
       const savedPricing = await this.pricingRepository.create(pricingData);
@@ -558,33 +612,8 @@ class ServiceService {
       }
 
       if (existingDisabled) {
-        // Re-enable flow: archive existing active pricings and archived pricings
-        const newArchived: Record<string, any> = { ...(existingDisabled.archivedPricings || {}) };
-
-        // rename any archived entry that collides with the new version
-        if (newArchived[formattedPricingVersion]) {
-          const newKey = `${formattedPricingVersion}_${Date.now()}`;
-          newArchived[newKey] = newArchived[formattedPricingVersion];
-          delete newArchived[formattedPricingVersion];
-        }
-
-        // move previous active pricings into archived (renaming collisions)
-        if (existingDisabled.activePricings) {
-          for (const key of Object.keys(existingDisabled.activePricings)) {
-            if (key === formattedPricingVersion) {
-              const newKey = `${key}_${Date.now()}`;
-              newArchived.set(newKey, existingDisabled.activePricings.get(key)!);
-            } else {
-              // if archived already has this key, append timestamp
-              if (newArchived.has(key)) {
-                const newKey = `${key}_${Date.now()}`;
-                newArchived.set(newKey, existingDisabled.activePricings.get(key)!);
-              } else {
-                newArchived.set(key, existingDisabled.activePricings.get(key)!);
-              }
-            }
-          }
-        }
+        // Versions of the disabled service stay archived: contracts may still use them.
+        const newArchived = pricingsOnReenable(existingDisabled, formattedPricingVersion);
 
         const updateData: any = {
           disabled: false,
@@ -662,29 +691,8 @@ class ServiceService {
 
       // If the service is disabled, re-enable it and move previous active/archived to archived
       if ((service as any).disabled) {
-        const newArchived: Record<string, any> = { ...(service.archivedPricings || {}) };
-
-        if (newArchived[formattedPricingVersion]) {
-          const newKey = `${formattedPricingVersion}_${Date.now()}`;
-          newArchived[newKey] = newArchived[formattedPricingVersion];
-          delete newArchived[formattedPricingVersion];
-        }
-
-        if (service.activePricings) {
-          for (const key of Object.keys(service.activePricings)) {
-            if (key === formattedPricingVersion) {
-              const newKey = `${key}_${Date.now()}`;
-              newArchived.set(newKey, service.activePricings.get(key)!);
-            } else {
-              if (newArchived.has(key)) {
-                const newKey = `${key}_${Date.now()}`;
-                newArchived.set(newKey, service.activePricings.get(key)!);
-              } else {
-                newArchived.set(key, service.activePricings.get(key)!);
-              }
-            }
-          }
-        }
+        // Versions of the disabled service stay archived: contracts may still use them.
+        const newArchived = pricingsOnReenable(service, formattedPricingVersion);
 
         updatePayload.disabled = false;
         updatePayload.activePricings = new Map([
@@ -760,31 +768,11 @@ class ServiceService {
       if (existingEnabled) {
         throw new Error(`Invalid request: Service ${uploadedPricing.saasName} already exists`);
       }
+      if (existingDisabled?.source === 'sphere') throw new Error('Invalid operation: reactivate this linked service through SPHERE synchronization');
 
       if (existingDisabled) {
-        const newArchived: Record<string, any> = { ...(existingDisabled.archivedPricings || {}) };
-
-        if (newArchived[formattedPricingVersion]) {
-          const newKey = `${formattedPricingVersion}_${Date.now()}`;
-          newArchived[newKey] = newArchived[formattedPricingVersion];
-          delete newArchived[formattedPricingVersion];
-        }
-
-        if (existingDisabled.activePricings) {
-          for (const key of Object.keys(existingDisabled.activePricings)) {
-            if (key === formattedPricingVersion) {
-              const newKey = `${key}_${Date.now()}`;
-              newArchived.set(newKey, existingDisabled.activePricings.get(key)!);
-            } else {
-              if (newArchived.has(key)) {
-                const newKey = `${key}_${Date.now()}`;
-                newArchived.set(newKey, existingDisabled.activePricings.get(key)!);
-              } else {
-                newArchived.set(key, existingDisabled.activePricings.get(key)!);
-              }
-            }
-          }
-        }
+        // Versions of the disabled service stay archived: contracts may still use them.
+        const newArchived = pricingsOnReenable(existingDisabled, formattedPricingVersion);
 
         const updateData: any = {
           disabled: false,
@@ -857,29 +845,8 @@ class ServiceService {
 
       // If disabled, re-enable and move previous active into archived
       if ((service as any).disabled) {
-        const newArchived: Record<string, any> = { ...(service.archivedPricings || {}) };
-
-        if (newArchived[formattedPricingVersion]) {
-          const newKey = `${formattedPricingVersion}_${Date.now()}`;
-          newArchived[newKey] = newArchived[formattedPricingVersion];
-          delete newArchived[formattedPricingVersion];
-        }
-
-        if (service.activePricings) {
-          for (const key of Object.keys(service.activePricings)) {
-            if (key === formattedPricingVersion) {
-              const newKey = `${key}_${Date.now()}`;
-              newArchived.set(newKey, service.activePricings.get(key)!);
-            } else {
-              if (newArchived.has(key)) {
-                const newKey = `${key}_${Date.now()}`;
-                newArchived.set(newKey, service.activePricings.get(key)!);
-              } else {
-                newArchived.set(key, service.activePricings.get(key)!);
-              }
-            }
-          }
-        }
+        // Versions of the disabled service stay archived: contracts may still use them.
+        const newArchived = pricingsOnReenable(service, formattedPricingVersion);
 
         updatePayload.disabled = false;
         updatePayload.organizationId = organizationId;
@@ -1170,31 +1137,39 @@ class ServiceService {
     return updatedService;
   }
 
+  /**
+   * Delete every service of the organization (of every organization when none
+   * is given), irreversibly: SPHERE-linked services through their own removal,
+   * the others after they have been removed from every contract of their
+   * organization (see `_removeServicesFromContracts`). Disabled services are
+   * deleted too, and removed from the contracts that still hold them. The
+   * contracts are updated first, so a failure leaves the services in place and
+   * the prune can be retried.
+   */
   async prune(organizationId?: string) {
     const linked = await ServiceModel.find({ ...(organizationId ? { organizationId } : {}), source: 'sphere' }).lean();
     for (const service of linked) await this.destroy(service.name, service.organizationId);
-    if (organizationId) {
-      const organizationServices: LeanService[] = await this.index({}, organizationId);
-      const organizationServiceNames: string[] = organizationServices.map(s => s.name) as string[];
 
-      for (const serviceName of organizationServiceNames) {
-        const cacheKey = `service.${organizationId}.${serviceName}`;
-        await this.cacheService.del(cacheKey);
-        const contractNovationResult = await this._removeServiceFromContracts(
-          serviceName,
-          organizationId
-        );
+    // Every remaining service, enabled or disabled, of every page.
+    const remaining: { name: string; organizationId: string }[] = await ServiceModel.find(
+      organizationId ? { organizationId } : {},
+      { name: 1, organizationId: 1 }
+    ).lean() as any;
+    const byOrganization = new Map<string, string[]>();
+    for (const { name, organizationId: org } of remaining) {
+      byOrganization.set(String(org), [...(byOrganization.get(String(org)) ?? []), name]);
+    }
 
-        if (!contractNovationResult) {
-          throw new Error(`Failed to remove service ${serviceName} from contracts`);
-        }
-      }
+    for (const [org, names] of byOrganization) {
+      await this._removeServicesFromContracts(names, org);
+      await this.cacheService.delMany(names.map(name => `service.${org}.${name}`));
     }
 
     const result = await this.serviceRepository.prune(organizationId);
     return result;
   }
 
+  /** Delete a service irreversibly, after removing it from every contract of the organization. */
   async destroy(serviceName: string, organizationId: string) {
     const cacheKey = `service.${organizationId}.${serviceName}`;
     let service = await this.cacheService.get(cacheKey);
@@ -1204,24 +1179,32 @@ class ServiceService {
     }
 
     if (!service) {
+      // A disabled service can be deleted too.
+      service = await this.serviceRepository.findByName(serviceName, organizationId, true);
+    }
+
+    if (!service) {
       throw new Error(`NOT FOUND: Service with name ${serviceName}`);
     }
 
-    const contractNovationResult = await this._removeServiceFromContracts(
-      service.name,
-      organizationId
-    );
+    await this._removeServicesFromContracts([service.name], organizationId);
 
-    if (!contractNovationResult) {
-      throw new Error(`Failed to remove service ${serviceName} from contracts`);
-    }
-
-    const result = await this.serviceRepository.destroy(serviceName, organizationId);
-    this.cacheService.del(cacheKey);
+    const result = await this.serviceRepository.destroy(service.name, organizationId);
+    await this.cacheService.del(cacheKey);
 
     return result;
   }
 
+  /**
+   * Disable a service (reversible: uploading a pricing with its saasName
+   * enables it again). Its pricings are archived and SERVICE_DISABLED is
+   * announced. Contracts are not changed: the service is dormant in them (see
+   * `dormantServices`), so its features evaluate as not available while the
+   * rest of each contract keeps working, and the subscription and usage levels
+   * are there again when the service is enabled. Removing it from contracts
+   * would make disabling irreversible; deleting a service (`destroy`, `prune`)
+   * does that.
+   */
   async disable(serviceName: string, organizationId: string) {
     const cacheKey = `service.${organizationId}.${serviceName}`;
     let service = await this.cacheService.get(cacheKey);
@@ -1234,21 +1217,46 @@ class ServiceService {
       throw new Error(`NOT FOUND: Service with name ${serviceName}`);
     }
 
-    const contractNovationResult = await this._removeServiceFromContracts(
-      service.name,
-      organizationId
-    );
-
-    if (!contractNovationResult) {
-      throw new Error(`Failed to remove service ${serviceName} from contracts`);
-    }
-
     const result = await this.serviceRepository.disable(service.name, organizationId);
 
     this.eventService.emitServiceDisabledMessage(service.name);
-    this.cacheService.del(cacheKey);
+    await this.cacheService.del(cacheKey);
+    await this.cacheService.del(`service.${organizationId}.${service.name}`);
+    // Cached evaluations and pricing tokens of the organization still include
+    // the features of the service. (Tokens already handed out stay valid until
+    // they expire: a signed token cannot be withdrawn.)
+    await this.cacheService.del(`features.${organizationId}.*`);
 
     return result;
+  }
+
+  /**
+   * Which of these services of a contract are dormant in the organization:
+   * `SERVICE_DISABLED` for a disabled service, `SERVICE_NOT_FOUND` for a
+   * service the organization no longer has (contracts written before deletions
+   * removed services from them). Names are compared case-insensitively and
+   * returned lowercased; enabled services are not listed.
+   */
+  async dormantServices(serviceNames: string[], organizationId: string): Promise<Record<string, DormantReason>> {
+    const names = Array.from(new Set(serviceNames.map(name => name.toLowerCase())));
+    if (names.length === 0) return {};
+
+    const enabled = new Set(
+      ((await this.serviceRepository.findByNames(names, organizationId, false)) ?? []).map(service =>
+        service.name.toLowerCase()
+      )
+    );
+    const missing = names.filter(name => !enabled.has(name));
+    if (missing.length === 0) return {};
+
+    const disabled = new Set(
+      ((await this.serviceRepository.findByNames(missing, organizationId, true)) ?? []).map(service =>
+        service.name.toLowerCase()
+      )
+    );
+    return Object.fromEntries(
+      missing.map(name => [name, disabled.has(name) ? 'SERVICE_DISABLED' : 'SERVICE_NOT_FOUND'] as const)
+    );
   }
 
   async destroyPricing(serviceName: string, pricingVersion: string, organizationId: string) {
@@ -1479,77 +1487,53 @@ class ServiceService {
     return retrievePricingFromText(remotePricingYaml);
   }
 
-  async _removeServiceFromContracts(serviceName: string, organizationId: string): Promise<boolean> {
-    try {
-      const contracts: LeanContract[] = await this.contractRepository.findByFilters({
-        organizationId,
-      });
-      const novatedContracts: LeanContract[] = [];
-      const contractsToDisable: LeanContract[] = [];
+  /**
+   * Remove services that are being deleted from every contract of the
+   * organization (all of them, not a page), case-insensitively: their entries
+   * in `contractedServices`, `subscriptionPlans`, `subscriptionAddOns` and
+   * `usageLevels`. The previous subscription goes to the contract history; a
+   * contract left without services is kept, ends now and no longer renews (see
+   * `ContractRepository.removeServicesFromContract`).
+   *
+   * Each write is conditional on the version of the contract that was read, so
+   * a novation that lands in between is never overwritten: the contract is
+   * read again and the removal retried. Every changed contract gets its cached
+   * copy, evaluations and pricing token dropped and a CONTRACT_NOVATED event.
+   *
+   * @returns how many contracts were changed.
+   * @throws on any failure (nothing is reported as done that was not).
+   */
+  async _removeServicesFromContracts(serviceNames: string[], organizationId: string): Promise<number> {
+    const userIds = await this.contractRepository.findUserIdsReferencingServices(organizationId, serviceNames);
+    const names = new Set(serviceNames.map(name => name.toLowerCase()));
+    const attempts = 5;
+    let changed = 0;
 
-      for (const contract of contracts) {
-        // Remove this service from the subscription objects
-        const newSubscription: Record<string, any> = {
-          contractedServices: {},
-          subscriptionPlans: {},
-          subscriptionAddOns: {},
-        };
-
-        // Rebuild subscription objects without the service to be removed
-        for (const key in contract.contractedServices) {
-          if (key !== serviceName) {
-            newSubscription.contractedServices[key] = contract.contractedServices[key];
-          }
+    for (const userId of userIds) {
+      let done = false;
+      for (let attempt = 0; attempt < attempts && !done; attempt++) {
+        const contract = await this.contractRepository.findByUserId(userId, organizationId);
+        if (!contract) {
+          done = true; // Deleted meanwhile.
+          break;
         }
+        const written = await this.contractRepository.removeServicesFromContract(contract, Array.from(names));
+        if (!written) continue; // Changed after it was read: read it again.
+        done = true;
+        if (written === contract) break; // Nothing of these services left in it.
 
-        for (const key in contract.subscriptionPlans) {
-          if (key !== serviceName) {
-            newSubscription.subscriptionPlans[key] = contract.subscriptionPlans[key];
-          }
-        }
-
-        for (const key in contract.subscriptionAddOns) {
-          if (key !== serviceName) {
-            newSubscription.subscriptionAddOns[key] = contract.subscriptionAddOns[key];
-          }
-        }
-
-        // Check if objects have the same content by comparing their JSON string representation
-        const hasContractChanged =
-          JSON.stringify(contract.contractedServices) !==
-          JSON.stringify(newSubscription.contractedServices);
-
-        // If objects are equal, skip this contract
-        if (!hasContractChanged) {
-          continue;
-        }
-
-        const newContract = performNovation(contract, newSubscription);
-
-        if (contract.usageLevels[serviceName]) {
-          delete contract.usageLevels[serviceName];
-        }
-
-        if (Object.keys(newSubscription.contractedServices).length === 0) {
-          newContract.usageLevels = {};
-          newContract.billingPeriod = {
-            startDate: new Date(),
-            endDate: new Date(),
-            autoRenew: false,
-            renewalDays: 0,
-          };
-
-          contractsToDisable.push(newContract);
-          continue;
-        }
-
-        novatedContracts.push(newContract);
+        changed++;
+        await this.cacheService.delMany(contractCacheKeys(written));
+        this.eventService.emitContractEvent?.('CONTRACT_NOVATED', written);
       }
-
-      return true;
-    } catch (err) {
-      return false;
+      if (!done) {
+        throw new Error(
+          `CONFLICT: The contract of user ${userId} kept changing while services ${Array.from(names).join(', ')} were removed from it; retry`
+        );
+      }
     }
+
+    return changed;
   }
 }
 
