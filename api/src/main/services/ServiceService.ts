@@ -1424,7 +1424,10 @@ class ServiceService {
    */
   async prune(organizationId?: string) {
     const linked = await ServiceModel.find({ ...(organizationId ? { organizationId } : {}), source: 'sphere' }).lean();
-    for (const service of linked) await this.destroy(service.name, service.organizationId);
+    let deleted = 0;
+    for (const service of linked) {
+      if (await this.destroy(service.name, service.organizationId)) deleted++;
+    }
 
     // Every remaining service, enabled or disabled, of every page.
     const remaining: LeanService[] = await ServiceModel.find(
@@ -1437,13 +1440,17 @@ class ServiceService {
       byOrganization.set(org, [...(byOrganization.get(org) ?? []), service]);
     }
 
-    let deleted = 0;
     for (const [org, services] of byOrganization) {
-      const names = services.map(service => service.name);
-      await this._removeServicesFromContracts(names, org);
-      await this.cacheService.delMany(names.map(name => `service.${org}.${name}`));
-      deleted += await this.serviceRepository.destroyByIds(services.map(service => String((service as any)._id)), org);
-      await this._deletePricingsOfServices(services, org);
+      // A global prune also needs each organization's binding lease. Otherwise
+      // a contract can be created after cleanup but before its service is deleted.
+      deleted += await withOrganizationLock(org, async () => {
+        const names = services.map(service => service.name);
+        await this._removeServicesFromContracts(names, org);
+        await this.cacheService.delMany(names.map(name => `service.${org}.${name}`));
+        const count = await this.serviceRepository.destroyByIds(services.map(service => String((service as any)._id)), org);
+        await this._deletePricingsOfServices(services, org);
+        return count;
+      }, 2000);
     }
 
     return deleted;

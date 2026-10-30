@@ -171,6 +171,42 @@ describe('Deleting and disabling services: organization and exact name', functio
       }
     });
 
+    it('global prune holds the organization lease until its services are deleted, preventing late contract bindings', async function () {
+      const admin = await createTestUser('ADMIN', `admin_${uuidv4()}`);
+      const newcomer = uuidv4();
+      const repository: any = container.resolve('serviceRepository');
+      const original = repository.destroyByIds.bind(repository);
+      let attempted = false;
+      const fault = vi.spyOn(repository, 'destroyByIds').mockImplementation(async (...args: any[]) => {
+        if (!attempted && args[1] === one.organization.id) {
+          attempted = true;
+          // A separate HTTP request has its own lease context. Before the fix
+          // this succeeds in the gap between contract cleanup and service deletion.
+          const created = await request(app).post(`${baseUrl}/contracts`).set('x-api-key', one.key).send({
+            userContact: { userId: newcomer, username: 'late-during-global-prune' },
+            billingPeriod: { autoRenew: true, renewalDays: 30 },
+            contractedServices: { [A]: PETCLINIC_BASE_VERSION },
+            subscriptionPlans: { [A]: 'GOLD' }, subscriptionAddOns: {},
+          });
+          expect(created.status, JSON.stringify(created.body)).not.toBe(201);
+          expect(created.body.error).toMatch(/busy|retry/i);
+        }
+        return original(...args);
+      });
+      try {
+        const response = await request(app).delete(`${baseUrl}/services`).set('x-api-key', admin.apiKey);
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+        expect(attempted).toBe(true);
+        expect(await ContractMongoose.countDocuments({ 'userContact.userId': newcomer })).toBe(0);
+        expect(await ServiceMongoose.countDocuments({ organizationId: { $in: [one.organization.id, two.organization.id] } })).toBe(0);
+        expect((await contractOf(one)).contractedServices).toEqual({});
+        expect((await contractOf(two)).contractedServices).toEqual({});
+      } finally {
+        fault.mockRestore();
+        await deleteTestUser(admin.username);
+      }
+    }, 10000);
+
     it('deletes only the services it read, with their pricings', async function () {
       // A service created while the prune runs (after the services were read)
       // was not removed from contracts, so it is not deleted either.
@@ -367,6 +403,15 @@ describe('Deleting and disabling services: organization and exact name', functio
         { $set: { [`contractedServices.${linkedName}`]: '5_0', [`subscriptionPlans.${linkedName}`]: 'basic', [`subscriptionAddOns.${linkedName}`]: {} } }
       );
     };
+
+    it('includes linked services in the prune count', async function () {
+      await insertLinked(one);
+      const response = await request(app).delete(`${baseUrl}/services`).set('x-api-key', one.key);
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.message).toBe('Pruned 2 services');
+      expect(await ServiceMongoose.countDocuments({ organizationId: one.organization.id })).toBe(0);
+      expect(await serviceOf(two, 'Petclinic')).not.toBeNull();
+    });
 
     it('pause through the SPHERE path and retain contracts whatever the casing of the URL name', async function () {
       await insertLinked(one);
