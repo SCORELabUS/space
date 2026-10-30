@@ -224,6 +224,20 @@ describe('Contract version and conditional novation', function () {
       expect(response.body[0].usageLevels[serviceName].maxPets.consumed).toBe(after.usageLevels[serviceName].maxPets.consumed);
     });
 
+    it('preserves concurrent consumption while keeping the billing period', async () => {
+      const reviewed = await read();
+      const before = await stored();
+      recordWhileWriting(userId);
+
+      const response = await novate({ ...subscription('PLATINUM'), keepBillingPeriod: true }, reviewed.headers.etag);
+      const after = await stored();
+
+      expect(response.status).toBe(200);
+      expect(after.billingPeriod.startDate).toEqual(before.billingPeriod.startDate);
+      expect(after.billingPeriod.endDate).toEqual(before.billingPeriod.endDate);
+      expect(after.usageLevels[serviceName].maxPets.consumed).toBe(before.usageLevels[serviceName].maxPets.consumed + 1);
+    });
+
     it('invalidates a novation snapshot when consumption lands after its database write', async () => {
       const repository = container.resolve('contractRepository');
       const original = repository.update.bind(repository);
