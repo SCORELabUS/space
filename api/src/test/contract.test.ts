@@ -9,7 +9,7 @@ import {
   deleteTestOrganization,
   addApiKeyToOrganization,
 } from './utils/organization/organizationTestUtils';
-import { createTestService, deleteTestService, getPricingFromService } from './utils/services/serviceTestUtils';
+import { deleteTestService, getPricingFromService } from './utils/services/serviceTestUtils';
 import { generateOrganizationApiKey } from '../main/utils/users/helpers';
 import { LeanUser } from '../main/types/models/User';
 import { LeanOrganization } from '../main/types/models/Organization';
@@ -18,7 +18,20 @@ import { LeanContract } from '../main/types/models/Contract';
 import { generateContract } from './utils/contracts/generators';
 import { createTestContract } from './utils/contracts/contractTestUtils';
 import ContractMongoose from '../main/repositories/mongoose/models/ContractMongoose';
-import { PETCLINIC_BASE_VERSION, uploadPetclinicService } from './utils/services/petclinicVersions';
+import { PETCLINIC_BASE_VERSION, uploadPetclinicService, writePetclinicVariant } from './utils/services/petclinicVersions';
+import container from '../main/config/container';
+
+// These routes test contracts, permissions, billing and cache invalidation.
+// Keep their pricing valid and fixed: randomized add-ons can produce an invalid
+// fixture before an assertion runs (for example quantity 1 with minQuantity 7).
+async function createTestService(organizationId?: string, serviceName = `contract-fixture-${randomUUID()}`): Promise<LeanService> {
+  if (!organizationId) throw new Error('Contract route fixtures require an organization');
+  const file = writePetclinicVariant(PETCLINIC_BASE_VERSION, '2025-03-26', pricing => {
+    pricing.saasName = serviceName;
+    pricing.addOns = {};
+  });
+  return await container.resolve('serviceService').create({ path: file }, 'file', organizationId) as unknown as LeanService;
+}
 
 describe('Contract API routes', function () {
   let app: Server;

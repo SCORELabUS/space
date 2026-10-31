@@ -125,6 +125,13 @@ SPHERE_SYNC_TEST_REDIS=true pnpm --dir api exec vitest run src/test/sphere-redis
 
 Both production builds and changed-file lint checks passed (existing hook/chunk-size warnings remain). The isolated suites passed 198 SPHERE tests and 76 SPACE tests. A separate cross-project HTTP smoke check used real SPHERE routes, real SPACE import/migration code and disposable MongoDB databases: private-version filtering, publishing a new public target, migration with preserved consumption/billing, retention, permanent-link renaming and offline operation passed. Cache and event effects were stubbed in that HTTP smoke check. Two additional tests against a disposable Redis instance verified contract/evaluation/pricing-token invalidation and event delivery between two API instances. Browser checks covered desktop/mobile, dark mode, the SPHERE form, All-policy warning, Escape dismissal and the service panel. The full legacy API suites were not run because they require their separate seeded test environment.
 
+## Contracts by pricing version
+
+The linked-service detail page shows the number of contracts currently assigned to each pricing version, plus the total and the applied target for new contracts. This makes the older cohorts retained by `new_last` and `new_pick` visible. Versions still referenced by contracts remain in the count table even when SPHERE no longer lists them; known versions with no contracts show zero.
+
+Counts include expired contracts that still have a current binding to the service. They exclude history entries, other services and other organizations, and return no customer identifiers. The synchronization-state response supplies `contractCounts: [{ version, count }]` from local MongoDB, so counting does not require a SPHERE request. The page refreshes these counts with its existing five-second state refresh; they may change during a running migration.
+
+The existing organization/userId compound index supports the organization lookup. No extra index or change to contract uniqueness is needed. Counts remain available while a linked service is paused, and do not expose stored SPHERE credentials.
 
 ### Linking private pricings in the interface
 

@@ -6,6 +6,7 @@ import SphereFields, { allWarning } from './SphereFields';
 import { disableService } from '@/api/services/servicesApi';
 import { spherePricingUrl } from '@/lib/sphereUrl';
 import { useCustomConfirm } from '@/hooks/useCustomConfirm';
+import PricingContractCounts from './PricingContractCounts';
 
 const surface = 'rounded-2xl border border-indigo-100 bg-white dark:border-gray-800 dark:bg-gray-900';
 const secondary = 'text-sm text-gray-500 dark:text-gray-400';
@@ -144,6 +145,8 @@ export default function SphereSyncPanel({ state, apiKey, organizationId, service
     {error && <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{error} Try synchronizing again or review your settings.</div>}
     {(config.error || state.run?.error) && <div role="status" className="flex gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100"><FiAlertCircle className="mt-0.5 shrink-0" aria-hidden="true" /><div><p className="font-semibold">Synchronization needs attention</p><p className="mt-1">{config.error || state.run?.error}. Current pricing copies remain available. Review your settings and try again.</p></div></div>}
     {config.status === 'applying' && <p role="status" className="rounded-xl bg-indigo-50 p-4 text-sm text-indigo-800 dark:bg-indigo-950 dark:text-indigo-200">Updating contracts · {state.run?.migrated ?? 0} updated so far. The applied version will change when the update completes.</p>}
+
+    <PricingContractCounts counts={state.contractCounts} versions={versions.map(version => version.version)} target={config.target.version} disabled={state.disabled} />
 
     {canManage && !state.disabled && editing && <div className={`${surface} p-6 sm:p-8`}>
       <h2 className="mb-5 text-lg font-bold text-indigo-700 dark:text-gray-100">Synchronization settings</h2>

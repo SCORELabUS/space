@@ -9,6 +9,7 @@ import { createTestUser, deleteTestUser } from './utils/users/userTestUtils';
 import { addApiKeyToOrganization, addMemberToOrganization, createTestOrganization, deleteTestOrganization } from './utils/organization/organizationTestUtils';
 import { generateOrganizationApiKey } from '../main/utils/users/helpers';
 import Service from '../main/repositories/mongoose/models/ServiceMongoose';
+import Contract from '../main/repositories/mongoose/models/ContractMongoose';
 import { functionalHash } from '../main/services/sphere/SphereClient';
 
 const origin = 'https://sphere.score.us.es';
@@ -79,6 +80,7 @@ describe('SPHERE synchronization API routes', () => {
   });
 
   afterEach(async () => {
+    await Contract.deleteMany({ organizationId: { $in: [organization.id, otherOrganization.id] } });
     vi.restoreAllMocks();
     await Service.deleteMany({ organizationId: { $in: [organization.id, otherOrganization.id] } });
     await deleteTestOrganization(organization.id);
@@ -169,6 +171,57 @@ describe('SPHERE synchronization API routes', () => {
       expect(response.body.configuration.pricingId).toBe(pricingId);
       expect(response.body.configuration.policy).toBe('new_last');
       expect(response.body.retainedVersions).toEqual([]);
+      expect(response.body.contractCounts).toEqual([]);
+    });
+
+    it('counts current bindings per version without including history, prefix siblings or other organizations', async () => {
+      await createLinkedService();
+      await Contract.collection.insertMany([
+        { organizationId: organization.id, userContact: { userId: 'counts-old-1' }, contractedServices: { [serviceName]: '1_0' } },
+        { organizationId: organization.id, userContact: { userId: 'counts-old-2' }, contractedServices: { [serviceName]: '1_0' }, billingPeriod: { endDate: new Date('2020-01-01') } },
+        { organizationId: organization.id, userContact: { userId: 'counts-new' }, contractedServices: { [serviceName]: '2_0' }, history: [{ contractedServices: { [serviceName]: '1_0' } }] },
+        { organizationId: organization.id, userContact: { userId: 'counts-sibling' }, contractedServices: { [`${serviceName}pro`]: '1_0' }, history: [{ contractedServices: { [serviceName]: '1_0' } }] },
+        { organizationId: otherOrganization.id, userContact: { userId: 'counts-other-org' }, contractedServices: { [serviceName]: '1_0' } },
+      ]);
+      const response = await request(app).get(`${baseUrl}/services/${serviceName}/synchronization`).set('x-api-key', evaluationKey);
+      expect(response.status).toBe(200);
+      expect(response.body.contractCounts).toEqual([{ version: '1.0', count: 2 }, { version: '2.0', count: 1 }]);
+      expect(JSON.stringify(response.body.contractCounts)).not.toContain('counts-old');
+      // A policy for new contracts can retain old bindings even without a remote manifest or local pricing copy.
+      expect(response.body.retainedVersions).toEqual([]);
+      const scoped = await request(app).get(`${baseUrl}/organizations/${organization.id}/services/${serviceName}/synchronization`).set('x-api-key', evaluatorUser.apiKey);
+      expect(scoped.status).toBe(200);
+      expect(scoped.body.contractCounts).toEqual(response.body.contractCounts);
+    });
+
+    it('preserves counts while paused and after reactivation without exposing credentials', async () => {
+      await createLinkedService({ service: { disabled: true }, sphere: { encryptedApiKey: { ciphertext: 'private-credential-marker' } } });
+      await Contract.collection.insertOne({ organizationId: organization.id, userContact: { userId: 'counts-paused' }, contractedServices: { [serviceName]: '1_0' } });
+      const get = () => request(app).get(`${baseUrl}/services/${serviceName}/synchronization`).set('x-api-key', allKey);
+      const paused = await get();
+      expect(paused.status).toBe(200);
+      expect(paused.body.disabled).toBe(true);
+      expect(paused.body.contractCounts).toEqual([{ version: '1.0', count: 1 }]);
+      expect(paused.body.configuration.hasApiKey).toBe(true);
+      expect(paused.body.configuration.encryptedApiKey).toBeUndefined();
+      expect(JSON.stringify(paused.body)).not.toContain('private-credential-marker');
+      const resumed = await request(app).post(`${baseUrl}/services/${serviceName}/synchronization/resume`).set('x-api-key', allKey);
+      expect(resumed.status).toBe(202);
+      const active = await get();
+      expect(active.body.disabled).toBe(false);
+      expect(active.body.contractCounts).toEqual(paused.body.contractCounts);
+      expect(active.body.configuration.encryptedApiKey).toBeUndefined();
+    });
+
+    it('refreshes counts after a binding changes or a contract is deleted', async () => {
+      await createLinkedService();
+      const contract = await Contract.collection.insertOne({ organizationId: organization.id, userContact: { userId: 'counts-changing' }, contractedServices: { [serviceName]: '1_0' } });
+      const get = () => request(app).get(`${baseUrl}/services/${serviceName}/synchronization`).set('x-api-key', allKey);
+      expect((await get()).body.contractCounts).toEqual([{ version: '1.0', count: 1 }]);
+      await Contract.collection.updateOne({ _id: contract.insertedId }, { $set: { [`contractedServices.${serviceName}`]: '2_0' } });
+      expect((await get()).body.contractCounts).toEqual([{ version: '2.0', count: 1 }]);
+      await Contract.collection.deleteOne({ _id: contract.insertedId });
+      expect((await get()).body.contractCounts).toEqual([]);
     });
 
     it('reports a manually created service as manual with no configuration', async () => {
@@ -180,6 +233,7 @@ describe('SPHERE synchronization API routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.source).toBe('manual');
       expect(response.body.configuration).toBeNull();
+      expect(response.body.contractCounts).toEqual([]);
     });
 
     it('is readable with an evaluation-scoped organization key', async () => {
