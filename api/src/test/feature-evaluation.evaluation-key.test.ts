@@ -14,7 +14,6 @@ import path from 'path';
 import { Server } from 'http';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { v4 as uuidv4 } from 'uuid';
-import { jwtVerify } from 'jose';
 import { baseUrl, getApp, shutdownApp } from './utils/testApp';
 import { cleanupAuthResources } from './utils/auth';
 import { createTestUser, deleteTestUser } from './utils/users/userTestUtils';
@@ -24,7 +23,7 @@ import {
   deleteTestOrganization,
 } from './utils/organization/organizationTestUtils';
 import { generateOrganizationApiKey } from '../main/utils/users/helpers';
-import { encryptJWTSecret } from '../main/utils/jwt';
+import { verifyPricingToken } from './utils/pricingTokens';
 import { LeanUser } from '../main/types/models/User';
 import { LeanOrganization } from '../main/types/models/Organization';
 import { LeanService } from '../main/types/models/Service';
@@ -201,11 +200,9 @@ describe('EVALUATION-scoped organization API keys', function () {
         .set('x-api-key', evaluationKey);
 
       expect(response.status).toEqual(200);
-      const { payload } = await jwtVerify(
-        response.body.pricingToken,
-        encryptJWTSecret(process.env.JWT_SECRET!),
-        { algorithms: ['HS256'], issuer: process.env.JWT_ISSUER || 'space', audience: organization.id! }
-      );
+      const { payload } = await verifyPricingToken(app, response.body.pricingToken, {
+        issuer: process.env.JWT_ISSUER || 'space', audience: organization.id!,
+      });
       expect(payload.sub).toEqual(`urn:space:${organization.id}:${encodeURIComponent(userId)}`);
       expect(payload.userId).toEqual(userId);
       expect(payload.organizationId).toEqual(organization.id);

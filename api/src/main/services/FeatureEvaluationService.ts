@@ -34,6 +34,7 @@ import {
 import ContractService from './ContractService';
 import ServiceService, { DormantReason, dormantServiceMessage } from './ServiceService';
 import { PricingTokenSubscription, generateTokenFromEvalResult } from '../utils/jwt';
+import { isSignedWithCurrentPricingTokenKey } from '../utils/pricingTokenKeys';
 import { computeContractVersion } from '../utils/contracts/version';
 import { escapeVersion } from '../utils/helpers';
 import CacheService from './CacheService';
@@ -136,7 +137,8 @@ class FeatureEvaluationService {
     const tokenKey = featuresCacheKey(contract.organizationId, userId, 'pricingToken');
     const cachedToken = await this.cacheService.get(tokenKey);
 
-    if (cachedToken) {
+    // Re-issue cached tokens after a signing-key rotation as well as a pause/resume.
+    if (cachedToken && (await isSignedWithCurrentPricingTokenKey(cachedToken))) {
       // An evaluation started before a pause/resume may finish after its cache
       // invalidation. Recheck availability before reusing that late token.
       const dormant = Object.keys(await this.serviceService.dormantServices(

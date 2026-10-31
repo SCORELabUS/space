@@ -67,3 +67,13 @@ jobs:
 
       - name: Run tests
         run: pnpm run test
+
+      - name: Set up .NET for pricing-token interoperability example
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Verify pricing tokens from .NET without a SPACE SDK
+        run: |
+          pnpm --dir api exec tsx src/test/utils/pricingTokenInteropFixtures.ts /tmp/space-token-fixtures.json
+          dotnet run --project docs/examples/pricing-token-dotnet -- --self-test /tmp/space-token-fixtures.json

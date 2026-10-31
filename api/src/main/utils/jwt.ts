@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 import { DetailedFeatureEvaluation, PricingContext, SubscriptionContext } from '../types/models/FeatureEvaluation';
 import { SignJWT } from 'jose';
 import { pbkdf2Sync } from 'crypto';
+import { getPricingTokenKeys } from './pricingTokenKeys';
 
 dotenv.config();
 
@@ -34,13 +35,7 @@ async function generateTokenFromEvalResult(
   organizationId: string,
   dormantServices: string[] = []
 ): Promise<string> {
-  if (!JWT_SECRET) {
-    throw new Error('JWT_SECRET environment variable is not defined!');
-  }
-
-  if (!JWT_SALT) {
-    throw new Error('JWT_SALT environment variable is not defined!');
-  }
+  const signing = await pricingTokenSigningKey();
 
   if (!organizationId) {
     throw new Error('INTERNAL ERROR: a pricing token is issued for a contract of an organization');
@@ -67,15 +62,38 @@ async function generateTokenFromEvalResult(
   };
 
   const token = await new SignJWT(payload)
-    .setProtectedHeader({ alg: 'HS256' })
+    .setProtectedHeader(signing.header)
     .setIssuedAt() // Automatically sets the 'iat' claim
     .setExpirationTime(JWT_EXPIRATION) // Sets the 'exp' claim
     .setSubject(tokenSub) // Sets the 'sub' claim
     .setIssuer(JWT_ISSUER)
     .setAudience(organizationId)
-    .sign(encryptJWTSecret(JWT_SECRET));
+    .sign(signing.key);
 
   return token;
+}
+
+/**
+ * ES256 with the configured key (its public part is published at
+ * `/.well-known/jwks.json`), or the legacy HS256 with the shared JWT_SECRET
+ * when PRICING_TOKEN_ALG=HS256. See `pricingTokenKeys.ts`.
+ */
+async function pricingTokenSigningKey() {
+  const { signer } = await getPricingTokenKeys();
+
+  if (signer.alg === 'ES256') {
+    return { header: { alg: 'ES256', kid: signer.kid }, key: signer.privateKey };
+  }
+
+  if (!JWT_SECRET) {
+    throw new Error('JWT_SECRET environment variable is not defined!');
+  }
+
+  if (!JWT_SALT) {
+    throw new Error('JWT_SALT environment variable is not defined!');
+  }
+
+  return { header: { alg: 'HS256' }, key: encryptJWTSecret(JWT_SECRET) };
 }
 
 function encryptJWTSecret(secret: string): Buffer {
