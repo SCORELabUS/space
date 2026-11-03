@@ -1,6 +1,6 @@
 {
   "name": "space-api",
-  "version": "1.0.0",
+  "version": "1.8.0",
   "description": "SPACE API is an open-source project designed to provide a robust and scalable API for various applications.",
   "main": "src/main/index.ts",
   "type": "module",
@@ -14,7 +14,8 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
-    "generate-test-env": "chmod +x generate-test-env.sh && ./generate-test-env.sh"
+    "generate-test-env": "chmod +x generate-test-env.sh && ./generate-test-env.sh",
+    "test:identity": "vitest run --config vitest.identity.config.ts"
   },
   "keywords": [
     "api",
