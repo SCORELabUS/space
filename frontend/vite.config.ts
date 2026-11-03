@@ -24,6 +24,7 @@ export default defineConfig(({ mode }) => {
     base: safeBase,
     server: {
       port: Number(env.VITE_PORT || 5174),
+      proxy: env.VITE_API_PROXY_TARGET ? { '/api': { target: env.VITE_API_PROXY_TARGET, changeOrigin: true } } : undefined,
     },
     plugins: [
       react(),

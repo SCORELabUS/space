@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { migrateSphereIdentity } from './migrations/20261103000000-sphere-identity';
 import * as dotenv from 'dotenv';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -130,6 +131,7 @@ const initializeDatabase = async (seedDatabaseFlag: boolean = true) => {
     switch (process.env.DATABASE_TECHNOLOGY ?? 'mongoDB') {
       case 'mongoDB':
         connection = await initMongoose();
+        await migrateSphereIdentity();
         // Idempotent; see the migration for what it changes.
         await runContractUserIdMigration();
         await initializeServiceRelocationJournal();

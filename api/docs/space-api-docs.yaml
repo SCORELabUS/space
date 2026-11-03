@@ -462,6 +462,104 @@ tags:
     description: Service health verification (Public)
 
 paths:
+  /auth/sphere/status:
+    get:
+      summary: Whether SPHERE sign-in is configured
+      security: []
+      responses:
+        '200':
+          description: Provider availability
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [available]
+                properties:
+                  available: {type: boolean}
+  /auth/sphere/start:
+    post:
+      summary: Start SPHERE sign-in or explicit account linking
+      description: Login is public. mode=link requires the current user's API key. Returns authorizationUrl and sets an HttpOnly SameSite=Lax transaction cookie. The request must come from SPACE's configured frontend origin.
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode: {type: string, enum: [login, link], default: login}
+      responses:
+        '200':
+          description: SPHERE authorization URL and transaction Set-Cookie
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authorizationUrl]
+                properties:
+                  authorizationUrl: {type: string, format: uri}
+        '401': {description: Linking requires an existing user session}
+  /auth/sphere/callback:
+    get:
+      summary: Validate SPHERE's code and redirect to SPACE's completion screen
+      description: Requires state and the original transaction cookie. No credentials are put in the frontend URL. Errors redirect to the completion screen with a server-stored error.
+      security: []
+      responses:
+        '302': {description: Redirect to the configured frontend auth/sphere page}
+        '400': {description: Invalid or expired browser transaction}
+  /auth/sphere/pending:
+    get:
+      summary: Inspect the browser-bound pending sign-in without exposing tokens
+      security: []
+      responses:
+        '200':
+          description: Pending browser-bound result
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SphereSignInPending'}
+        '400': {description: Transaction missing or expired}
+  /auth/sphere/complete:
+    post:
+      summary: Complete login, choose a local username, or confirm explicit linking
+      description: Requires the transaction cookie and SPACE frontend Origin. Signup requires username (3–30 letters, digits, underscores or hyphens); collisions return 409 and allow retry. Link requires the same user's API key used at start. Neither usernames nor email addresses automatically link accounts. Success returns SPACE's existing username/apiKey/role session, or linked=true. Transaction is consumed once.
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: {type: string, minLength: 3, maxLength: 30, pattern: '^[A-Za-z0-9_-]{3,30}$'}
+      responses:
+        '200':
+          description: Existing SPACE session or linking confirmation
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - {$ref: '#/components/schemas/SphereSignInSession'}
+                  - type: object
+                    required: [linked]
+                    properties:
+                      linked: {type: boolean, enum: [true]}
+        '409': {description: Username or identity already belongs to another account}
+        '400': {description: Invalid username or expired transaction}
+        '401': {description: Linking user session changed or is missing}
+  /auth/sphere/connection:
+    get:
+      summary: Inspect the current user's SPHERE sign-in method
+      responses:
+        '200':
+          description: Current user's sign-in methods
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [linked, hasPassword]
+                properties:
+                  linked: {type: boolean}
+                  hasPassword: {type: boolean}
+        '401': {description: User API key required}
   /services/sphere/preview:
     post:
       security:
@@ -5426,6 +5524,20 @@ paths:
 
 components:
   schemas:
+    SphereSignInSession:
+      type: object
+      required: [username, apiKey, role]
+      properties:
+        username: {type: string}
+        apiKey: {type: string}
+        role: {type: string, enum: [USER, ADMIN]}
+    SphereSignInPending:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string, enum: [login, signup, link, error]}
+        suggestedUsername: {type: string, description: Signup suggestion only; never an account linking identifier}
+        error: {type: string}
     SphereVersion:
       type: object
       required: [versionId, version, createdAt, contentHash]

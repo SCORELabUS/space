@@ -6,6 +6,26 @@ import { UserRole } from '../../types/permissions';
 import { generateUserApiKey } from '../../utils/users/helpers';
 
 class UserRepository extends RepositoryBase {
+  async findBySphereIdentity(issuer: string, subject: string): Promise<LeanUser | null> {
+    const user = await UserMongoose.findOne({ 'sphereIdentity.issuer': issuer, 'sphereIdentity.subject': subject });
+    return user ? user.toObject({ virtuals: true }) as unknown as LeanUser : null;
+  }
+
+  async sphereConnection(userId: string) {
+    const user = await UserMongoose.findById(userId).select('+sphereIdentity');
+    if (!user) throw new Error('User no longer exists');
+    return { linked: Boolean(user.sphereIdentity), hasPassword: Boolean(user.password) };
+  }
+
+  async linkSphereIdentity(userId: string, issuer: string, subject: string) {
+    return UserMongoose.findOneAndUpdate({ _id: userId, sphereIdentity: { $exists: false } },
+      { $set: { sphereIdentity: { issuer, subject } } }, { new: true });
+  }
+
+  async deleteCreatedFederatedUser(userId: string) {
+    await UserMongoose.deleteOne({ _id: userId, password: { $exists: false } });
+  }
+
 
   async findAll(query?: any): Promise<LeanUser[]> {
     try {
@@ -71,6 +91,7 @@ class UserRepository extends RepositoryBase {
       // If the user does not have an API key, we generate one
       const newApiKey = generateUserApiKey();
       await UserMongoose.updateOne({ username }, { apiKey: newApiKey });
+      leanUser.apiKey = newApiKey;
       
       return leanUser;
     }
@@ -83,7 +104,7 @@ class UserRepository extends RepositoryBase {
 
     if (!user) return null;
 
-    return toPlainObject<LeanUser>(user.toObject());
+    return toPlainObject<LeanUser>(user.toObject({ virtuals: true }));
   }
 
   async create(userData: any): Promise<LeanUser> {

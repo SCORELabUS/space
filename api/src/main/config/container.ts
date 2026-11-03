@@ -1,3 +1,4 @@
+import SphereAuthService from '../services/SphereAuthService';
 import ServiceRelocationRepository from '../repositories/mongoose/ServiceRelocationRepository';
 import SphereSyncRepository from '../repositories/mongoose/SphereSyncRepository';
 import SphereSyncService from '../services/sphere/SphereSyncService';
@@ -56,6 +57,7 @@ function initContainer(databaseType: string): AwilixContainer {
     usageConsumptionRepository: asValue(usageConsumptionRepository),
     idempotencyKeyRepository: asValue(idempotencyKeyRepository),
     userService: asClass(UserService).singleton(),
+    sphereAuthService: asClass(SphereAuthService).singleton(),
     serviceRelocationRepository: asClass(ServiceRelocationRepository).singleton(),
     sphereSyncRepository: asClass(SphereSyncRepository).singleton(),
     sphereSyncService: asClass(SphereSyncService).singleton(),

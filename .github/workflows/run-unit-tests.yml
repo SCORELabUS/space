@@ -77,3 +77,41 @@ jobs:
         run: |
           pnpm --dir api exec tsx src/test/utils/pricingTokenInteropFixtures.ts /tmp/space-token-fixtures.json
           dotnet run --project docs/examples/pricing-token-dotnet -- --self-test /tmp/space-token-fixtures.json
+
+  identity:
+    name: SPHERE identity integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ENVIRONMENT: testing
+      DATABASE_TECHNOLOGY: mongoDB
+      DATABASE_NAME: space_identity_scratch
+      MONGO_URI: mongodb://127.0.0.1:27018/space_identity_scratch
+      REDIS_URL: redis://127.0.0.1:6378
+      REDIS_KEY_PREFIX: 'space-identity-ci:'
+      SERVER_PORT: '0'
+      SEED_ON_STARTUP: 'false'
+    services:
+      mongodb:
+        image: mongo:7.0.16
+        ports: ['27018:27017']
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok'"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7.4.2
+        ports: ['6378:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+      - name: Install pnpm
+        run: npm install -g pnpm@10.9.0
+      - name: Install API dependencies
+        run: pnpm --dir api install --frozen-lockfile
+      - name: Test isolated SPHERE identity persistence
+        run: pnpm --dir api run test:identity

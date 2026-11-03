@@ -57,7 +57,21 @@ class UserService {
     return user;
   }
 
+  async createFederated(username: string, issuer: string, subject: string) {
+    const user = await this.userRepository.create({ username, sphereIdentity: { issuer, subject }, role: 'USER' });
+    try {
+      await this.organizationService.create({ name: `${user.username}'s Organization`, owner: user.username, default: true }, user);
+    } catch (error) {
+      await this.userRepository.deleteCreatedFederatedUser(user.id);
+      throw error;
+    }
+    return user;
+  }
+
   async create(userData: any, creatorData: LeanUser) {
+    // Federated identities are server-managed and cannot be set through generic user writes.
+    userData = { username: userData.username, password: userData.password, role: userData.role };
+
     
     const existingUser = await this.userRepository.findByUsername(userData.username);
     if (existingUser) {
@@ -84,6 +98,8 @@ class UserService {
   }
 
   async update(username: string, userData: any, creatorData: LeanUser) {
+    userData = Object.fromEntries(Object.entries(userData).filter(([key]) => ['username', 'password', 'role'].includes(key)));
+
     
     if (creatorData && (creatorData.role !== 'ADMIN' && userData.role === 'ADMIN')) {
       throw new Error('PERMISSION ERROR: Only admins can change roles to admin.');
