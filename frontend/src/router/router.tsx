@@ -1,4 +1,5 @@
 import { BrowserRouter, Route, Routes, Navigate, useLocation } from "react-router";
+import SphereAuthPage from '../pages/sphere-auth';
 import MainPage from "../pages/main";
 import LoggedLayout from "@/layouts/logged-view";
 import MembersPage from "@/pages/members";
@@ -42,6 +43,7 @@ export function SpaceRouter() {
     <BrowserRouter basename={import.meta.env.BASE_URL}>
       <Routes>
         <Route path="/" element={<MainPage/>}/>
+        <Route path="/auth/sphere" element={<SphereAuthPage/>}/>
         <Route path="/register" element={<RegisterPage/>}/>
         <Route path="/contracts/dashboard" element={<RequireAuth><LoggedLayout><ContractsDashboard/></LoggedLayout></RequireAuth>} />
         <Route path="/contracts/:userId" element={<RequireAuth><LoggedLayout><ContractDetailPage/></LoggedLayout></RequireAuth>} />

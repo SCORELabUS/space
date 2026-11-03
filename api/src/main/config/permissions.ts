@@ -22,6 +22,13 @@ import { RoutePermission } from "../types/permissions";
  * If no rule matches, access is denied by default.
  */
 export const ROUTE_PERMISSIONS: RoutePermission[] = [
+  { path: '/auth/sphere/status', methods: ['GET'], isPublic: true },
+  { path: '/auth/sphere/start', methods: ['POST'], isPublic: true },
+  { path: '/auth/sphere/callback', methods: ['GET'], isPublic: true },
+  { path: '/auth/sphere/pending', methods: ['GET'], isPublic: true },
+  { path: '/auth/sphere/complete', methods: ['POST'], isPublic: true },
+  { path: '/auth/sphere/connection', methods: ['GET'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
+
   // SPHERE synchronization (before general service routes).
   { path: '/organizations/*/services/sphere/preview', methods: ['POST'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
   { path: '/services/sphere/preview', methods: ['POST'], allowedUserRoles: [], allowedOrgRoles: ['ALL', 'MANAGEMENT'] },

@@ -14,6 +14,7 @@ export interface AuthContextType {
   isAuthenticated: boolean;
   login: (username: string, password: string) => Promise<void>;
   logout: () => void;
+  acceptSession: (user: UserData) => void;
   user: UserData;
   updateUser: (newUser: Partial<UserData>) => void;
   refreshOrganizations: () => Promise<void>;
@@ -166,6 +167,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     };
   }, [isAuthenticated, user.apiKey, organizationContext]);
 
+  const acceptSession = (userData: UserData) => {
+    if (!['ADMIN', 'USER'].includes(userData.role) || !userData.apiKey) throw new Error('Invalid SPACE session');
+    organizationsLoadedRef.current = false;
+    const userInfo = { username: userData.username, apiKey: userData.apiKey, role: userData.role };
+    localStorage.setItem('user', JSON.stringify(userInfo));
+    setUser(userInfo);
+    setIsAuthenticated(true);
+  };
+
   const login = async (username: string, password: string) => {
     try {
       const response = await axios.post(
@@ -187,21 +197,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
         throw new Error("Unauthorized user. You must be ADMIN or USER to access SPACE.");
       }
 
-      // Reset organizations loaded flag for new user
-      organizationsLoadedRef.current = false;
-
-      const userInfo = {
-        username: userData.username,
-        apiKey: userData.apiKey,
-        role: userData.role,
-      };
-
-      // Persist user to localStorage
-      localStorage.setItem('user', JSON.stringify(userInfo));
-
-      setUser(userInfo);
-      setIsAuthenticated(true);
-      // Organizations will be loaded by the useEffect above
+      acceptSession(userData);
     } catch (error: any) {
       throw new Error(error.response?.data?.error || error.message || "Authentication failed");
     }
@@ -273,7 +269,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   };
 
   return (
-    <AuthContext.Provider value={{ isAuthenticated, login, logout, user, updateUser, refreshOrganizations }}>
+    <AuthContext.Provider value={{ isAuthenticated, login, logout, acceptSession, user, updateUser, refreshOrganizations }}>
       {children}
     </AuthContext.Provider>
   );

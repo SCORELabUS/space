@@ -1,3 +1,4 @@
+import SphereSignIn from '@/components/auth/SphereSignIn';
 import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { useNavigate } from 'react-router';
@@ -50,6 +51,7 @@ export default function LoginPage() {
           className="w-full flex flex-col gap-6"
           onSubmit={handleLogin}
         >
+          <SphereSignIn />
           <FormError message={error} />
           <div>
             <label className="block text-indigo-800 dark:text-indigo-200 text-sm font-bold mb-2" htmlFor="username">

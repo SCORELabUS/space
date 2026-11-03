@@ -47,6 +47,24 @@ class CacheService {
 
   // --------------------------------
 
+  async incrementWindow(key: string, seconds: number) {
+    if (!this.redisClient) throw new Error('Redis client not initialized');
+    const count = await this.redisClient.incr(this.key(key));
+    if (count === 1) await this.redisClient.expire(this.key(key), seconds);
+    return count;
+  }
+
+  async take(key: string) {
+    if (!this.redisClient) throw new Error('Redis client not initialized');
+    const value = await this.redisClient.getDel(this.key(key));
+    return value ? JSON.parse(value, this.reviver) : null;
+  }
+
+  async setIfAbsent(key: string, value: unknown, seconds: number): Promise<boolean> {
+    if (!this.redisClient) throw new Error('Redis client not initialized');
+    return (await this.redisClient.set(this.key(key), JSON.stringify(value), { NX: true, EX: seconds })) === 'OK';
+  }
+
   async get(key: string) {
     if (!this.redisClient) {
       throw new Error('Redis client not initialized');
