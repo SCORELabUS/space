@@ -13,11 +13,17 @@ const loadFileRoutes = (app: express.Application) => {
     res.json({ status: 'The WebSocket event service is active' });
   });
   
-  // Route to send a test event
+  // Route to send a test event. Authorization is enforced by the permission
+  // rules (organization key with scope ALL, or ADMIN user); it is disabled in
+  // production unless ENABLE_TEST_EVENTS=true.
   app
   .route(`${baseUrl}/events/test-event`)
   .post((req, res) => {
-    const { serviceName, pricingVersion } = req.body;
+    if (process.env.ENVIRONMENT === 'production' && process.env.ENABLE_TEST_EVENTS !== 'true') {
+      return res.status(404).json({ error: 'Test events are disabled in production (set ENABLE_TEST_EVENTS=true to enable them)' });
+    }
+
+    const { serviceName, pricingVersion } = req.body ?? {};
     
     if (!serviceName || !pricingVersion) {
       return res.status(400).json({ error: 'The fields serviceName and pricingVersion are required' });

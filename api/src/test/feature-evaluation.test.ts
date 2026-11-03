@@ -8,8 +8,7 @@ import { LeanFeature } from '../main/types/models/FeatureEvaluation';
 import { LeanService } from '../main/types/models/Service';
 import { v4 as uuidv4 } from 'uuid';
 import { addMonths, subDays, subMilliseconds } from 'date-fns';
-import { jwtVerify } from 'jose';
-import { encryptJWTSecret } from '../main/utils/jwt';
+import { verifyPricingToken } from './utils/pricingTokens';
 import { LeanContract } from '../main/types/models/Contract';
 import { cleanupAuthResources } from './utils/auth';
 import { LeanUser } from '../main/types/models/User';
@@ -542,20 +541,25 @@ describe('Features API Test Suite', function () {
 
       const token = response.body.pricingToken;
 
-      const { payload, protectedHeader } = await jwtVerify(
-        token,
-        encryptJWTSecret(process.env.JWT_SECRET!),
-        {
-          algorithms: ['HS256'], // It is important to specify the algorithm used to sign the JWT
-        }
-      );
+      // Verified the way an organization does: published public keys, ES256 only,
+      // pinning the issuer and the organization it serves.
+      const { payload, protectedHeader } = await verifyPricingToken(app, token, {
+        issuer: process.env.JWT_ISSUER || 'space',
+        audience: newContract.organizationId,
+      });
 
       expect(protectedHeader).toBeDefined();
-      expect(protectedHeader.alg).toEqual('HS256');
+      expect(protectedHeader.alg).toEqual('ES256');
+      expect(protectedHeader.kid).toBeDefined();
       expect(payload).toBeDefined();
       expect(payload.features).toEqual(DETAILED_EVALUATION_EXPECTED_RESULT);
-      expect(payload.sub).toBeDefined();
-      expect(payload.sub).toEqual(newContract.userContact.userId);
+      expect(payload.sub).toEqual(
+        `urn:space:${newContract.organizationId}:${encodeURIComponent(newContract.userContact.userId)}`
+      );
+      expect(payload.userId).toEqual(newContract.userContact.userId);
+      expect(payload.organizationId).toEqual(newContract.organizationId);
+      expect(payload.aud).toEqual(newContract.organizationId);
+      expect(payload.iss).toEqual(process.env.JWT_ISSUER || 'space');
       expect(payload.pricingContext).toBeDefined();
       expect(payload.subscriptionContext).toBeDefined();
     });
@@ -612,6 +616,7 @@ describe('Features API Test Suite', function () {
         },
         eval: true,
         error: null,
+        consumptionId: expect.any(String),
       });
 
       const contractAfter = (
@@ -690,6 +695,7 @@ describe('Features API Test Suite', function () {
         },
         eval: true,
         error: null,
+        consumptionId: expect.any(String),
       });
 
       const contractAfter = (
@@ -758,6 +764,7 @@ describe('Features API Test Suite', function () {
         },
         eval: true,
         error: null,
+        consumptionId: expect.any(String),
       });
 
       const contractAfter = (

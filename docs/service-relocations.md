@@ -1,0 +1,9 @@
+# Recovering a service rename or move
+
+Renames and moves keep the service identity and persist a private operation journal, with per-contract progress. Existing subscription/history/consumption guards remain in force. Pricings, contracts and service metadata are convergent stages, not one multi-document transaction. A technical interruption can leave an operation pending; it is not reported as successful.
+
+Retry the exact original PUT body using the original organization and service name. Recovery finds the operation by that identity even after the service metadata moved, reads contracts by stable database ID, and recognizes an atomic mutation marker so it never applies the same history twice. It completes pending cache invalidations and event emission attempts even when a contract no longer contains the old service name. An event attempt is not a transport delivery acknowledgement; duplicate notification attempts are possible after a crash.
+
+While pending, other service/binding mutations in either organization return 409 SERVICE_RELOCATION_PENDING. Manual binding writes and relocations share renewable organization leases; relocations acquire source/destination in a fixed order. Normal atomic consumption updates remain conditional and independent. SPHERE creation/synchronization also respects pending binding changes. A retry must retain the original destination so normal source/destination authorization is checked again; destination-only routes cannot resume a source operation.
+
+The additive startup migration creates the serviceRelocations/serviceRelocationSteps collections and indexes; seed/reset initializes their empty indexes. The journal is internal and is never returned by service or contract endpoints. Its per-contract snapshots contain only the identity and original service bindings needed for invalidation and notifications; the private mutation marker is omitted from public contract serialization and listings.

@@ -12,7 +12,11 @@ const userSchema = new Schema({
   password: {
     type: String,
     minlength: 5,
-    required: true,
+    required: function(this: { sphereIdentity?: unknown }) { return !this.sphereIdentity; },
+  },
+  sphereIdentity: {
+    type: new Schema({ issuer: { type: String, required: true }, subject: { type: String, required: true } }, { _id: false }),
+    select: false,
   },
   apiKey: {
     type: String,
@@ -32,29 +36,33 @@ const userSchema = new Schema({
       delete resultObject._id;
       delete resultObject.__v;
       delete resultObject.password;
+      delete resultObject.sphereIdentity;
       return resultObject;
     }
   }
 });
 
+userSchema.index({ 'sphereIdentity.issuer': 1, 'sphereIdentity.subject': 1 }, {
+  name: 'unique_sphere_identity', unique: true,
+  partialFilterExpression: { 'sphereIdentity.issuer': { $type: 'string' }, 'sphereIdentity.subject': { $type: 'string' } },
+});
+
 // Verify password method
 userSchema.methods.verifyPassword = async function(password: string) {
-  return await bcrypt.compare(password, this.password);
+  return Boolean(this.password) && await bcrypt.compare(password, this.password);
 };
 
 userSchema.pre('save', async function(next) {
   const user = this;
   
+  if (!user.apiKey) user.apiKey = generateUserApiKey();
+
   // If the password hasn't changed, we continue
-  if (!user.isModified('password')) return next();
+  if (!user.isModified('password') || !user.password) return next();
 
   try {
     user.password = await hashPassword(user.password);
-    
-    // If there's no API Key, we generate one
-    if (!user.apiKey) {
-      user.apiKey = generateUserApiKey();
-    }
+
     
     next();
   } catch (error) {
@@ -64,7 +72,8 @@ userSchema.pre('save', async function(next) {
 
 export interface UserDocument extends Document {
   username: string;
-  password: string;
+  password?: string;
+  sphereIdentity?: { issuer: string; subject: string };
   apiKey: string;
   role: UserRole;
   verifyPassword: (password: string) => Promise<boolean>;

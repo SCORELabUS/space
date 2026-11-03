@@ -33,11 +33,16 @@ const handleFileUpload = (imageFieldNames: string[], folder: string): RequestHan
   }
 };
 
-const handlePricingUpload = (pricingFieldNames: string[], folder: string): RequestHandler => {
+const handlePricingUpload = (pricingFieldNames: string[], folder: string | (() => string)): RequestHandler => {
   const storage = multer.diskStorage({
     destination: function (req, file, cb) {
-      fs.mkdirSync(folder, { recursive: true });
-      cb(null, folder);
+      try {
+        const directory = typeof folder === 'function' ? folder() : folder;
+        fs.mkdirSync(directory, { recursive: true });
+        cb(null, directory);
+      } catch (error) {
+        cb(error as Error, '');
+      }
     },
     filename: function (req, file, cb) {
       if (file) {

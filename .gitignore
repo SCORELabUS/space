@@ -142,9 +142,13 @@ api/scripts/output/
 
 # Static files
 api/public/static
+api/private
 
 # Generated files for testing purposes
 api/src/test/data/generated/
 
 #### Global ignores ####
 .DS_Store
+# Built .NET documentation example
+docs/examples/pricing-token-dotnet/bin/
+docs/examples/pricing-token-dotnet/obj/

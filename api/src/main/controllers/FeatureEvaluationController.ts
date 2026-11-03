@@ -1,7 +1,9 @@
+import { ServiceRelocationPendingError } from '../services/serviceRelocationState';
 import container from '../config/container.js';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils.js';
 import FeatureEvaluationService from '../services/FeatureEvaluationService.js';
-import { FeatureEvalQueryParams, FeatureEvaluationResult, FeatureIndexQueryParams, SingleFeatureEvalQueryParams } from '../types/models/FeatureEvaluation.js';
+import { DormantServiceError } from '../services/ServiceService.js';
+import { ConsumptionRevertResult, FeatureEvalQueryParams, FeatureEvaluationResult, FeatureIndexQueryParams, SingleFeatureEvalQueryParams } from '../types/models/FeatureEvaluation.js';
 
 class FeatureEvaluationController {
   private readonly featureEvaluationService: FeatureEvaluationService;
@@ -27,6 +29,7 @@ class FeatureEvaluationController {
       const features = await this.featureEvaluationService.index(queryParams, organizationId);
       res.json(features);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       res.status(500).send({ error: err.message });
     }
   }
@@ -43,6 +46,7 @@ class FeatureEvaluationController {
       const featureEvaluation = await this.featureEvaluationService.eval(userId, req.org, options);
       res.json(featureEvaluation);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       }else if (err.message.toLowerCase().includes('invalid')) {
@@ -67,6 +71,7 @@ class FeatureEvaluationController {
       const token = await this.featureEvaluationService.generatePricingToken(userId, req.org, options);
       res.json({pricingToken: token});
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       }else if (err.message.toLowerCase().includes('invalid')) {
@@ -90,21 +95,28 @@ class FeatureEvaluationController {
         throw new Error('PERMISSION ERROR: This endpoint can only be invoqued with organization authentication');
       }
 
-      const featureEvaluation: boolean | FeatureEvaluationResult = await this.featureEvaluationService.evalFeature(userId, featureId, expectedConsumption, req.org, options);
+      const featureEvaluation: boolean | FeatureEvaluationResult | ConsumptionRevertResult =
+        await this.featureEvaluationService.evalFeature(userId, featureId, expectedConsumption, req.org, options);
 
       if (typeof featureEvaluation === 'boolean') {
         res.status(204).json("Usage level reset successfully");
       }else{
+        // An evaluation, or a revert that skipped usage levels (200 with what
+        // was reverted and skipped instead of 204).
         res.json(featureEvaluation);
       }
     }
     catch (err: any) {
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err instanceof DormantServiceError) {
+        res.status(409).send({ error: err.message, code: err.code, service: err.service });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       }else if (err.message.toLowerCase().includes('invalid')) {
         res.status(400).send({ error: err.message });
       }else if (err.message.toLowerCase().includes('permission error')) {
         res.status(403).send({ error: err.message });
+      }else if (err.message.startsWith('CONFLICT:')) {
+        res.status(409).send({ error: err.message });
       }else {
         res.status(500).send({ error: err.message });
       }
@@ -162,6 +174,17 @@ class FeatureEvaluationController {
       revert: queryParams['revert'] === "true",
       latest: queryParams['latest'] === "true",
     };
+
+    const consumptionId = queryParams['consumptionId'];
+    if (consumptionId !== undefined) {
+      if (typeof consumptionId !== 'string' || consumptionId.length === 0 || consumptionId.length > 255) {
+        throw new Error('Invalid query: consumptionId must be one non-empty id');
+      }
+      if (!transformedData.revert) {
+        throw new Error('Invalid query: consumptionId is only accepted with revert=true');
+      }
+      transformedData.consumptionId = consumptionId;
+    }
 
     return transformedData;
   }

@@ -23,6 +23,18 @@ export default class SphereSyncRepository {
   deletePricing(filter: any): Promise<{ deletedCount: number }> { return Pricing.deleteOne(filter).exec(); }
   contract(filter: any): Promise<any> { return Contract.findOne(filter).lean().exec(); }
   contracts(filter: any): Promise<any[]> { return Contract.find(filter).lean().exec(); }
+  /** Counts current bindings only; history and unrelated organizations are excluded. */
+  contractCountsByVersion(organizationId: string, serviceName: string): Promise<{ version: string; count: number }[]> {
+    return Contract.aggregate<{ version: string; count: number }>([
+      { $match: { organizationId } },
+      { $project: { bindings: { $objectToArray: { $ifNull: ['$contractedServices', {}] } } } },
+      { $unwind: '$bindings' },
+      { $match: { 'bindings.k': serviceName } },
+      { $group: { _id: '$bindings.v', count: { $sum: 1 } } },
+      { $project: { _id: 0, version: '$_id', count: 1 } },
+      { $sort: { version: 1 } },
+    ]).exec();
+  }
   contractExists(filter: any) { return Contract.exists(filter); }
   updateContract(filter: any, update: any) { return Contract.updateOne(filter, update); }
   aggregateContracts(pipeline: any[]) { return Contract.aggregate(pipeline); }

@@ -293,6 +293,7 @@ class OrganizationService {
 
     // 4. Persistence
     await this.organizationRepository.updateMemberRole(organizationId, username, role);
+    await container.resolve('eventService').revalidateContractConnections();
   }
 
   async update(organizationId: string, updateData: any, reqUser: any): Promise<void> {
@@ -323,61 +324,65 @@ class OrganizationService {
       organization.name = updateData.name;
     }
 
-    if (updateData.owner) {
-      if (reqUser.role !== 'ADMIN' && organization.owner !== reqUser.username) {
-        throw new Error(
-          'PERMISSION ERROR: Only SPACE admins or organization owners can change organization ownership.'
-        );
+    try {
+      if (updateData.owner) {
+        if (reqUser.role !== 'ADMIN' && organization.owner !== reqUser.username) {
+          throw new Error(
+            'PERMISSION ERROR: Only SPACE admins or organization owners can change organization ownership.'
+          );
+        }
+
+        if (organization.default) {
+          throw new Error('CONFLICT: Cannot transfer ownership of a default organization.');
+        }
+
+        const proposedOwner = await this.userRepository.findByUsername(updateData.owner);
+        if (!proposedOwner) {
+          throw new Error(`INVALID DATA: User with username ${updateData.owner} does not exist.`);
+        }
+
+        // Save the old owner to add them as ADMIN member
+        const oldOwner = organization.owner;
+        const newOwner = updateData.owner;
+
+        // Check if new owner is currently a member - if so, remove them from members
+        const newOwnerIsMember = organization.members.some(m => m.username === newOwner);
+        if (newOwnerIsMember) {
+          await this.organizationRepository.removeMember(organizationId, newOwner);
+        }
+
+        // Check if old owner is already a member
+        const oldOwnerIsMember = organization.members.some(m => m.username === oldOwner);
+
+        // Add old owner as ADMIN member if not already a member
+        if (!oldOwnerIsMember) {
+          await this.organizationRepository.addMember(organizationId, {
+            username: oldOwner,
+            role: 'ADMIN',
+          });
+        }
+
+        organization.owner = newOwner;
       }
 
-      if (organization.default) {
-        throw new Error('CONFLICT: Cannot transfer ownership of a default organization.');
+      if (updateData.default !== undefined) {
+        if (typeof updateData.default !== 'boolean') {
+          throw new Error('INVALID DATA: Invalid organization default flag.');
+        }
+
+        const proposedOwnerDefaultOrg = await this.organizationRepository.find({ owner: organization.owner, default: true });
+
+        if (proposedOwnerDefaultOrg.length > 0) {
+          throw new Error(`CONFLICT: The proposed owner ${organization.owner} already has a default organization.`);
+        }
+
+        organization.default = updateData.default;
       }
 
-      const proposedOwner = await this.userRepository.findByUsername(updateData.owner);
-      if (!proposedOwner) {
-        throw new Error(`INVALID DATA: User with username ${updateData.owner} does not exist.`);
-      }
-
-      // Save the old owner to add them as ADMIN member
-      const oldOwner = organization.owner;
-      const newOwner = updateData.owner;
-      
-      // Check if new owner is currently a member - if so, remove them from members
-      const newOwnerIsMember = organization.members.some(m => m.username === newOwner);
-      if (newOwnerIsMember) {
-        await this.organizationRepository.removeMember(organizationId, newOwner);
-      }
-      
-      // Check if old owner is already a member
-      const oldOwnerIsMember = organization.members.some(m => m.username === oldOwner);
-      
-      // Add old owner as ADMIN member if not already a member
-      if (!oldOwnerIsMember) {
-        await this.organizationRepository.addMember(organizationId, {
-          username: oldOwner,
-          role: 'ADMIN',
-        });
-      }
-
-      organization.owner = newOwner;
+      await this.organizationRepository.update(organizationId, updateData);
+    } finally {
+      await container.resolve('eventService').revalidateContractConnections();
     }
-
-    if (updateData.default !== undefined) {
-      if (typeof updateData.default !== 'boolean') {
-        throw new Error('INVALID DATA: Invalid organization default flag.');
-      }
-
-      const proposedOwnerDefaultOrg = await this.organizationRepository.find({ owner: organization.owner, default: true });
-  
-      if (proposedOwnerDefaultOrg.length > 0) {
-        throw new Error(`CONFLICT: The proposed owner ${organization.owner} already has a default organization.`);
-      }
-
-      organization.default = updateData.default;
-    }
-
-    await this.organizationRepository.update(organizationId, updateData);
   }
 
   async updateUsername(oldUsername: string, newUsername: string): Promise<void> {
@@ -435,6 +440,7 @@ class OrganizationService {
 
     // 3. Execution
     await this.organizationRepository.removeApiKey(organizationId, apiKey);
+    await container.resolve('eventService').revalidateContractConnections();
   }
 
   async removeMember(organizationId: string, username: string, reqUser: any): Promise<void> {
@@ -479,6 +485,7 @@ class OrganizationService {
 
     // 3. Execute the atomic removal operation in the database
     await this.organizationRepository.removeMember(organizationId, username);
+    await container.resolve('eventService').revalidateContractConnections();
   }
 
   async destroy(organizationId: string, reqUser: any): Promise<void> {
@@ -503,6 +510,7 @@ class OrganizationService {
 
     await this.serviceService.prune(organizationId);
     await this.organizationRepository.delete(organizationId);
+    await container.resolve('eventService').revalidateContractConnections();
   }
 
   /**
@@ -511,6 +519,7 @@ class OrganizationService {
   async forceDelete(organizationId: string): Promise<void> {
     await this.serviceService.prune(organizationId);
     await this.organizationRepository.delete(organizationId);
+    await container.resolve('eventService').revalidateContractConnections();
   }
 
   /**
@@ -525,51 +534,55 @@ class OrganizationService {
     // Get organizations where the user is owner or member
     const allOrgs = await this.organizationRepository.findByUser(username);
 
-    for (const org of allOrgs) {
-      const orgId = (org as any).id as string | undefined;
+    try {
+      for (const org of allOrgs) {
+        const orgId = (org as any).id as string | undefined;
 
-      // If user is a member, remove them
-      const isMember = (org.members || []).some(m => m.username === username);
-      if (isMember && orgId) {
-        try {
-          await this.organizationRepository.removeMember(orgId, username);
-        } catch (err) {
-          // ignore if not present or race
-        }
-      }
-
-      // If user is owner, handle transfer or deletion
-      if (org.owner === username) {
-        const members = org.members || [];
-        // Candidates exclude owner
-        const candidates = members.filter((m: any) => m.username !== username);
-
-        let newOwner: string | undefined;
-        if (candidates.length > 0) {
-          const adminCandidate = candidates.find((m: any) => m.role === 'ADMIN');
-          const managerCandidate = candidates.find((m: any) => m.role === 'MANAGER');
-          const evaluatorCandidate = candidates.find((m: any) => m.role === 'EVALUATOR');
-
-          newOwner = (adminCandidate || managerCandidate || evaluatorCandidate)?.username;
-        }
-
-        if (newOwner && orgId) {
-          // change owner and ensure the old owner is removed from members
-          await this.organizationRepository.changeOwner(orgId, newOwner);
+        // If user is a member, remove them
+        const isMember = (org.members || []).some(m => m.username === username);
+        if (isMember && orgId) {
           try {
             await this.organizationRepository.removeMember(orgId, username);
           } catch (err) {
-            // ignore
+            // ignore if not present or race
           }
-        } else if (orgId) {
-          // No candidates: delete org. Allow deletion of default when explicitly permitted.
-          if (org.default && !allowDeleteDefault) {
-            // If default deletion is not allowed, skip transfer/delete — leave org owned by deleted user (edge case)
-            continue;
+        }
+
+        // If user is owner, handle transfer or deletion
+        if (org.owner === username) {
+          const members = org.members || [];
+          // Candidates exclude owner
+          const candidates = members.filter((m: any) => m.username !== username);
+
+          let newOwner: string | undefined;
+          if (candidates.length > 0) {
+            const adminCandidate = candidates.find((m: any) => m.role === 'ADMIN');
+            const managerCandidate = candidates.find((m: any) => m.role === 'MANAGER');
+            const evaluatorCandidate = candidates.find((m: any) => m.role === 'EVALUATOR');
+
+            newOwner = (adminCandidate || managerCandidate || evaluatorCandidate)?.username;
           }
-          await this.forceDelete(orgId);
+
+          if (newOwner && orgId) {
+            // change owner and ensure the old owner is removed from members
+            await this.organizationRepository.changeOwner(orgId, newOwner);
+            try {
+              await this.organizationRepository.removeMember(orgId, username);
+            } catch (err) {
+              // ignore
+            }
+          } else if (orgId) {
+            // No candidates: delete org. Allow deletion of default when explicitly permitted.
+            if (org.default && !allowDeleteDefault) {
+              // If default deletion is not allowed, skip transfer/delete — leave org owned by deleted user (edge case)
+              continue;
+            }
+            await this.forceDelete(orgId);
+          }
         }
       }
+    } finally {
+      await container.resolve('eventService').revalidateContractConnections();
     }
   }
 }

@@ -1,3 +1,4 @@
+import SphereSignIn from '@/components/auth/SphereSignIn';
 import { motion } from 'framer-motion';
 import SettingToggle from '@/components/SettingToggle';
 import useAuth from '@/hooks/useAuth';
@@ -23,6 +24,7 @@ export default function SettingsPage() {
         Settings
       </motion.h2>
       <div className="w-full max-w-md flex flex-col gap-4">
+        <SphereSignIn mode="link" />
         <SettingToggle
           label="Dark mode"
           checked={darkMode}

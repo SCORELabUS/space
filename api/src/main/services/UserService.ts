@@ -57,7 +57,21 @@ class UserService {
     return user;
   }
 
+  async createFederated(username: string, issuer: string, subject: string) {
+    const user = await this.userRepository.create({ username, sphereIdentity: { issuer, subject }, role: 'USER' });
+    try {
+      await this.organizationService.create({ name: `${user.username}'s Organization`, owner: user.username, default: true }, user);
+    } catch (error) {
+      await this.userRepository.deleteCreatedFederatedUser(user.id);
+      throw error;
+    }
+    return user;
+  }
+
   async create(userData: any, creatorData: LeanUser) {
+    // Federated identities are server-managed and cannot be set through generic user writes.
+    userData = { username: userData.username, password: userData.password, role: userData.role };
+
     
     const existingUser = await this.userRepository.findByUsername(userData.username);
     if (existingUser) {
@@ -84,6 +98,8 @@ class UserService {
   }
 
   async update(username: string, userData: any, creatorData: LeanUser) {
+    userData = Object.fromEntries(Object.entries(userData).filter(([key]) => ['username', 'password', 'role'].includes(key)));
+
     
     if (creatorData && (creatorData.role !== 'ADMIN' && userData.role === 'ADMIN')) {
       throw new Error('PERMISSION ERROR: Only admins can change roles to admin.');
@@ -120,9 +136,13 @@ class UserService {
 
     const updatedUser = await this.userRepository.update(username, userData);
 
-    // If the username was changed, update the owner field in the organizations owned by the user
-    if (userData.username && userData.username !== username) {
-      await this.organizationService.updateUsername(username, userData.username);
+    try {
+      // If the username was changed, update the owner field in the organizations owned by the user
+      if (userData.username && userData.username !== username) {
+        await this.organizationService.updateUsername(username, userData.username);
+      }
+    } finally {
+      await container.resolve('eventService').revalidateContractConnections();
     }
 
     return this.sanitizeUserForRequester(updatedUser, creatorData, username);
@@ -139,6 +159,7 @@ class UserService {
       throw new Error('API Key could not be regenerated');
     }
     
+    await container.resolve('eventService').revalidateContractConnections();
     return newApiKey;
   }
 
@@ -170,6 +191,7 @@ class UserService {
     }
 
     const updatedUser = await this.userRepository.changeRole(username, role);
+    await container.resolve('eventService').revalidateContractConnections();
     return this.sanitizeUserForRequester(updatedUser, creatorData, username);
   }
 
@@ -208,6 +230,7 @@ class UserService {
     if (!result) {
       throw new Error('INVALID DATA: User not found');
     }
+    await container.resolve('eventService').revalidateContractConnections();
     return true;
   }
 }

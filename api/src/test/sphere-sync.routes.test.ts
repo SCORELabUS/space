@@ -2,12 +2,14 @@ import request from 'supertest';
 import nock from 'nock';
 import mongoose from 'mongoose';
 import { Server } from 'http';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import container from '../main/config/container';
 import { baseUrl, getApp, shutdownApp } from './utils/testApp';
 import { createTestUser, deleteTestUser } from './utils/users/userTestUtils';
 import { addApiKeyToOrganization, addMemberToOrganization, createTestOrganization, deleteTestOrganization } from './utils/organization/organizationTestUtils';
 import { generateOrganizationApiKey } from '../main/utils/users/helpers';
 import Service from '../main/repositories/mongoose/models/ServiceMongoose';
+import Contract from '../main/repositories/mongoose/models/ContractMongoose';
 import { functionalHash } from '../main/services/sphere/SphereClient';
 
 const origin = 'https://sphere.score.us.es';
@@ -78,6 +80,8 @@ describe('SPHERE synchronization API routes', () => {
   });
 
   afterEach(async () => {
+    await Contract.deleteMany({ organizationId: { $in: [organization.id, otherOrganization.id] } });
+    vi.restoreAllMocks();
     await Service.deleteMany({ organizationId: { $in: [organization.id, otherOrganization.id] } });
     await deleteTestOrganization(organization.id);
     await deleteTestOrganization(otherOrganization.id);
@@ -167,6 +171,57 @@ describe('SPHERE synchronization API routes', () => {
       expect(response.body.configuration.pricingId).toBe(pricingId);
       expect(response.body.configuration.policy).toBe('new_last');
       expect(response.body.retainedVersions).toEqual([]);
+      expect(response.body.contractCounts).toEqual([]);
+    });
+
+    it('counts current bindings per version without including history, prefix siblings or other organizations', async () => {
+      await createLinkedService();
+      await Contract.collection.insertMany([
+        { organizationId: organization.id, userContact: { userId: 'counts-old-1' }, contractedServices: { [serviceName]: '1_0' } },
+        { organizationId: organization.id, userContact: { userId: 'counts-old-2' }, contractedServices: { [serviceName]: '1_0' }, billingPeriod: { endDate: new Date('2020-01-01') } },
+        { organizationId: organization.id, userContact: { userId: 'counts-new' }, contractedServices: { [serviceName]: '2_0' }, history: [{ contractedServices: { [serviceName]: '1_0' } }] },
+        { organizationId: organization.id, userContact: { userId: 'counts-sibling' }, contractedServices: { [`${serviceName}pro`]: '1_0' }, history: [{ contractedServices: { [serviceName]: '1_0' } }] },
+        { organizationId: otherOrganization.id, userContact: { userId: 'counts-other-org' }, contractedServices: { [serviceName]: '1_0' } },
+      ]);
+      const response = await request(app).get(`${baseUrl}/services/${serviceName}/synchronization`).set('x-api-key', evaluationKey);
+      expect(response.status).toBe(200);
+      expect(response.body.contractCounts).toEqual([{ version: '1.0', count: 2 }, { version: '2.0', count: 1 }]);
+      expect(JSON.stringify(response.body.contractCounts)).not.toContain('counts-old');
+      // A policy for new contracts can retain old bindings even without a remote manifest or local pricing copy.
+      expect(response.body.retainedVersions).toEqual([]);
+      const scoped = await request(app).get(`${baseUrl}/organizations/${organization.id}/services/${serviceName}/synchronization`).set('x-api-key', evaluatorUser.apiKey);
+      expect(scoped.status).toBe(200);
+      expect(scoped.body.contractCounts).toEqual(response.body.contractCounts);
+    });
+
+    it('preserves counts while paused and after reactivation without exposing credentials', async () => {
+      await createLinkedService({ service: { disabled: true }, sphere: { encryptedApiKey: { ciphertext: 'private-credential-marker' } } });
+      await Contract.collection.insertOne({ organizationId: organization.id, userContact: { userId: 'counts-paused' }, contractedServices: { [serviceName]: '1_0' } });
+      const get = () => request(app).get(`${baseUrl}/services/${serviceName}/synchronization`).set('x-api-key', allKey);
+      const paused = await get();
+      expect(paused.status).toBe(200);
+      expect(paused.body.disabled).toBe(true);
+      expect(paused.body.contractCounts).toEqual([{ version: '1.0', count: 1 }]);
+      expect(paused.body.configuration.hasApiKey).toBe(true);
+      expect(paused.body.configuration.encryptedApiKey).toBeUndefined();
+      expect(JSON.stringify(paused.body)).not.toContain('private-credential-marker');
+      const resumed = await request(app).post(`${baseUrl}/services/${serviceName}/synchronization/resume`).set('x-api-key', allKey);
+      expect(resumed.status).toBe(202);
+      const active = await get();
+      expect(active.body.disabled).toBe(false);
+      expect(active.body.contractCounts).toEqual(paused.body.contractCounts);
+      expect(active.body.configuration.encryptedApiKey).toBeUndefined();
+    });
+
+    it('refreshes counts after a binding changes or a contract is deleted', async () => {
+      await createLinkedService();
+      const contract = await Contract.collection.insertOne({ organizationId: organization.id, userContact: { userId: 'counts-changing' }, contractedServices: { [serviceName]: '1_0' } });
+      const get = () => request(app).get(`${baseUrl}/services/${serviceName}/synchronization`).set('x-api-key', allKey);
+      expect((await get()).body.contractCounts).toEqual([{ version: '1.0', count: 1 }]);
+      await Contract.collection.updateOne({ _id: contract.insertedId }, { $set: { [`contractedServices.${serviceName}`]: '2_0' } });
+      expect((await get()).body.contractCounts).toEqual([{ version: '2.0', count: 1 }]);
+      await Contract.collection.deleteOne({ _id: contract.insertedId });
+      expect((await get()).body.contractCounts).toEqual([]);
     });
 
     it('reports a manually created service as manual with no configuration', async () => {
@@ -178,6 +233,7 @@ describe('SPHERE synchronization API routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.source).toBe('manual');
       expect(response.body.configuration).toBeNull();
+      expect(response.body.contractCounts).toEqual([]);
     });
 
     it('is readable with an evaluation-scoped organization key', async () => {
@@ -396,6 +452,98 @@ describe('SPHERE synchronization API routes', () => {
         expect(response.status).toBe(200);
         expect(response.body.configuration.pollIntervalMinutes).toBe(1);
       });
+    });
+  });
+
+  describe('POST /services/:serviceName/synchronization/resume', () => {
+    beforeEach(() => {
+      // This route schedules background synchronization; policy execution is covered by integration tests.
+      vi.spyOn(container.resolve('sphereSyncService'), 'synchronize').mockResolvedValue(undefined);
+    });
+
+    it('reactivates and queues a paused linked service and accepts repeat requests', async () => {
+      await createLinkedService({ service: { disabled: true } });
+      const activated = vi.spyOn(container.resolve('eventService'), 'emitPricingActivedMessage');
+      const before = await Service.findOne({ name: serviceName, organizationId: organization.id }).lean() as any;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await request(app).post(`${baseUrl}/services/${serviceName}/synchronization/resume`).set('x-api-key', allKey);
+        expect(response.status, JSON.stringify(response.body)).toBe(202);
+        expect(response.body.disabled).toBe(false);
+        expect(response.body.configuration.status).toBe('queued');
+        expect(response.body.configuration.policy).toBe(before.sphere.policy);
+        expect(response.body.configuration.target).toEqual(before.sphere.target);
+      }
+      const after = await Service.findOne({ name: serviceName, organizationId: organization.id }).lean() as any;
+      expect(after.disabled).toBe(false);
+      expect(after.activePricings).toEqual(before.activePricings);
+      expect(after.archivedPricings).toEqual(before.archivedPricings);
+      expect(after.sphere.revision).toBe(before.sphere.revision);
+      expect(activated).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows the organization owner to reactivate through the scoped route', async () => {
+      await createLinkedService({ service: { disabled: true } });
+      const response = await request(app).post(`${baseUrl}/organizations/${organization.id}/services/${serviceName}/synchronization/resume`)
+        .set('x-api-key', ownerUser.apiKey).send({ organizationId: otherOrganization.id });
+      expect(response.status, JSON.stringify(response.body)).toBe(202);
+      expect(response.body.disabled).toBe(false);
+      expect((await Service.findOne({ name: serviceName, organizationId: organization.id }).lean())?.disabled).toBe(false);
+      expect(await Service.countDocuments({ organizationId: otherOrganization.id })).toBe(0);
+    });
+
+    it('rejects an EVALUATION organization key without reactivating', async () => {
+      await createLinkedService({ service: { disabled: true } });
+      const response = await request(app).post(`${baseUrl}/services/${serviceName}/synchronization/resume`).set('x-api-key', evaluationKey);
+      expect(response.status).toBe(403);
+      expect((await Service.findOne({ name: serviceName, organizationId: organization.id }).lean())?.disabled).toBe(true);
+    });
+
+    it.each(['outsider', 'evaluator'])('rejects a scoped %s user without reactivating', async actor => {
+      await createLinkedService({ service: { disabled: true } });
+      const response = await request(app).post(`${baseUrl}/organizations/${organization.id}/services/${serviceName}/synchronization/resume`)
+        .set('x-api-key', actor === 'outsider' ? outsiderUser.apiKey : evaluatorUser.apiKey);
+      expect(response.status).toBe(403);
+      expect((await Service.findOne({ name: serviceName, organizationId: organization.id }).lean())?.disabled).toBe(true);
+    });
+
+    it('cannot reactivate another organization service through its own key', async () => {
+      await createLinkedService({ service: { disabled: true } });
+      const response = await request(app).post(`${baseUrl}/services/${serviceName}/synchronization/resume`).set('x-api-key', otherOrgKey);
+      expect(response.status).toBe(404);
+      expect((await Service.findOne({ name: serviceName, organizationId: organization.id }).lean())?.disabled).toBe(true);
+    });
+
+    it('returns 404 for a manual service', async () => {
+      await createLinkedService({ service: { source: 'manual', disabled: true } });
+      const response = await request(app).post(`${baseUrl}/services/${serviceName}/synchronization/resume`).set('x-api-key', allKey);
+      expect(response.status).toBe(404);
+    });
+
+    it('returns 409 while a synchronization is applying and leaves it disabled', async () => {
+      await createLinkedService({ service: { disabled: true }, sphere: { status: 'applying' } });
+      const response = await request(app).post(`${baseUrl}/services/${serviceName}/synchronization/resume`).set('x-api-key', allKey);
+      expect(response.status).toBe(409);
+      expect((await Service.findOne({ name: serviceName, organizationId: organization.id }).lean())?.disabled).toBe(true);
+    });
+  });
+
+  describe('discovering disabled services', () => {
+    it('lists paused services through disabled=true without changing the default active list', async () => {
+      await createLinkedService({ service: { disabled: true } });
+      const paused = await request(app).get(`${baseUrl}/services?disabled=true`).set('x-api-key', allKey);
+      const active = await request(app).get(`${baseUrl}/services`).set('x-api-key', allKey);
+      const status = await request(app).get(`${baseUrl}/services/${serviceName}/synchronization`).set('x-api-key', evaluationKey);
+      expect(status.status).toBe(200);
+      expect(status.body.disabled).toBe(true);
+      expect(paused.status).toBe(200);
+      expect(paused.body.map((entry: any) => entry.name)).toContain(serviceName);
+      expect(active.status).toBe(200);
+      expect(active.body.map((entry: any) => entry.name)).not.toContain(serviceName);
+    });
+
+    it.each(['disabled=maybe', 'disabled[]=true', 'disabled=true&disabled=false'])('rejects an invalid disabled filter (%s)', async query => {
+      const response = await request(app).get(`${baseUrl}/services?${query}`).set('x-api-key', allKey);
+      expect(response.status).toBe(400);
     });
   });
 

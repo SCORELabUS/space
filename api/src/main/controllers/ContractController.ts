@@ -1,5 +1,7 @@
+import { IdempotencyStateChangedError } from '../services/idempotencyExecution';
+import { ServiceRelocationPendingError } from '../services/serviceRelocationState';
 import container from '../config/container';
-import ContractService from '../services/ContractService';
+import ContractService, { NovationOptions } from '../services/ContractService';
 import {
   ContractQueryFilters,
   ContractToCreate,
@@ -7,16 +9,132 @@ import {
   UsageLevelsResetQuery,
 } from '../types/models/Contract';
 import { removeOptionalFieldsOfQueryParams } from '../utils/controllerUtils';
+import { SubscriptionValidationError } from './validation/ContractValidation';
+import { DormantServiceError } from '../services/ServiceService';
+import {
+  ContractChangedError,
+  computeContractVersion,
+  parseIfMatch,
+} from '../utils/contracts/version';
+import { OrganizationRequiredError } from '../utils/contracts/scope';
+
+/** Add `contractVersion` to a contract response (see `computeContractVersion`). */
+function withVersion<T extends object>(contract: T): T & { contractVersion: string } {
+  return { ...contract, contractVersion: computeContractVersion(contract as any) };
+}
+
+/**
+ * Send one contract with its version, also as `ETag`.
+ *
+ * The tag versions the subscription, for `If-Match` on novation. It is not a
+ * cache validator for the whole representation - usage levels change under the
+ * same version - so `If-None-Match` is not evaluated (Express would otherwise
+ * answer 304 by itself).
+ */
+function sendContract(req: any, res: any, status: number, contract: any) {
+  const body = withVersion(contract);
+  delete req.headers['if-none-match'];
+  delete req.headers['if-modified-since'];
+  res.set('ETag', `"${body.contractVersion}"`);
+  res.status(status).json(body);
+}
+
+function sendContractChanged(res: any, err: ContractChangedError) {
+  if (typeof err.contractVersion === 'string') {
+    res.set('ETag', `"${err.contractVersion}"`);
+    res.status(412).send({ error: 'CONTRACT_CHANGED', contractVersion: err.contractVersion });
+  } else {
+    res.status(412).send({
+      error: 'CONTRACT_CHANGED',
+      contractVersions: err.contractVersion,
+      ...(err.novated ? { novated: err.novated } : {}),
+    });
+  }
+}
+
+/**
+ * Every validation problem, each with a stable `code`.
+ *
+ * Status: 400. Novations keep answering 404 when everything wrong is a missing
+ * plan, add-on or pricing version, as they did before the codes existed.
+ */
+function sendInvalidSubscription(res: any, err: SubscriptionValidationError, novation = false) {
+  const onlyMissing = err.errors.every(error => error.code.endsWith('_NOT_FOUND'));
+  res.status(novation && onlyMissing ? 404 : 400).send({ error: err.message, errors: err.errors });
+}
+
+/**
+ * A boolean option from the query (`name=true`) or the body (`name: true`).
+ * The body field is removed so that only the subscription remains.
+ */
+function flagOf(req: any, name: string): boolean {
+  const value = req.body?.[name];
+  if (req.body && typeof req.body === 'object' && name in req.body) delete req.body[name];
+  return req.query?.[name] === 'true' || value === true;
+}
+
+/** Novation options: `keepBillingPeriod` and the opt-in `rejectPrivate`. */
+function novationOptionsOf(req: any): NovationOptions {
+  return {
+    keepBillingPeriod: flagOf(req, 'keepBillingPeriod'),
+    rejectPrivate: flagOf(req, 'rejectPrivate'),
+  };
+}
+
+/**
+ * The versions a novation is conditional on: the strong tags of `If-Match`
+ * (several may be listed; weak tags never match) or the body field
+ * `expectedContractVersion` (removed from the body). Both may be given only if
+ * the header lists the body's version (or is `*`).
+ */
+function expectedVersionOf(req: any): string[] | undefined {
+  const header = parseIfMatch(req.get?.('If-Match'));
+  const fromBody = req.body?.expectedContractVersion;
+  if (req.body && 'expectedContractVersion' in req.body) delete req.body.expectedContractVersion;
+  if (fromBody !== undefined) {
+    if (header !== undefined && !header.includes(fromBody) && !header.includes('*')) {
+      throw new Error('Invalid precondition: If-Match and expectedContractVersion differ');
+    }
+    return [fromBody];
+  }
+  return header;
+}
+
+/**
+ * Answer the errors of resolving the organization of a request (see
+ * `ContractController._scope`): 400 `ORGANIZATION_ID_REQUIRED` when a platform
+ * ADMIN does not name one, 403 for an `organizationId` parameter that is not the
+ * caller's, 400 for a malformed one. Returns whether it answered.
+ */
+function sendScopeError(res: any, err: any): boolean {
+  if (err instanceof OrganizationRequiredError) {
+    res.status(400).send({ error: err.message, code: err.code });
+    return true;
+  }
+  const message = String(err?.message ?? '');
+  if (message.startsWith('PERMISSION ERROR: organizationId')) {
+    res.status(403).send({ error: message });
+    return true;
+  }
+  if (message.startsWith('INVALID DATA: organizationId')) {
+    res.status(400).send({ error: message });
+    return true;
+  }
+  return false;
+}
 
 class ContractController {
   private readonly contractService: ContractService;
 
   constructor() {
     this.contractService = container.resolve('contractService');
+    this._scope = this._scope.bind(this);
     this.index = this.index.bind(this);
     this.show = this.show.bind(this);
+    this.pricings = this.pricings.bind(this);
     this.create = this.create.bind(this);
     this.novate = this.novate.bind(this);
+    this.previewNovation = this.previewNovation.bind(this);
     this.novateByGroupId = this.novateByGroupId.bind(this);
     this.novateUserContact = this.novateUserContact.bind(this);
     this.novateBillingPeriod = this.novateBillingPeriod.bind(this);
@@ -26,16 +144,55 @@ class ContractController {
     this.destroy = this.destroy.bind(this);
   }
 
+  /**
+   * The organization named by the `organizationId` query parameter, if any.
+   *
+   * It only selects an organization for a platform ADMIN on the direct routes.
+   * Any other caller already has one (its API key's, or the route's, whose
+   * membership `memberRole` checked): the parameter may repeat it and is
+   * refused otherwise, never used to reach another organization.
+   */
+  _requestedOrganization(req: any): string | undefined {
+    const requested = req.query?.organizationId;
+    if (requested === undefined) return undefined;
+    if (typeof requested !== 'string' || requested.length === 0) {
+      throw new Error('INVALID DATA: organizationId must be one organization id');
+    }
+    const fixed = req.org?.id ?? req.params.organizationId;
+    if (fixed && requested !== fixed) {
+      throw new Error('PERMISSION ERROR: organizationId does not match the organization of this request');
+    }
+    return requested;
+  }
+
+  /**
+   * Organization in which a request addresses contracts by `userId` (the
+   * route's `:userId`) or by `groupId`.
+   *
+   * Organization API keys are confined to their own organization, and the
+   * organization-scoped routes to the organization in the path. A platform
+   * ADMIN on the direct routes has none and must name it with
+   * `?organizationId=` (a `userId` or `groupId` is only unique within an
+   * organization): without it, `OrganizationRequiredError` (400). It runs
+   * before the request reads, locks or writes anything.
+   */
+  _scope(req: any, groupId?: string): string {
+    const requested = this._requestedOrganization(req);
+    const fixed = req.org?.id ?? req.params.organizationId;
+    if (fixed) return fixed;
+    if (requested) return requested;
+    throw groupId === undefined
+      ? new OrganizationRequiredError('userId', req.params.userId)
+      : new OrganizationRequiredError('groupId', groupId);
+  }
+
   async index(req: any, res: any) {
     try {
       const queryParams = this._transformIndexQueryParams(req.query);
       const filters = req.body?.filters;
       const merged = filters ? { ...queryParams, filters } : queryParams;
-      let organizationId = req.org?.id ?? req.params.organizationId;
-
-      if (!req.params.organizationId && req.user && req.user.role === 'ADMIN' && !req.org?.id) {
-        organizationId = undefined;
-      }
+      // A platform ADMIN on the direct route lists every organization, or the one named with ?organizationId=.
+      const organizationId = this._requestedOrganization(req) ?? req.org?.id ?? req.params.organizationId;
 
       const [contracts, total] = await Promise.all([
         this.contractService.index(merged, organizationId),
@@ -43,8 +200,10 @@ class ContractController {
       ]);
 
       res.set('X-Total-Count', total.toString());
-      res.json(contracts);
+      res.json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('validation of query params')) {
         res.status(400).send({ error: err.message });
       } else {
@@ -56,9 +215,34 @@ class ContractController {
   async show(req: any, res: any) {
     try {
       const userId = req.params.userId;
-      const contract = await this.contractService.show(userId);
-      res.json(contract);
+      const contract = await this.contractService.show(userId, this._scope(req));
+      sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
+      if (err.message.toLowerCase().includes('not found')) {
+        res.status(404).send({ error: err.message });
+      } else {
+        res.status(500).send({ error: err.message });
+      }
+    }
+  }
+
+  /** GET /contracts/{userId}/pricings */
+  async pricings(req: any, res: any) {
+    try {
+      const { contract, services } = await this.contractService.pricings(
+        req.params.userId,
+        this._scope(req),
+        req.params.organizationId
+      );
+      const contractVersion = computeContractVersion(contract);
+      delete req.headers['if-none-match'];
+      res.set('ETag', `"${contractVersion}"`);
+      res.json({ services, contractVersion });
+    } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -90,10 +274,15 @@ class ContractController {
         }
       }
 
-      const contract = await this.contractService.create(contractData);
-      res.status(201).json(contract);
+      const rejectPrivate = flagOf(req, 'rejectPrivate');
+      const contract = await this.contractService.create(contractData, { rejectPrivate });
+      sendContract(req, res, 201, contract);
     } catch (err: any) {
-      if (err.message.toLowerCase().includes('invalid')) {
+      if (err instanceof DormantServiceError) return res.status(409).json({ error: err.message, code: err.code, service: err.service });
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (err instanceof SubscriptionValidationError) {
+        sendInvalidSubscription(res, err);
+      } else if (err.message.toLowerCase().includes('invalid')) {
         res.status(400).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('permission error')) {
         res.status(403).send({ error: err.message });
@@ -108,11 +297,26 @@ class ContractController {
   async novate(req: any, res: any) {
     try {
       const userId = req.params.userId;
+      const expectedContractVersion = expectedVersionOf(req);
+      const options = novationOptionsOf(req);
       const newSubscription: Subscription = req.body;
-      const contract = await this.contractService.novate(userId, newSubscription);
-      res.status(200).json(contract);
+      const contract = await this.contractService.novate(userId, newSubscription, this._scope(req), {
+        ...options,
+        expectedContractVersion,
+      });
+      sendContract(req, res, 200, contract);
     } catch (err: any) {
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err instanceof DormantServiceError) return res.status(409).json({ error: err.message, code: err.code, service: err.service });
+      if (err instanceof IdempotencyStateChangedError) return res.status(409).json({ code: err.code, error: err.message, contractVersion: err.contractVersion, ...(err.novated ? { novated: err.novated } : {}) });
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
+      if (err instanceof SubscriptionValidationError) {
+        sendInvalidSubscription(res, err, true);
+      } else if (err instanceof ContractChangedError) {
+        sendContractChanged(res, err);
+      } else if (err.message.toLowerCase().includes('invalid precondition')) {
+        res.status(400).send({ error: err.message });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('invalid subscription:')) {
         res.status(400).send({ error: err.message });
@@ -122,19 +326,68 @@ class ContractController {
     }
   }
 
+  /** POST /contracts/{userId}/novation/preview: what PUT /contracts/{userId} would do, writing nothing. */
+  async previewNovation(req: any, res: any) {
+    try {
+      const options = novationOptionsOf(req);
+      // Preconditions are for writes; the preview reports the current version instead.
+      if (req.body && 'expectedContractVersion' in req.body) delete req.body.expectedContractVersion;
+      const preview = await this.contractService.previewNovation(req.params.userId, req.body, this._scope(req), options);
+      res.status(200).json(preview);
+    } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
+      if (err.message.toLowerCase().includes('not found')) {
+        res.status(404).send({ error: err.message });
+      } else if (/applying|busy/i.test(err.message)) {
+        res.status(409).send({ error: err.message });
+      } else {
+        res.status(500).send({ error: err.message });
+      }
+    }
+  }
+
   async novateByGroupId(req: any, res: any) {
     try {
       const groupId = req.query.groupId;
-      const organizationId = req.org?.id ?? req.params.organizationId;
       if (!groupId) {
         res.status(400).send({ error: 'Missing groupId query parameter' });
         return;
       }
+      if (req.get('If-Match') !== undefined) {
+        res.status(400).send({
+          error:
+            'Invalid precondition: If-Match cannot name the versions of several contracts; use expectedContractVersions',
+        });
+        return;
+      }
+      if (req.body && 'expectedContractVersion' in req.body) {
+        res.status(400).send({
+          error:
+            'Invalid precondition: expectedContractVersion names the version of one contract; use expectedContractVersions (userId -> contractVersion)',
+        });
+        return;
+      }
+      const expectedContractVersions = req.body?.expectedContractVersions;
+      if (req.body && 'expectedContractVersions' in req.body) delete req.body.expectedContractVersions;
+      const options = novationOptionsOf(req);
       const newSubscription: Subscription = req.body;
-      const contracts = await this.contractService.novateByGroupId(groupId, organizationId, newSubscription);
-      res.status(200).json(contracts);
+      const organizationId = this._scope(req, groupId);
+      const contracts = await this.contractService.novateByGroupId(groupId, organizationId, newSubscription, {
+        ...options,
+        expectedContractVersions,
+      });
+      res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
-      if (
+      if (err instanceof DormantServiceError) return res.status(409).json({ error: err.message, code: err.code, service: err.service });
+      if (err instanceof IdempotencyStateChangedError) return res.status(409).json({ code: err.code, error: err.message, contractVersion: err.contractVersion, ...(err.novated ? { novated: err.novated } : {}) });
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
+      if (err instanceof SubscriptionValidationError) {
+        sendInvalidSubscription(res, err, true);
+      } else if (err instanceof ContractChangedError) {
+        sendContractChanged(res, err);
+      } else if (
         err.message.toLowerCase().includes('not found') ||
         err.message.toLowerCase().includes('no contracts found')
       ) {
@@ -151,9 +404,15 @@ class ContractController {
     try {
       const userId = req.params.userId;
       const userContact = req.body;
-      const contract = await this.contractService.novateUserContact(userId, userContact);
-      res.status(200).json(contract);
+      const contract = await this.contractService.novateUserContact(
+        userId,
+        userContact,
+        this._scope(req)
+      );
+      sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {
@@ -167,9 +426,15 @@ class ContractController {
       const userId = req.params.userId;
       const billingPeriod = req.body;
 
-      const contract = await this.contractService.novateBillingPeriod(userId, billingPeriod);
-      res.status(200).json(contract);
+      const contract = await this.contractService.novateBillingPeriod(
+        userId,
+        billingPeriod,
+        this._scope(req)
+      );
+      sendContract(req, res, 200, contract);
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('invalid data:')) {
@@ -183,17 +448,19 @@ class ContractController {
   async novateBillingPeriodByGroupId(req: any, res: any) {
     try {
       const groupId = req.query.groupId;
-      const organizationId = req.org?.id ?? req.params.organizationId;
       const billingPeriod = req.body;
 
       if (!groupId) {
         res.status(400).send({ error: 'Missing groupId query parameter' });
         return;
       }
+      const organizationId = this._scope(req, groupId);
 
       const contracts = await this.contractService.novateBillingPeriodByGroupId(groupId, organizationId, billingPeriod);
-      res.status(200).json(contracts);
+      res.status(200).json(contracts.map(contract => withVersion(contract)));
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
       if (
         err.message.toLowerCase().includes('not found') ||
         err.message.toLowerCase().includes('no contracts found')
@@ -215,11 +482,17 @@ class ContractController {
       const novatedContract = await this.contractService.resetUsageLevels(
         userId,
         queryParams,
-        usageLevelsIncrements
+        usageLevelsIncrements,
+        this._scope(req)
       );
-      res.status(200).json(novatedContract);
+      sendContract(req, res, 200, novatedContract);
     } catch (err: any) {
-      if (err.message.toLowerCase().includes('not found')) {
+      if (err instanceof IdempotencyStateChangedError) return res.status(409).json({ code: err.code, error: err.message, contractVersion: err.contractVersion, ...(err.novated ? { novated: err.novated } : {}) });
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
+      if (err instanceof DormantServiceError) {
+        res.status(409).send({ error: err.message, code: err.code, service: err.service });
+      } else if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('invalid query:')) {
         res.status(400).send({ error: err.message });
@@ -231,11 +504,14 @@ class ContractController {
 
   async prune(req: any, res: any) {
     try {
-      const organizationId = req.org?.id ?? req.params.organizationId;
+      // A platform ADMIN on the direct route prunes every organization, or the one named with ?organizationId=.
+      const organizationId = this._requestedOrganization(req) ?? req.org?.id ?? req.params.organizationId;
 
       const result: number = await this.contractService.prune(organizationId, req.user);
       res.status(204).json({ message: `Deleted ${result} contracts successfully` });
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else if (err.message.toLowerCase().includes('permission error')) {
@@ -249,9 +525,11 @@ class ContractController {
   async destroy(req: any, res: any) {
     try {
       const userId = req.params.userId;
-      await this.contractService.destroy(userId);
+      await this.contractService.destroy(userId, this._scope(req));
       res.status(204).json({ message: `Deleted contract with userId ${userId} successfully` });
     } catch (err: any) {
+      if (err instanceof ServiceRelocationPendingError) return res.status(409).json({ code: err.code, error: err.message });
+      if (sendScopeError(res, err)) return;
       if (err.message.toLowerCase().includes('not found')) {
         res.status(404).send({ error: err.message });
       } else {

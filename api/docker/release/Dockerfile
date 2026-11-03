@@ -30,8 +30,10 @@ COPY --from=build /usr/src/server/node_modules ./node_modules
 COPY --from=build /usr/src/server/dist ./dist
 COPY package.json ./
 
-# Pricing files are stored under ./public/static. Mount a volume here to persist them.
-RUN mkdir -p public/static/pricings && chown -R node:node /usr/src/server/public
+# Static files are served from ./public. Pricing files are stored outside it, in
+# ./private (SPACE_PRIVATE_FILES_DIR), and only served to authorised callers.
+# Mount a volume on each to persist them.
+RUN mkdir -p public private && chown -R node:node /usr/src/server/public /usr/src/server/private
 USER node
 
 EXPOSE 3000

@@ -1,11 +1,13 @@
 export interface Service {
   name: string;
+  defaultVersion?: string;
   activePricings: Record<string, Pricing>;
   archivedPricings: Record<string, Pricing>;
 }
 
 export interface RetrievedService {
   name: string;
+  defaultVersion?: string;
   activePricings: Record<string, PricingEntry>;
   archivedPricings: Record<string, PricingEntry>;
 }
@@ -19,6 +21,8 @@ export interface Pricing {
   id?: string;
   url?: string;
   yamlPath?: string;
+  /** Present on snapshots imported from SPHERE: the SPHERE pricing and version it copies. */
+  sphere?: SpherePricingSource;
   version: string;
   currency: string;
   createdAt: Date; // o Date si no haces `JSON.stringify`
@@ -26,6 +30,13 @@ export interface Pricing {
   usageLimits?: Record<string, UsageLimit>;
   plans?: Record<string, Plan>;
   addOns?: Record<string, AddOn>;
+}
+
+export interface SpherePricingSource {
+  pricingId: string;
+  versionId: string;
+  permanentUrl?: string;
+  version?: string;
 }
 
 export interface PricingFeature {
@@ -111,6 +122,7 @@ export interface SubscriptionConstraint {
 }
 
 export type ServiceQueryFilters = {
+  disabled?: boolean;
   name?: string;
   page?: number;
   offset?: number;

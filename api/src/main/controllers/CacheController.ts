@@ -13,6 +13,7 @@ class CacheController {
   async get(req: any, res: any) {
     try {
       const { key } = req.query;
+      if (typeof key === 'string' && key.trim().toLowerCase().startsWith('sso:')) return res.status(403).json({ error: 'Reserved server cache key' });
       const data = await this.cacheService.get(key);
       res.json(data);
     } catch (err: any) {
@@ -23,6 +24,7 @@ class CacheController {
   async set(req: any, res: any) {
     try {
       const { key, value, expirationInSeconds } = req.body;
+      if (typeof key === 'string' && key.trim().toLowerCase().startsWith('sso:')) return res.status(403).json({ error: 'Reserved server cache key' });
       if (!expirationInSeconds){
         await this.cacheService.set(key, value);
       }else{
