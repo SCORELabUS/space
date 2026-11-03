@@ -40,4 +40,14 @@ function resetEscapePricingVersion(pricing: LeanPricing){
   pricing.version = resetEscapeVersion(pricing.version);
 }
 
-export { resetEscapeVersionInService, resetEscapePricingVersion };
+/**
+ * Path of the Pricing2Yaml file of a version (`format=yaml`), on the same kind
+ * of route as the request: organization-scoped when the request was (user API
+ * keys), direct otherwise (organization API keys).
+ */
+function pricingYamlUrl(organizationId: string | undefined, serviceName: string, version: string): string {
+  const scope = organizationId ? `/organizations/${organizationId}` : '';
+  return `/api/v1${scope}/services/${encodeURIComponent(serviceName)}/pricings/${encodeURIComponent(version)}?format=yaml`;
+}
+
+export { resetEscapeVersionInService, resetEscapePricingVersion, pricingYamlUrl };

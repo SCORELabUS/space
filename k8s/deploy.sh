@@ -1,11 +1,40 @@
-cd ..
+#!/bin/sh
+set -eu
+
+deploy_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+pricing_key_file=''
+cleanup() {
+  if [ -n "$pricing_key_file" ]; then
+    rm -f -- "$pricing_key_file"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+cd "$deploy_dir/.."
 echo "Building docker images..."
 docker compose build
-cd k8s
+cd "$deploy_dir"
 echo "Creating namespace..."
 kubectl apply -f space-namespace.yml
 echo "Deploying ingress controller..."
 kubectl apply -f controllers/
+echo "Creating the pricing token signing key (only if it does not exist yet)..."
+if ! pricing_key_secret=$(kubectl -n space get secret space-pricing-token-key --ignore-not-found -o name); then
+  echo "Cannot check the pricing token signing secret; deployment stopped." >&2
+  exit 1
+fi
+if [ -z "$pricing_key_secret" ]; then
+  umask 077
+  pricing_key_file=$(mktemp "${TMPDIR:-/tmp}/space-pricing-token-key.XXXXXX")
+  # Complete and validate generation before creating a persistent secret.
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$pricing_key_file"
+  openssl pkey -in "$pricing_key_file" -check -noout >/dev/null
+  kubectl -n space create secret generic space-pricing-token-key --from-file="private.pem=$pricing_key_file"
+  rm -f -- "$pricing_key_file"
+  pricing_key_file=''
+fi
 echo "Deploying config maps..."
 kubectl apply -f config/
 echo "Deploying services..."

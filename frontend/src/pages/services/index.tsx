@@ -46,15 +46,15 @@ export default function ServicesPage() {
 
   useEffect(() => {
     if (!currentOrganization) return;
-    
+    let cancelled = false;
     setLoading(true);
-    getServices(user.apiKey, currentOrganization.id, { page: 1, limit: 1000, order: 'asc' }).then((data: Service[]) => {
-      setTotal(data.length);
-    });
+    getServices(user.apiKey, currentOrganization.id, { ...filters, page: 1, limit: 1000, order: 'asc' }).then((data: Service[]) => {
+      if (!cancelled) setTotal(data.length);
+    }).catch(() => { if (!cancelled) setTotal(0); });
     getServices(user.apiKey, currentOrganization.id, filters).then((data: Service[]) => {
-      setServices(data);
-      setLoading(false);
-    });
+      if (!cancelled) { setServices(data); setLoading(false); }
+    }).catch(() => { if (!cancelled) { setServices([]); setLoading(false); } });
+    return () => { cancelled = true; };
   }, [filters, user.apiKey, currentOrganization]);
 
   const totalPages = Math.max(1, Math.ceil(total / (filters.limit ?? 10)));

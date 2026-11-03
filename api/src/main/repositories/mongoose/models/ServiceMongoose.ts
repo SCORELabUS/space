@@ -1,3 +1,4 @@
+import { publicSphereSource } from '../../../services/sphere/types';
 import { assertOrganizationLease } from '../../../services/sphere/lock';
 import mongoose, { Schema } from 'mongoose';
 
@@ -18,6 +19,8 @@ const serviceSchema = new Schema(
     source: { type: String, enum: ['manual', 'sphere'], default: 'manual' },
     sphere: { type: Schema.Types.Mixed },
     disabled: { type: Boolean, default: false },
+    // Manual services: version for new contracts that omit one (must be active).
+    defaultVersion: { type: String },
     activePricings: {type: Map, of: pricingDataSchema},
     archivedPricings: {type: Map, of: pricingDataSchema}
   },
@@ -27,6 +30,8 @@ const serviceSchema = new Schema(
       transform: function (doc, resultObject, options) {
         delete resultObject._id;
         delete resultObject.__v;
+        // The SPHERE API key never leaves the database: responses show hasApiKey.
+        if (resultObject.sphere) resultObject.sphere = publicSphereSource(resultObject.sphere);
         return resultObject;
       },
     },

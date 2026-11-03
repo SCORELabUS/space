@@ -30,6 +30,8 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
   { path: '/auth/sphere/connection', methods: ['GET'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
 
   // SPHERE synchronization (before general service routes).
+  { path: '/organizations/*/services/*/synchronization/resume', methods: ['POST'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
+  { path: '/services/*/synchronization/resume', methods: ['POST'], allowedUserRoles: [], allowedOrgRoles: ['ALL', 'MANAGEMENT'] },
   { path: '/organizations/*/services/sphere/preview', methods: ['POST'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
   { path: '/services/sphere/preview', methods: ['POST'], allowedUserRoles: [], allowedOrgRoles: ['ALL', 'MANAGEMENT'] },
   { path: '/organizations/*/services/*/synchronization', methods: ['GET', 'PUT'], allowedUserRoles: ['ADMIN', 'USER'], requiresUser: true },
@@ -103,6 +105,12 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
     allowedUserRoles: ['ADMIN', 'USER'],
     allowedOrgRoles: [],
   },
+  {
+    path: '/organizations/*/contracts/*/novation/preview',
+    methods: ['POST'],
+    allowedUserRoles: ['ADMIN', 'USER'],
+    allowedOrgRoles: [],
+  },
 
   // ============================================
   // Organization Management Routes (User API Keys ONLY)
@@ -173,6 +181,12 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
     allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
   },
   {
+    path: '/services/*/pricings/*/public-url',
+    methods: ['GET'],
+    allowedUserRoles: [],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
+  },
+  {
     path: '/services/*/pricings/*',
     methods: ['PUT', 'PATCH'],
     allowedUserRoles: [],
@@ -201,6 +215,13 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
     allowedOrgRoles: ['ALL'],
   },
   {
+    // Dry run of PUT /contracts/{userId}: same permissions as the novation.
+    path: '/contracts/*/novation/preview',
+    methods: ['POST'],
+    allowedUserRoles: ['ADMIN'],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT'],
+  },
+  {
     path: '/contracts/**',
     methods: ['GET', 'PUT', 'PATCH'],
     allowedUserRoles: ['ADMIN'],
@@ -214,14 +235,13 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
   },
 
   // ============================================
-  // Feature Evaluation Routes
+  // Feature Evaluation Routes (Organization API Keys only)
+  // Evaluating is what EVALUATION keys are for, so every scope may list the
+  // features, evaluate all of a user's features, evaluate one feature (with
+  // the expected consumption that evaluation records, and `?revert=true` to
+  // undo it) and get a pricing token. Changing usage levels directly is
+  // `PUT /contracts/{userId}/usageLevels`, which stays ALL/MANAGEMENT.
   // ============================================
-  {
-    path: '/features/evaluate',
-    methods: ['POST'],
-    allowedUserRoles: [],
-    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
-  },
   {
     path: '/features',
     methods: ['GET'],
@@ -229,6 +249,25 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
     allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
   },
   {
+    path: '/features/*',
+    methods: ['POST'],
+    allowedUserRoles: [],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
+  },
+  {
+    path: '/features/*/pricing-token',
+    methods: ['POST'],
+    allowedUserRoles: [],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
+  },
+  {
+    path: '/features/*/*',
+    methods: ['POST'],
+    allowedUserRoles: [],
+    allowedOrgRoles: ['ALL', 'MANAGEMENT', 'EVALUATION'],
+  },
+  {
+    // Anything else under /features (other methods, deeper paths).
     path: '/features/**',
     methods: ['POST', 'PUT', 'PATCH', 'DELETE'],
     allowedUserRoles: [],
@@ -259,8 +298,24 @@ export const ROUTE_PERMISSIONS: RoutePermission[] = [
   // Event Routes (Public)
   // ============================================
   {
+    // Emits a pricing event to every connected client.
+    path: '/events/test-event',
+    methods: ['POST'],
+    allowedUserRoles: ['ADMIN'],
+    allowedOrgRoles: ['ALL'],
+  },
+  {
     path: '/events/**',
-    methods: ['GET', 'POST'],
+    methods: ['GET'],
+    isPublic: true,
+  },
+
+  // ============================================
+  // Pricing token public keys (Public, also at the root: /.well-known/jwks.json)
+  // ============================================
+  {
+    path: '/.well-known/jwks.json',
+    methods: ['GET'],
     isPublic: true,
   },
 

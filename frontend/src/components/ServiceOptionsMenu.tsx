@@ -26,15 +26,18 @@ export default function ServiceOptionsMenu({
   }
 
   return (
-    <div className="relative" tabIndex={0} onBlur={handleBlur} onKeyDown={event => {
-      if (event.key === 'Escape') {
+    <div className="relative" onBlur={handleBlur} onKeyDown={event => {
+      if (event.key === 'Escape' && open) {
+        event.preventDefault();
+        event.stopPropagation();
         setOpen(false);
         btnRef.current?.focus();
       }
     }}>
       <button
+        type="button"
         ref={btnRef}
-        className="dark:text-white cursor-pointer p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-600 transition"
+        className="dark:text-white cursor-pointer min-h-11 min-w-11 p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-600 transition"
         aria-label="Service options"
         aria-expanded={open}
         onClick={() => setOpen(v => !v)}
@@ -51,7 +54,8 @@ export default function ServiceOptionsMenu({
             className="absolute right-0 mt-2 w-48 bg-white dark:bg-gray-900 rounded-xl shadow-lg border border-gray-100 dark:border-gray-700 z-50 overflow-hidden"
           >
             {onAddVersion && <button
-              className="cursor-pointer w-full flex items-center gap-2 px-4 py-3 text-sm text-indigo-700 dark:text-indigo-300 hover:bg-gray-200 dark:hover:bg-gray-800 transition font-medium"
+              type="button"
+              className="cursor-pointer min-h-11 w-full flex items-center gap-2 px-4 py-3 text-sm text-indigo-700 dark:text-indigo-300 hover:bg-gray-200 dark:hover:bg-gray-800 transition font-medium"
               onClick={() => {
                 setOpen(false);
                 onAddVersion();
@@ -61,7 +65,8 @@ export default function ServiceOptionsMenu({
             </button>}
             {canDisableService && (
               <button
-                className="cursor-pointer w-full flex items-center gap-2 px-4 py-3 text-sm text-red-700 dark:text-red-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition font-medium border-t border-gray-100 dark:border-gray-700"
+                type="button"
+                className={`cursor-pointer min-h-11 w-full flex items-center gap-2 px-4 py-3 text-sm text-red-700 dark:text-red-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition font-medium ${onAddVersion ? 'border-t border-gray-100 dark:border-gray-700' : ''}`}
                 onClick={() => {
                   setOpen(false);
                   onDisableService();

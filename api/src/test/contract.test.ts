@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Server } from 'http';
 import request from 'supertest';
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
@@ -8,7 +9,7 @@ import {
   deleteTestOrganization,
   addApiKeyToOrganization,
 } from './utils/organization/organizationTestUtils';
-import { createTestService, deleteTestService, getPricingFromService } from './utils/services/serviceTestUtils';
+import { deleteTestService, getPricingFromService } from './utils/services/serviceTestUtils';
 import { generateOrganizationApiKey } from '../main/utils/users/helpers';
 import { LeanUser } from '../main/types/models/User';
 import { LeanOrganization } from '../main/types/models/Organization';
@@ -17,6 +18,20 @@ import { LeanContract } from '../main/types/models/Contract';
 import { generateContract } from './utils/contracts/generators';
 import { createTestContract } from './utils/contracts/contractTestUtils';
 import ContractMongoose from '../main/repositories/mongoose/models/ContractMongoose';
+import { PETCLINIC_BASE_VERSION, uploadPetclinicService, writePetclinicVariant } from './utils/services/petclinicVersions';
+import container from '../main/config/container';
+
+// These routes test contracts, permissions, billing and cache invalidation.
+// Keep their pricing valid and fixed: randomized add-ons can produce an invalid
+// fixture before an assertion runs (for example quantity 1 with minQuantity 7).
+async function createTestService(organizationId?: string, serviceName = `contract-fixture-${randomUUID()}`): Promise<LeanService> {
+  if (!organizationId) throw new Error('Contract route fixtures require an organization');
+  const file = writePetclinicVariant(PETCLINIC_BASE_VERSION, '2025-03-26', pricing => {
+    pricing.saasName = serviceName;
+    pricing.addOns = {};
+  });
+  return await container.resolve('serviceService').create({ path: file }, 'file', organizationId) as unknown as LeanService;
+}
 
 describe('Contract API routes', function () {
   let app: Server;
@@ -32,6 +47,21 @@ describe('Contract API routes', function () {
     if (contract?.userContact?.userId) {
       contractsToCleanup.add(contract.userContact.userId);
     }
+  };
+
+  // Cache and organization-boundary assertions need a valid fixed subscription,
+  // rather than random feature/usage-limit and add-on combinations.
+  const createFixedContract = async (key: string, serviceName: string, groupId: string): Promise<LeanContract> => {
+    const name = serviceName.toLowerCase();
+    const response = await request(app).post(`${baseUrl}/contracts`).set('x-api-key', key).send({
+      userContact: { userId: randomUUID(), username: 'fixed-contract-fixture' },
+      groupId,
+      contractedServices: { [name]: PETCLINIC_BASE_VERSION },
+      subscriptionPlans: { [name]: 'BASIC' },
+      subscriptionAddOns: {},
+      billingPeriod: { autoRenew: false, renewalDays: 30 },
+    }).expect(201);
+    return response.body;
   };
 
   beforeAll(async function () {
@@ -944,7 +974,8 @@ describe('Contract API routes', function () {
 
     it('clears cached single-feature evaluations when novating contracts by groupId', async function () {
       const sharedGroupId = `bulk-cache-features-${Date.now()}`;
-      const targetContract = await createTestContract(testOrganization.id!, [testService], app, sharedGroupId);
+      const fixedService = await uploadPetclinicService(app, testOrgApiKey);
+      const targetContract = await createFixedContract(testOrgApiKey, fixedService.name, sharedGroupId);
       trackContractForCleanup(targetContract);
 
       const allFeaturesBeforeResponse = await request(app)
@@ -998,6 +1029,7 @@ describe('Contract API routes', function () {
       expect(singleFeatureAfterResponse.body.error.code).toBe('FLAG_NOT_FOUND');
 
       await deleteTestService(novationService.name, testOrganization.id!);
+      await deleteTestService(fixedService.name, testOrganization.id!);
     });
 
     it('clears cached pricing token when novating contracts by groupId', async function () {
@@ -1102,7 +1134,7 @@ describe('Contract API routes', function () {
       expect(response.status).toBe(422);
     });
 
-    it('returns 200 when ADMIN user novates contracts by groupId globally', async function () {
+    it('returns 200 when ADMIN user novates contracts by groupId naming the organization', async function () {
       const adminGroupId = `admin-global-${Date.now()}`;
       const adminContract = await createTestContract(testOrganization.id!, [testService], app, adminGroupId);
       trackContractForCleanup(adminContract);
@@ -1117,7 +1149,7 @@ describe('Contract API routes', function () {
       );
 
       const response = await request(app)
-        .put(`${baseUrl}/contracts?groupId=${adminGroupId}`)
+        .put(`${baseUrl}/contracts?groupId=${adminGroupId}&organizationId=${testOrganization.id}`)
         .set('x-api-key', adminUser.apiKey)
         .send({
           contractedServices: { [adminService.name.toLowerCase()]: pricingVersion },
@@ -1152,29 +1184,20 @@ describe('Contract API routes', function () {
       const sharedGroupId = `billing-group-${Date.now()}`;
       const unaffectedGroupId = `billing-unaffected-${Date.now()}`;
 
-      const targetContract = await createTestContract(testOrganization.id!, [testService], app, sharedGroupId);
+      const fixedService = await uploadPetclinicService(app, testOrgApiKey);
+      const targetContract = await createFixedContract(testOrgApiKey, fixedService.name, sharedGroupId);
       trackContractForCleanup(targetContract);
 
-      const unaffectedContract = await createTestContract(
-        testOrganization.id!,
-        [testService],
-        app,
-        unaffectedGroupId
-      );
+      const unaffectedContract = await createFixedContract(testOrgApiKey, fixedService.name, unaffectedGroupId);
       trackContractForCleanup(unaffectedContract);
 
       const foreignOrgOwner = await createTestUser('USER');
       const foreignOrganization = await createTestOrganization(foreignOrgOwner.username);
-      const foreignService = await createTestService(foreignOrganization.id);
       const foreignOrgApiKey = generateOrganizationApiKey();
       await addApiKeyToOrganization(foreignOrganization.id!, { key: foreignOrgApiKey, scope: 'ALL' });
 
-      const foreignContract = await createTestContract(
-        foreignOrganization.id!,
-        [foreignService],
-        app,
-        sharedGroupId
-      );
+      const foreignService = await uploadPetclinicService(app, foreignOrgApiKey);
+      const foreignContract = await createFixedContract(foreignOrgApiKey, foreignService.name, sharedGroupId);
       trackContractForCleanup(foreignContract);
 
       const billingData = {
@@ -1223,6 +1246,7 @@ describe('Contract API routes', function () {
         foreignContractBefore.body.billingPeriod.renewalDays
       );
 
+      await deleteTestService(fixedService.name, testOrganization.id!);
       await deleteTestService(foreignService.name, foreignOrganization.id!);
       await deleteTestOrganization(foreignOrganization.id!);
       await deleteTestUser(foreignOrgOwner.username);
@@ -1266,7 +1290,7 @@ describe('Contract API routes', function () {
       expect(response.status).toBe(422);
     });
 
-    it('returns 200 when ADMIN user updates billing period by groupId globally', async function () {
+    it('returns 200 when ADMIN user updates billing period by groupId naming the organization', async function () {
       const adminBillingGroupId = `admin-billing-${Date.now()}`;
       const adminBillingContract = await createTestContract(
         testOrganization.id!,
@@ -1282,7 +1306,7 @@ describe('Contract API routes', function () {
       };
 
       const response = await request(app)
-        .put(`${baseUrl}/contracts/billingPeriod?groupId=${adminBillingGroupId}`)
+        .put(`${baseUrl}/contracts/billingPeriod?groupId=${adminBillingGroupId}&organizationId=${testOrganization.id}`)
         .set('x-api-key', adminUser.apiKey)
         .send(billingData);
 
@@ -1304,7 +1328,7 @@ describe('Contract API routes', function () {
       expect(response.body.error).toContain('API Key');
     });
 
-    it('returns 200 when ADMIN user updates billing period by groupId globally', async function () {
+    it('returns 200 when ADMIN user updates billing period by groupId naming the organization', async function () {
       const adminBillingGroupId = `admin-billing-${Date.now()}`;
       const adminBillingContract = await createTestContract(
         testOrganization.id!,
@@ -1320,7 +1344,7 @@ describe('Contract API routes', function () {
       };
 
       const response = await request(app)
-        .put(`${baseUrl}/contracts/billingPeriod?groupId=${adminBillingGroupId}`)
+        .put(`${baseUrl}/contracts/billingPeriod?groupId=${adminBillingGroupId}&organizationId=${testOrganization.id}`)
         .set('x-api-key', adminUser.apiKey)
         .send(billingData);
 

@@ -270,7 +270,10 @@ end note
 
 note right of Contract
     Tracks resource consumption
-    per service and usage limit
+    per service and usage limit.
+    Identified by organization and
+    userContact.userId: a userId is
+    unique within an organization
 end note
 
 note right of Pricing
