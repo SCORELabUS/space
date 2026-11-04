@@ -1,3 +1,12 @@
+# Optional standard Docker proxy build arguments. No proxy is configured by default.
+x-proxy-build-args: &proxy-build-args
+  HTTP_PROXY: ${HTTP_PROXY:-${http_proxy:-}}
+  HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}
+  NO_PROXY: ${NO_PROXY:-${no_proxy:-}}
+  http_proxy: ${http_proxy:-${HTTP_PROXY:-}}
+  https_proxy: ${https_proxy:-${HTTPS_PROXY:-}}
+  no_proxy: ${no_proxy:-${NO_PROXY:-}}
+
 services:
   mongodb:
       image: mongo:7.0.16
@@ -39,6 +48,7 @@ services:
     build:
         context: ../../api/
         dockerfile: ./docker/production/Dockerfile
+        args: *proxy-build-args
     env_file:
       - ./.env
     environment:
@@ -79,6 +89,7 @@ services:
       context: ../../frontend/
       dockerfile: ./docker/production/Dockerfile
       args:
+        <<: *proxy-build-args
         VITE_ENVIRONMENT: ${ENVIRONMENT:-production}
         VITE_BASE_PATH: ${BASE_PATH:-}
         VITE_SPACE_BASE_URL: ${SPACE_HOST:-http://localhost:5403}${BASE_PATH:-}/api/v1
@@ -107,6 +118,7 @@ services:
     build:
         context: ../../nginx/production/
         dockerfile: ./Dockerfile
+        args: *proxy-build-args
     ports:
       - 80:80
       - 443:443
