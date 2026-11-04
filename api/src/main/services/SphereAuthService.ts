@@ -1,10 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
 import container from '../config/container';
 import CacheService from './CacheService';
 import UserRepository from '../repositories/mongoose/UserRepository';
 import UserService from './UserService';
 import type { LeanUser } from '../types/models/User';
+import { fetchWithOptionalProxy } from '../utils/proxy';
 
 const secret = () => randomBytes(32).toString('hex');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -46,7 +47,7 @@ export default class SphereAuthService {
   }
   private async metadata() {
     const config = this.config();
-    const response = await fetch(config.issuer + '/.well-known/openid-configuration', { signal: AbortSignal.timeout(5000), redirect: 'error' });
+    const response = await fetchWithOptionalProxy(config.issuer + '/.well-known/openid-configuration', { signal: AbortSignal.timeout(5000), redirect: 'error' });
     if (!response.ok) throw new SphereAuthError(503, 'SPHERE is unavailable. Try again later.');
     const metadata = await response.json() as Record<string, unknown>;
     if (metadata.issuer !== config.issuer) throw new Error('SPHERE issuer mismatch');
@@ -87,7 +88,7 @@ export default class SphereAuthService {
       if (typeof query.code !== 'string' || query.code.length > 512) throw new SphereAuthError(400, 'Missing authorization code');
       const config = this.config();
       const metadata = await this.metadata();
-      const response = await fetch(metadata.token_endpoint, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(5000),
+      const response = await fetchWithOptionalProxy(metadata.token_endpoint, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(5000),
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code',
           client_id: config.clientId, client_secret: config.clientSecret, redirect_uri: config.redirectUri,
           code: query.code, code_verifier: pending.verifier }) });
@@ -95,7 +96,7 @@ export default class SphereAuthService {
       const tokens = await response.json() as { id_token?: string };
       if (typeof tokens.id_token !== 'string') throw new Error('Missing identity token');
       if (!this.jwks || this.jwksUrl !== metadata.jwks_uri) {
-        this.jwks = createRemoteJWKSet(new URL(metadata.jwks_uri), { timeoutDuration: 5000 });
+        this.jwks = createRemoteJWKSet(new URL(metadata.jwks_uri), { timeoutDuration: 5000, [customFetch]: fetchWithOptionalProxy });
         this.jwksUrl = metadata.jwks_uri;
       }
       const { payload } = await jwtVerify(tokens.id_token, this.jwks, { issuer: config.issuer, audience: config.clientId,
