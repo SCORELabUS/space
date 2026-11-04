@@ -12,6 +12,8 @@ let nonce: string;
 let tokenOptions: { nonce?: string; issuer?: string; audience?: string; expired?: boolean; subject?: string };
 let keys: Awaited<ReturnType<typeof generateKeyPair>>;
 beforeEach(async () => {
+  for (const name of ['http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY', 'no_proxy', 'NO_PROXY',
+    'npm_config_proxy', 'npm_config_http_proxy', 'npm_config_https_proxy', 'npm_config_no_proxy']) vi.stubEnv(name, '');
   entries = new Map(); tokenOptions = {};
   cache = { get: vi.fn(async (key: string) => entries.get(key) ?? null),
     set: vi.fn(async (key: string, value: unknown) => { entries.set(key, value); }),

@@ -42,6 +42,23 @@ Serve SPACE's API under its frontend origin, or a same-site API host with creden
 
 The SPACE startup migration `20261103000000-sphere-identity.ts` adds the unique partial index idempotently; legacy users are outside the index. Seeders also build this index through the user schema. No credentials or identity grants need seeding in SPHERE. Disabling the OIDC settings rolls back the integration without changing local usernames/passwords. Accounts created without a local password still need SPHERE (or a local password added through the existing authorized account-management flow).
 
+## Optional outbound proxy
+
+Without proxy environment variables, OIDC connections go directly to SPHERE. Set
+`HTTPS_PROXY` / `HTTP_PROXY` (or `https_proxy` / `http_proxy`) in `docker/production/.env`
+only when the deployment requires a proxy. `NO_PROXY` / `no_proxy` bypasses it for
+selected hosts. Standard lowercase variables take precedence over uppercase ones.
+Discovery, token exchange and JWKS retrieval use the same selection rules; a failed
+proxy request never retries directly. Timeouts, redirect restrictions and TLS
+certificate verification remain enabled.
+
+The production Dockerfiles no longer bake in an infrastructure-specific proxy.
+Production Compose forwards optional proxy values as standard Docker build arguments,
+and the backend receives configured runtime variables through its existing `env_file`.
+The GHCR release images likewise have no built-in proxy. Builds and runtime networking
+are configured separately; `NO_PROXY` should include internal Docker destinations such
+as `localhost,127.0.0.1,mongodb,redis` when a deployment uses an outbound proxy.
+
 ## Local laboratory
 
 Run these commands from the SPHERE repository. Requires Node, pnpm dependencies installed in both repositories, Docker Desktop and sibling checkout `../space-api` (override `SPACE_REPOSITORY` if needed).

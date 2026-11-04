@@ -1,6 +1,6 @@
 {
   "name": "space-api",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "SPACE API is an open-source project designed to provide a robust and scalable API for various applications.",
   "main": "src/main/index.ts",
   "type": "module",
