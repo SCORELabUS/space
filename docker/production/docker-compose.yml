@@ -76,7 +76,7 @@ services:
     networks:
       - space-network
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"const http=require('http'); const path=(process.env.BASE_URL_PATH ?? '') + '/api/v1'; http.get('http://localhost:3000'+path+'/healthcheck', r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1));\""]
+      test: ["CMD", "node", "-e", "const http=require('http'); const path=(process.env.BASE_URL_PATH ?? '') + '/api/v1'; http.get('http://localhost:3000'+path+'/healthcheck', r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1));"]
       interval: 5s
       timeout: 5s
       retries: 3
