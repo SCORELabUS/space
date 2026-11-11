@@ -45,7 +45,7 @@ export default function ContractsDashboard() {
   }, [currentOrganization?.id]);
 
   useEffect(() => {
-    if (!apiKey || !currentOrganization) return;
+    if (!currentOrganization) return;
     getServices(apiKey, currentOrganization.id).then(list => {
       const names = (list || []).map((s: any) => s.name).filter(Boolean);
       setAvailableServices(names);
@@ -63,7 +63,7 @@ export default function ContractsDashboard() {
 
   useEffect(() => {
     // when selectedService changes, fetch its pricing versions
-    if (!apiKey || !currentOrganization || !selectedService) {
+    if (!currentOrganization || !selectedService) {
       setAvailableVersions([]);
       setSelectedVersion(undefined);
       return;

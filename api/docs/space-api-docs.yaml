@@ -57,7 +57,10 @@ info:
 
     ## Permission Summary by Endpoint Category
 
-    All endpoints require an `x-api-key` header unless explicitly marked as **Public**.
+    API clients send an `x-api-key` header unless a route is public. In managed
+    SCORETech mode, the SPACE browser can also use its session cookie for
+    user-authorized routes. Legacy accounts can use a dedicated password route
+    for browser sessions. Anonymous local registration is disabled in this mode.
 
     - **Public**: No authentication required
     - **User Key (ADMIN)**: Requires User API Key with ADMIN role
@@ -462,6 +465,138 @@ tags:
     description: Service health verification (Public)
 
 paths:
+  /auth/config:
+    get:
+      summary: Read SPACE's browser sign-in mode
+      security: []
+      responses:
+        '200':
+          description: Public configuration
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [provider]
+                properties:
+                  provider:
+                    type: string
+                    enum: [local, scoretech]
+                  legacyPasswordLogin:
+                    type: boolean
+                    description: Password access to unlinked SPACE accounts in managed mode.
+                  accountUrl:
+                    type: string
+                    format: uri
+  /auth/identity/start:
+    post:
+      summary: Start SCORETech Identity sign-in
+      description: Requires the configured SPACE frontend Origin.
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password:
+                  type: string
+                  format: password
+                  description: Current SPACE password when linking from a legacy browser session. Omit for ordinary sign-in.
+      responses:
+        '200':
+          description: Sets the temporary flow cookie and returns the provider authorization URL.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authorizationUrl]
+                properties:
+                  authorizationUrl:
+                    type: string
+                    format: uri
+        '401':
+          description: Linking requires a valid legacy browser session and its current password.
+        '403':
+          description: Untrusted origin
+        '404':
+          description: SCORETech sign-in is disabled
+        '429':
+          description: Too many requests
+        '503':
+          description: Identity temporarily unavailable
+  /auth/identity/legacy:
+    post:
+      summary: Sign in to an unlinked SPACE account with its existing password
+      description: Managed mode only. Requires the configured SPACE frontend Origin.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: Sets a SPACE browser session cookie and returns the username and role.
+        '401':
+          description: Invalid credentials or the account already uses SCORETech Identity.
+        '403':
+          description: Untrusted origin
+        '404':
+          description: Legacy password login is disabled
+        '429':
+          description: Too many requests
+        '503':
+          description: Sign-in is temporarily unavailable
+  /auth/identity/connection:
+    get:
+      summary: Read the SCORETech connection status of the current SPACE browser session
+      security: []
+      responses:
+        '200':
+          description: Returns the linked and canLink flags.
+        '401':
+          description: No active browser session
+        '404':
+          description: SCORETech sign-in is disabled
+  /auth/identity/callback:
+    get:
+      summary: Exchange the SCORETech authorization code and open a SPACE browser session
+      security: []
+      parameters:
+        - in: query
+          name: code
+          schema:
+            type: string
+        - in: query
+          name: state
+          schema:
+            type: string
+      responses:
+        '303':
+          description: Redirect to SPACE. Sets a session cookie for a linked account on success.
+        '404':
+          description: SCORETech sign-in is disabled
+        '429':
+          description: Too many requests
+  /auth/identity/logout:
+    post:
+      summary: End the current SPACE browser session in managed mode
+      description: Requires the configured SPACE frontend Origin. Uses the browser session cookie when present.
+      security: []
+      responses:
+        '204':
+          description: Session ended and cookie cleared
+        '403':
+          description: Untrusted origin
+        '404':
+          description: SCORETech sign-in is disabled
+        '503':
+          description: Session store temporarily unavailable
   /auth/sphere/status:
     get:
       summary: Whether SPHERE sign-in is configured
@@ -999,7 +1134,7 @@ paths:
       summary: Authenticate user and obtain API Key
       description: |
         Authenticates a user with username and password and returns a User API Key 
-        that can be used for subsequent authenticated requests.
+        that can be used for subsequent authenticated requests. Available in local mode.
 
         **Authentication**: Public (no API key required)
         
@@ -1044,6 +1179,8 @@ paths:
                 $ref: '#/components/schemas/Error'
               example:
                 error: Invalid credentials
+        '403':
+          description: Password sign-in through this endpoint is disabled in SCORETech mode.
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
 

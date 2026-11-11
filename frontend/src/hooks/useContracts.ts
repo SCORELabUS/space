@@ -14,7 +14,7 @@ export default function useContracts(apiKey: string, organizationId?: string) {
   // (pricing cache removed) we fetch active pricings via getServices when computing revenue
 
   useEffect(() => {
-    if (!apiKey || !organizationId) return;
+    if (!organizationId) return;
     setLoading(true);
     // Build request body with service filter if present (API supports requestBody)
     const body = serviceFilter ? { services: [serviceFilter] } : undefined;
@@ -74,8 +74,8 @@ export default function useContracts(apiKey: string, organizationId?: string) {
     let servicesList: any[] = [];
     try {
       // getServices returns an array of Service objects with activePricings map
-      // Note: if apiKey or organizationId missing, skip
-      if (apiKey && organizationId) servicesList = await (await import('@/api/services/servicesApi')).getServices(apiKey, organizationId);
+      // Note: if organizationId is missing, skip
+      if (organizationId) servicesList = await (await import('@/api/services/servicesApi')).getServices(apiKey, organizationId);
     } catch (e) {
       console.warn('Failed to retrieve services/pricings for revenue calc', e);
       servicesList = [];

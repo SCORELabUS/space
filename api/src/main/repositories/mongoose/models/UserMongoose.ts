@@ -3,6 +3,18 @@ import mongoose, { Document, Schema } from 'mongoose';
 import { generateUserApiKey, hashPassword } from '../../../utils/users/helpers';
 import { UserRole, USER_ROLES } from '../../../types/permissions';
 
+const identitySchema = new Schema({
+  issuer: { type: String, required: true },
+  subject: { type: String, required: true },
+}, { _id: false });
+
+export const scoretechIdentityIndex = { 'scoretechIdentity.issuer': 1, 'scoretechIdentity.subject': 1 } as const;
+export const scoretechIdentityIndexOptions = {
+  name: 'unique_scoretech_identity',
+  unique: true,
+  partialFilterExpression: { 'scoretechIdentity.issuer': { $type: 'string' }, 'scoretechIdentity.subject': { $type: 'string' } },
+};
+
 const userSchema = new Schema({
   username: {
     type: String,
@@ -12,12 +24,13 @@ const userSchema = new Schema({
   password: {
     type: String,
     minlength: 5,
-    required: function(this: { sphereIdentity?: unknown }) { return !this.sphereIdentity; },
+    required: function(this: { sphereIdentity?: unknown; scoretechIdentity?: unknown }) { return !this.sphereIdentity && !this.scoretechIdentity; },
   },
   sphereIdentity: {
-    type: new Schema({ issuer: { type: String, required: true }, subject: { type: String, required: true } }, { _id: false }),
+    type: identitySchema,
     select: false,
   },
+  scoretechIdentity: { type: identitySchema, select: false },
   apiKey: {
     type: String,
     unique: true,
@@ -37,6 +50,7 @@ const userSchema = new Schema({
       delete resultObject.__v;
       delete resultObject.password;
       delete resultObject.sphereIdentity;
+      delete resultObject.scoretechIdentity;
       return resultObject;
     }
   }
@@ -46,6 +60,8 @@ userSchema.index({ 'sphereIdentity.issuer': 1, 'sphereIdentity.subject': 1 }, {
   name: 'unique_sphere_identity', unique: true,
   partialFilterExpression: { 'sphereIdentity.issuer': { $type: 'string' }, 'sphereIdentity.subject': { $type: 'string' } },
 });
+
+userSchema.index(scoretechIdentityIndex, scoretechIdentityIndexOptions);
 
 // Verify password method
 userSchema.methods.verifyPassword = async function(password: string) {
@@ -74,6 +90,7 @@ export interface UserDocument extends Document {
   username: string;
   password?: string;
   sphereIdentity?: { issuer: string; subject: string };
+  scoretechIdentity?: { issuer: string; subject: string };
   apiKey: string;
   role: UserRole;
   verifyPassword: (password: string) => Promise<boolean>;

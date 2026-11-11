@@ -120,7 +120,7 @@ export default function UsersList({
           if (username === loggedUser.username) {
             if (updated.role === 'USER') {
               // If admin degrades themselves to USER, logout (they lose access to this page)
-              logout();
+              await logout();
             } else {
               updateUser({ role: updated.role });
             }

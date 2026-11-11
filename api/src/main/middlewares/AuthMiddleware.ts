@@ -1,3 +1,4 @@
+import { authProvider, identityConfig, readCookie, SESSION_COOKIE } from '../services/identity/config';
 import { Request, Response, NextFunction } from 'express';
 import container from '../config/container';
 import {
@@ -36,10 +37,8 @@ const authenticateApiKeyMiddleware = async (req: Request, res: Response, next: N
   const apiKey = req.headers['x-api-key'] as string;
 
   try {
-    // Determine API Key type based on prefix
-    if (!apiKey) {
-      return checkPermissions(req, res, next);
-    } else if (apiKey.startsWith('usr_')) {
+    if (!apiKey) return checkPermissions(req, res, next);
+    if (apiKey.startsWith('usr_')) {
       // User API Key authentication
       await authenticateUserApiKey(req, apiKey);
     } else if (apiKey.startsWith('org_')) {
@@ -147,7 +146,7 @@ async function authenticateOrgApiKey(req: Request, apiKey: string): Promise<void
  *
  * Must be used AFTER authenticateApiKey middleware.
  */
-const checkPermissions = (req: Request, res: Response, next: NextFunction) => {
+const checkPermissions = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const method = req.method.toUpperCase() as HttpMethod;
     const baseUrlPath = '/api/v1';
@@ -169,8 +168,37 @@ const checkPermissions = (req: Request, res: Response, next: NextFunction) => {
     }
 
     // Allow public routes without authentication
-    if (matchingRule.isPublic) {
+    const managedRegistration = authProvider() === 'scoretech' && method === 'POST' && matchPath('/users', apiPath);
+    if (matchingRule.isPublic && !managedRegistration) {
       return next();
+    }
+
+    // A cookie is a browser credential. Match the frontend Origin on writes,
+    // and reject cross-origin reads even if the deployment permits other CORS origins.
+    if (!req.authType && authProvider() === 'scoretech') {
+      const session = readCookie(req.headers.cookie, SESSION_COOKIE);
+      if (session) {
+        const origin = req.headers.origin;
+        if ((origin || !['GET', 'HEAD'].includes(method)) && origin !== identityConfig().frontend.origin) {
+          return res.status(403).json({ error: 'Start this action from SPACE' });
+        }
+        res.setHeader('Cache-Control', 'no-store');
+        try {
+          const user = await container.resolve('scoretechIdentityService').authenticate(session);
+          if (user) {
+            req.user = user;
+            req.authType = 'user';
+          }
+        } catch {
+          res.setHeader('Retry-After', '2');
+          return res.status(503).json({ error: 'SPACE cannot verify your session right now' });
+        }
+      }
+    }
+
+    if (managedRegistration) {
+      if (req.authType === 'user' && req.user) return next();
+      return res.status(403).json({ error: 'Local registration is disabled' });
     }
 
     // Protected route - require authentication

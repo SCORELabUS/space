@@ -1,3 +1,4 @@
+import { authProvider } from '../services/identity/config';
 import container from '../config/container';
 import UserService from '../services/UserService';
 import { USER_ROLES } from '../types/permissions';
@@ -19,6 +20,9 @@ class UserController {
   }
 
   async create(req: any, res: any) {
+    if (authProvider() === 'scoretech' && !req.user) {
+      return res.status(403).json({ error: 'Local registration is disabled' });
+    }
     try {
       const user = await this.userService.create(req.body, req.user);
       res.status(201).json(user);
@@ -39,6 +43,7 @@ class UserController {
   }
 
   async authenticate(req: any, res: any) {
+    if (authProvider() === 'scoretech') return res.status(403).json({ error: 'Use SCORETech Identity to sign in' });
     try {
       const { username, password } = req.body;
       const user = await this.userService.authenticate(username, password);

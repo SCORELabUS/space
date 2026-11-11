@@ -14,7 +14,7 @@ interface UserEntry {
 }
 
 export default function UsersPage() {
-  const { user } = useAuth();
+  const { user, isAuthenticated } = useAuth();
   const [users, setUsers] = useState<UserEntry[]>([]);
   const [totalUsers, setTotalUsers] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -54,7 +54,7 @@ export default function UsersPage() {
   }, [filters.search]);
 
   useEffect(() => {
-    if (!user?.apiKey) return;
+    if (!isAuthenticated) return;
 
     const normalizedSearch = filters.search.trim();
     if (normalizedSearch !== debouncedSearch) {
@@ -87,7 +87,7 @@ export default function UsersPage() {
     return () => {
       cancelled = true;
     };
-  }, [user?.apiKey, filters.search, filters.pageSize, page, refreshKey, debouncedSearch, showAlert]);
+  }, [isAuthenticated, user?.apiKey, filters.search, filters.pageSize, page, refreshKey, debouncedSearch, showAlert]);
 
   const totalPages = Math.ceil(totalUsers / filters.pageSize) || 1;
 

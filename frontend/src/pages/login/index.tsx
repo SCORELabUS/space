@@ -1,3 +1,4 @@
+import ScoretechSignIn from '@/components/auth/ScoretechSignIn';
 import SphereSignIn from '@/components/auth/SphereSignIn';
 import { useState } from 'react';
 import { motion } from 'framer-motion';
@@ -12,9 +13,13 @@ export default function LoginPage() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [showLegacy, setShowLegacy] = useState(false);
+  const [signingIn, setSigningIn] = useState(false);
 
-  const { login } = useAuth();
+  const { login, config } = useAuth();
   const navigate = useNavigate();
+  const managed = config.provider === 'scoretech';
+  const legacyEnabled = managed && config.legacyPasswordLogin;
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -23,14 +28,16 @@ export default function LoginPage() {
       setError('Please enter both username and password.');
       return;
     }
-    login(username, password)
-      .catch((error) => {
-        if (error.message.toLowerCase().includes("unauthorized")) {
-          setError(error.message);
-        }else{
-          setError('Login failed. Please check your credentials and try again.');
-        }
-      });
+    setSigningIn(true);
+    try {
+      await login(username, password);
+    } catch (error) {
+      setError(managed || (error as Error).message.toLowerCase().includes('unauthorized')
+        ? (error as Error).message
+        : 'Login failed. Please check your credentials and try again.');
+    } finally {
+      setSigningIn(false);
+    }
   };
 
   return (
@@ -44,14 +51,27 @@ export default function LoginPage() {
         >
           Welcome to SPACE
         </motion.h1>
-        <motion.form
+        {managed && <div className="flex w-full flex-col gap-4">
+          <ScoretechSignIn allowLegacy={legacyEnabled} />
+          {legacyEnabled && <button
+            type="button"
+            aria-expanded={showLegacy}
+            aria-controls="space-password-form"
+            className="cursor-pointer self-center rounded-sm text-sm font-medium text-indigo-700 underline focus-visible:outline-2 dark:text-indigo-200"
+            onClick={() => { setShowLegacy(value => !value); setPassword(''); setError(''); }}
+          >
+            Use an existing SPACE password
+          </button>}
+        </div>}
+        {(!managed || legacyEnabled && showLegacy) && <motion.form
+          id="space-password-form"
           initial={{ opacity: 0, scale: 0.95 }}
           animate={{ opacity: 1, scale: 1 }}
           transition={{ delay: 0.4, duration: 0.5 }}
           className="w-full flex flex-col gap-6"
           onSubmit={handleLogin}
         >
-          <SphereSignIn />
+          {!managed && <SphereSignIn />}
           <FormError message={error} />
           <div>
             <label className="block text-indigo-800 dark:text-indigo-200 text-sm font-bold mb-2" htmlFor="username">
@@ -86,10 +106,11 @@ export default function LoginPage() {
             whileTap={{ scale: 0.97 }}
             className="cursor-pointer mt-2 bg-gradient-to-r from-indigo-400 via-blue-400 to-purple-400 dark:from-indigo-600 dark:via-blue-700 dark:to-purple-700 hover:from-indigo-300 hover:to-purple-300 dark:hover:from-indigo-500 dark:hover:to-purple-500 text-white font-bold py-2 px-6 rounded-lg shadow-lg transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-200 dark:focus:ring-indigo-800 focus:ring-offset-2"
             type="submit"
+            disabled={signingIn}
           >
-            Log In
+            {signingIn ? 'Signing in…' : 'Log In'}
           </motion.button>
-          <div className="text-center mt-4">
+          {!managed && <div className="text-center mt-4">
             <button
               type="button"
               onClick={() => navigate(`/register`)}
@@ -97,8 +118,8 @@ export default function LoginPage() {
             >
               Don't have an account? Register here
             </button>
-          </div>
-        </motion.form>
+          </div>}
+        </motion.form>}
       </SpaceCard>
     </LightBackground>
   );

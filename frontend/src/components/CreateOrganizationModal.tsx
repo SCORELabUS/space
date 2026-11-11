@@ -12,7 +12,7 @@ interface CreateOrganizationModalProps {
 }
 
 export default function CreateOrganizationModal({ isOpen, onClose }: CreateOrganizationModalProps) {
-  const { user } = useAuth();
+  const { user, isAuthenticated } = useAuth();
   const { setOrganizations } = useOrganization();
   const [organizationName, setOrganizationName] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -24,7 +24,7 @@ export default function CreateOrganizationModal({ isOpen, onClose }: CreateOrgan
       return;
     }
 
-    if (!user?.apiKey) {
+    if (!isAuthenticated) {
       setError('API key is not available');
       return;
     }

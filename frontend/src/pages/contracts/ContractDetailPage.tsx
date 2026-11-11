@@ -19,7 +19,7 @@ const normalizePlanName = (plan?: string | null) => {
 export default function ContractDetailPage() {
   const { userId } = useParams<{ userId: string }>();
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, isAuthenticated } = useAuth();
   const { currentOrganization } = useOrganization();
 
   const [contract, setContract] = useState<Subscription | null>(null);
@@ -27,7 +27,7 @@ export default function ContractDetailPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!userId || !user?.apiKey || !currentOrganization?.id) {
+    if (!userId || !isAuthenticated || !currentOrganization?.id) {
       setLoading(false);
       return;
     }
@@ -86,7 +86,7 @@ export default function ContractDetailPage() {
     return () => {
       mounted = false;
     };
-  }, [userId, user?.apiKey, currentOrganization?.id]);
+  }, [userId, isAuthenticated, user?.apiKey, currentOrganization?.id]);
 
   if (loading) {
     return (

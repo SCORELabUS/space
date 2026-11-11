@@ -9,7 +9,7 @@ import { getOrganization, createApiKey, deleteApiKey } from '@/api/organizations
 import type { OrganizationApiKey } from '@/types/Organization';
 
 export default function ApiKeysPage() {
-  const { user } = useAuth();
+  const { user, isAuthenticated } = useAuth();
   const { currentOrganization } = useOrganization();
   const { showAlert } = useCustomAlert();
   const { showConfirm, confirmElement } = useCustomConfirm();
@@ -27,7 +27,7 @@ export default function ApiKeysPage() {
   }, [currentOrganization?.id]);
 
   const loadApiKeys = async () => {
-    if (!currentOrganization || !user?.apiKey) return;
+    if (!currentOrganization || !isAuthenticated) return;
 
     setLoading(true);
     try {
@@ -41,7 +41,7 @@ export default function ApiKeysPage() {
   };
 
   const handleCreateApiKey = async () => {
-    if (!currentOrganization || !user?.apiKey) return;
+    if (!currentOrganization || !isAuthenticated) return;
 
     setIsSubmitting(true);
     try {
@@ -60,7 +60,7 @@ export default function ApiKeysPage() {
   };
 
   const handleDeleteApiKey = async (key: string) => {
-    if (!currentOrganization || !user?.apiKey) return;
+    if (!currentOrganization || !isAuthenticated) return;
 
     const confirmed = await showConfirm(
       'Are you sure you want to delete this API key? This action cannot be undone.',

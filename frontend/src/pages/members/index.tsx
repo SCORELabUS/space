@@ -15,7 +15,7 @@ interface SelectedUser {
 }
 
 export default function MembersPage() {
-  const { user } = useAuth();
+  const { user, isAuthenticated } = useAuth();
   const { currentOrganization, setCurrentOrganization, setOrganizations } = useOrganization();
   const { showAlert } = useCustomAlert();
   const { showConfirm, confirmElement } = useCustomConfirm();
@@ -59,7 +59,7 @@ export default function MembersPage() {
 
     // Set new timeout for debouncing
     debounceTimeoutRef.current = setTimeout(async () => {
-      if (!user?.apiKey) return;
+      if (!isAuthenticated) return;
       
       setIsSearching(true);
       try {
@@ -94,7 +94,7 @@ export default function MembersPage() {
         clearTimeout(debounceTimeoutRef.current);
       }
     };
-  }, [userSearchQuery, selectedUsers, members, owner, user?.apiKey]);
+  }, [userSearchQuery, selectedUsers, members, owner, isAuthenticated, user?.apiKey]);
 
   // Click outside to close dropdown
   useEffect(() => {
@@ -109,7 +109,7 @@ export default function MembersPage() {
   }, []);
 
   const loadMembers = async () => {
-    if (!currentOrganization || !user?.apiKey) return;
+    if (!currentOrganization || !isAuthenticated) return;
 
     setLoading(true);
     try {
@@ -124,7 +124,7 @@ export default function MembersPage() {
   };
 
   const handleAddMember = async () => {
-    if (!currentOrganization || !user?.apiKey) {
+    if (!currentOrganization || !isAuthenticated) {
       setModalError('Organization or user not found');
       return;
     }
@@ -211,7 +211,7 @@ export default function MembersPage() {
   };
 
   const handleRemoveMember = async (username: string) => {
-    if (!currentOrganization || !user?.apiKey) return;
+    if (!currentOrganization || !isAuthenticated) return;
 
     const confirmed = await showConfirm(
       `Are you sure you want to remove ${username} from the organization?`,
@@ -231,7 +231,7 @@ export default function MembersPage() {
   };
 
   const handleChangeRole = async (username: string, newRole: 'ADMIN' | 'MANAGER' | 'EVALUATOR') => {
-    if (!currentOrganization || !user?.apiKey) return;
+    if (!currentOrganization || !isAuthenticated) return;
 
     try {
       const updatedOrg = await updateMemberRole(user.apiKey, currentOrganization.id, username, newRole);
@@ -300,7 +300,7 @@ export default function MembersPage() {
   };
 
   const refreshOrganizations = async () => {
-    if (!user?.apiKey) return;
+    if (!isAuthenticated) return;
     const orgs = await getOrganizations(user.apiKey);
     setOrganizations(orgs);
     if (orgs.length === 0) {
@@ -312,7 +312,7 @@ export default function MembersPage() {
   };
 
   const handleLeaveOrganization = async () => {
-    if (!currentOrganization || !user?.apiKey || !user?.username) return;
+    if (!currentOrganization || !isAuthenticated || !user?.username) return;
 
     const confirmed = await showConfirm(
       'Are you sure you want to leave this organization?',

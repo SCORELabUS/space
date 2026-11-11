@@ -1,4 +1,5 @@
 import container from '../config/container';
+import { authProvider } from './identity/config';
 import UserRepository from '../repositories/mongoose/UserRepository';
 import { LeanUser } from '../types/models/User';
 import { UserRole, USER_ROLES } from '../types/permissions';
@@ -99,6 +100,9 @@ class UserService {
 
   async update(username: string, userData: any, creatorData: LeanUser) {
     userData = Object.fromEntries(Object.entries(userData).filter(([key]) => ['username', 'password', 'role'].includes(key)));
+    if (authProvider() === 'scoretech' && creatorData?.role !== 'ADMIN' && creatorData?.username !== username) {
+      throw new Error('PERMISSION ERROR: Only admins can update other accounts.');
+    }
 
     
     if (creatorData && (creatorData.role !== 'ADMIN' && userData.role === 'ADMIN')) {

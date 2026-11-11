@@ -1,3 +1,4 @@
+import bcrypt from 'bcryptjs';
 import { toPlainObject } from '../../utils/mongoose';
 import RepositoryBase from '../RepositoryBase';
 import UserMongoose from './models/UserMongoose';
@@ -9,6 +10,35 @@ class UserRepository extends RepositoryBase {
   async findBySphereIdentity(issuer: string, subject: string): Promise<LeanUser | null> {
     const user = await UserMongoose.findOne({ 'sphereIdentity.issuer': issuer, 'sphereIdentity.subject': subject });
     return user ? user.toObject({ virtuals: true }) as unknown as LeanUser : null;
+  }
+
+  async findByScoretechIdentity(issuer: string, subject: string): Promise<LeanUser | null> {
+    const user = await UserMongoose.findOne({
+      'scoretechIdentity.issuer': issuer,
+      'scoretechIdentity.subject': subject,
+    }).select('-password -apiKey');
+    return user ? user.toObject({ virtuals: true }) as unknown as LeanUser : null;
+  }
+
+  async legacyPasswordAccount(query: { username: string } | { _id: string }, password?: string) {
+    const document = await UserMongoose.findOne({
+      ...query, scoretechIdentity: { $exists: false }, password: { $type: 'string' },
+    }).select('username role password');
+    // Use a fixed dummy hash when the account is missing or already linked.
+    const dummy = '$2b$10$123456789012345678901uA5EP1vebA2KgfkQtHAl2u1dqEOdPS6m';
+    if (password !== undefined && !await bcrypt.compare(password, document?.password ?? dummy)) return null;
+    if (!document?.password) return null;
+    return {
+      user: { id: document.id, username: document.username, role: document.role, apiKey: '' } satisfies LeanUser,
+      passwordHash: document.password,
+    };
+  }
+
+  async linkScoretechIdentity(userId: string, passwordHash: string, issuer: string, subject: string) {
+    const result = await UserMongoose.updateOne({
+      _id: userId, password: passwordHash, scoretechIdentity: { $exists: false },
+    }, { $set: { scoretechIdentity: { issuer, subject } } });
+    return result.modifiedCount === 1;
   }
 
   async sphereConnection(userId: string) {

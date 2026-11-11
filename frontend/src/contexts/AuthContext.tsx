@@ -1,5 +1,6 @@
 import React, { createContext, useState, useContext, useEffect, useRef } from "react";
 import axios from "../lib/axios";
+import { endIdentitySession, getAuthConfig, signInWithSpacePassword, type AuthConfig } from "@/api/auth/identityApi";
 import { getOrganizations } from "@/api/organizations/organizationsApi";
 import { getCurrentUser } from "@/api/users/usersApi";
 import { OrganizationContext } from "./OrganizationContext";
@@ -13,7 +14,8 @@ export interface UserData {
 export interface AuthContextType {
   isAuthenticated: boolean;
   login: (username: string, password: string) => Promise<void>;
-  logout: () => void;
+  logout: () => Promise<void>;
+  config: AuthConfig;
   acceptSession: (user: UserData) => void;
   user: UserData;
   updateUser: (newUser: Partial<UserData>) => void;
@@ -28,11 +30,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   const organizationContext = useContext(OrganizationContext);
   const organizationsLoadedRef = useRef(false);
 
-  const isDevelopmentEnvironment: boolean = import.meta.env.VITE_ENVIRONMENT === "development"
+  const [config, setConfig] = useState<AuthConfig | null>(null);
+  const [bootstrapError, setBootstrapError] = useState(false);
+  const [retry, setRetry] = useState(0);
+  const isDevelopmentEnvironment = config?.provider === 'local' && import.meta.env.VITE_ENVIRONMENT === 'development';
+  const usesIdentity = config?.provider === 'scoretech';
 
   // Load user from localStorage if exists
-  const loadStoredUser = (): UserData => {
-    if (isDevelopmentEnvironment) {
+  const loadStoredUser = (development: boolean): UserData => {
+    if (development) {
       return {
         username: "devUser",
         apiKey: import.meta.env.VITE_SPACE_ADMIN_API_KEY,
@@ -52,9 +58,45 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     return { username: "", apiKey: "", role: "" };
   };
 
-  const storedUser = loadStoredUser();
-  const [isAuthenticated, setIsAuthenticated] = useState(isDevelopmentEnvironment || !!storedUser.apiKey);
-  const [user, setUser] = useState<UserData>(storedUser);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [user, setUser] = useState<UserData>({ username: "", apiKey: "", role: "" });
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const { signal } = controller;
+    async function bootstrap() {
+      try {
+        const settings = await getAuthConfig(signal);
+        let account: UserData | undefined;
+        if (settings.provider === 'scoretech') {
+          localStorage.removeItem('user');
+          try {
+            const { data } = await axios.get<Omit<UserData, 'apiKey'>>('/users/me', {
+              withCredentials: true, timeout: 15_000, signal,
+            });
+            account = { ...data, apiKey: '' };
+          } catch (error: any) {
+            if (error.response?.status !== 401) throw error;
+          }
+        } else {
+          const development = import.meta.env.VITE_ENVIRONMENT === 'development';
+          const stored = loadStoredUser(development);
+          if (development || stored.apiKey) account = stored;
+        }
+        if (signal.aborted) return;
+        axios.defaults.withCredentials = settings.provider === 'scoretech';
+        if (account) {
+          setUser(account);
+          setIsAuthenticated(true);
+        }
+        setConfig(settings);
+      } catch {
+        if (!signal.aborted) setBootstrapError(true);
+      }
+    }
+    void bootstrap();
+    return () => controller.abort();
+  }, [retry]);
 
   // Load user role from API in development mode
   useEffect(() => {
@@ -85,7 +127,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   const logoutRef = useRef<() => void>(() => {});
 
   useEffect(() => {
-    if (isDevelopmentEnvironment || !user.apiKey) {
+    if (isDevelopmentEnvironment || !isAuthenticated) {
       return;
     }
 
@@ -93,7 +135,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     let checkingSession = false;
 
     const interceptor = axios.interceptors.response.use(undefined, error => {
-      const sentApiKey = error.config?.headers?.["x-api-key"];
+      const sentApiKey = error.config?.headers?.get("x-api-key") ?? "";
 
       if (error.response?.status === 401 && sentApiKey === apiKey && !checkingSession) {
         checkingSession = true;
@@ -115,11 +157,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     return () => {
       axios.interceptors.response.eject(interceptor);
     };
-  }, [isDevelopmentEnvironment, user.apiKey]);
+  }, [isDevelopmentEnvironment, isAuthenticated, user.apiKey]);
 
   // Load organizations when user is authenticated (for dev mode or after login)
   useEffect(() => {
-    if (!isAuthenticated || !user.apiKey || !organizationContext) {
+    if (!isAuthenticated || !organizationContext) {
       return;
     }
 
@@ -178,6 +220,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const login = async (username: string, password: string) => {
     try {
+      if (usesIdentity) {
+        const account = await signInWithSpacePassword(username, password);
+        organizationsLoadedRef.current = false;
+        setUser({ ...account, apiKey: '' });
+        setIsAuthenticated(true);
+        return;
+      }
       const response = await axios.post(
         "/users/authenticate",
         { username, password },
@@ -203,7 +252,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     }
   };
 
-  const logout = () => {
+  const clearSession = () => {
     organizationsLoadedRef.current = false;
     
     setUser({
@@ -224,7 +273,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     localStorage.removeItem('currentOrganizationId');
     localStorage.removeItem('organizations');
   };
-  logoutRef.current = logout;
+  logoutRef.current = clearSession;
+
+  const logout = async () => {
+    if (usesIdentity) await endIdentitySession();
+    clearSession();
+  };
 
   // Allows updating the user from outside (e.g., after editing username or role)
   const updateUser = (newUser: Partial<UserData>) => {
@@ -233,7 +287,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 
   // Refresh organizations from the API
   const refreshOrganizations = async () => {
-    if (!user.apiKey || !organizationContext) {
+    if (!isAuthenticated || !organizationContext) {
       return;
     }
 
@@ -268,8 +322,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     }
   };
 
+  if (!config) {
+    return (
+      <main className="grid min-h-screen place-content-center gap-4 bg-white p-4 text-center text-gray-900 dark:bg-gray-950 dark:text-gray-100">
+        {bootstrapError ? <>
+          <p role="alert">SPACE could not check your sign-in. Please try again.</p>
+          <button type="button" className="cursor-pointer rounded-lg bg-indigo-600 px-4 py-2 text-white"
+            onClick={() => { setBootstrapError(false); setRetry(value => value + 1); }}>Try again</button>
+        </> : <p role="status">Checking sign-in…</p>}
+      </main>
+    );
+  }
+
   return (
-    <AuthContext.Provider value={{ isAuthenticated, login, logout, acceptSession, user, updateUser, refreshOrganizations }}>
+    <AuthContext.Provider value={{ config, isAuthenticated, login, logout, acceptSession, user, updateUser, refreshOrganizations }}>
       {children}
     </AuthContext.Provider>
   );

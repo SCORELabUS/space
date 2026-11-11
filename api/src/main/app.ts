@@ -1,4 +1,6 @@
 import mongoose from 'mongoose';
+import { authProvider, identityConfig } from './services/identity/config';
+import { migrateScoretechIdentity } from './migrations/20261111000000-scoretech-identity';
 import { migrateSphereIdentity } from './migrations/20261103000000-sphere-identity';
 import * as dotenv from 'dotenv';
 import { existsSync } from 'node:fs';
@@ -36,6 +38,7 @@ const initializeApp = async (seedDatabase: boolean = true) => {
   if (existsSync(workspaceEnv)) dotenv.config({ path: workspaceEnv });
   dotenv.config();
   // Before anything else: a server that cannot sign verifiable pricing tokens must not start.
+  if (authProvider() === 'scoretech') identityConfig();
   await initPricingTokenKeys();
   const app: Application = express();
   loadGlobalMiddlewares(app);
@@ -132,6 +135,7 @@ const initializeDatabase = async (seedDatabaseFlag: boolean = true) => {
       case 'mongoDB':
         connection = await initMongoose();
         await migrateSphereIdentity();
+        await migrateScoretechIdentity();
         // Idempotent; see the migration for what it changes.
         await runContractUserIdMigration();
         await initializeServiceRelocationJournal();

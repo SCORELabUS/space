@@ -83,8 +83,6 @@ services:
       start_period: 10s
   space-client:
     container_name: space-client
-    env_file:
-      - ./.env
     build:
       context: ../../frontend/
       dockerfile: ./docker/production/Dockerfile
@@ -115,6 +113,8 @@ services:
   nginx:
     restart: always
     container_name: space-nginx
+    environment:
+      BASE_URL_PATH: ${BASE_PATH:-}
     build:
         context: ../../nginx/production/
         dockerfile: ./Dockerfile

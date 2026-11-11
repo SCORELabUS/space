@@ -96,6 +96,21 @@ class CacheService {
     });
   }
 
+  // Compare and write in Redis so an in-flight refresh cannot restore a logged-out session.
+  async replaceIfCurrent(key: string, expected: unknown, replacement?: { value: unknown; seconds: number }) {
+    if (!this.redisClient) throw new Error('Redis client not initialized');
+    const result = await this.redisClient.eval(`
+      if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+      if ARGV[2] == '' then return redis.call('DEL', KEYS[1]) end
+      redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+      return 1
+    `, {
+      keys: [this.key(key)],
+      arguments: [JSON.stringify(expected), replacement ? JSON.stringify(replacement.value) : '', String(replacement?.seconds ?? 0)],
+    });
+    return result === 1;
+  }
+
   async match(keyLocationPattern: string): Promise<string[]> {
     if (!this.redisClient) {
       throw new Error('Redis client not initialized');

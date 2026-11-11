@@ -7,7 +7,7 @@ import { getOrganizationsPaginated } from '@/api/organizations/organizationsApi'
 import type { Organization } from '@/types/Organization';
 
 export default function OrganizationsPage() {
-  const { user } = useAuth();
+  const { user, isAuthenticated } = useAuth();
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [totalOrganizations, setTotalOrganizations] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -28,7 +28,7 @@ export default function OrganizationsPage() {
   };
 
   useEffect(() => {
-    if (!user?.apiKey) return;
+    if (!isAuthenticated) return;
 
     setLoading(true);
     const offset = (page - 1) * filters.pageSize;
@@ -44,7 +44,7 @@ export default function OrganizationsPage() {
         setTotalOrganizations(0);
       })
       .finally(() => setLoading(false));
-  }, [user?.apiKey, filters, page, refreshKey]);
+  }, [isAuthenticated, user?.apiKey, filters, page, refreshKey]);
 
   const totalPages = Math.ceil(totalOrganizations / filters.pageSize) || 1;
 

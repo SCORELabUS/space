@@ -39,12 +39,13 @@ function RequireRole({ children, allowedRoles }: { children: ReactNode; allowedR
 }
 
 export function SpaceRouter() {
+  const { config } = useAuth();
   return (
     <BrowserRouter basename={import.meta.env.BASE_URL}>
       <Routes>
         <Route path="/" element={<MainPage/>}/>
-        <Route path="/auth/sphere" element={<SphereAuthPage/>}/>
-        <Route path="/register" element={<RegisterPage/>}/>
+        <Route path="/auth/sphere" element={config.provider === 'local' ? <SphereAuthPage /> : <Navigate to="/" replace />}/>
+        <Route path="/register" element={config.provider === 'local' ? <RegisterPage /> : <Navigate to="/" replace />}/>
         <Route path="/contracts/dashboard" element={<RequireAuth><LoggedLayout><ContractsDashboard/></LoggedLayout></RequireAuth>} />
         <Route path="/contracts/:userId" element={<RequireAuth><LoggedLayout><ContractDetailPage/></LoggedLayout></RequireAuth>} />
         <Route path="/instance-monitoring" element={<RequireAuth><RequireRole allowedRoles={['ADMIN']}><LoggedLayout><InstanceMonitoringPage/></LoggedLayout></RequireRole></RequireAuth>} />

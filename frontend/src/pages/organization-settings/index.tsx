@@ -7,7 +7,7 @@ import { updateOrganization, getOrganization } from '@/api/organizations/organiz
 import type { Organization } from '@/types/Organization';
 
 export default function OrganizationSettingsPage() {
-  const { user } = useAuth();
+  const { user, isAuthenticated } = useAuth();
   const { currentOrganization, setCurrentOrganization, setOrganizations } = useOrganization();
   const [organization, setOrganization] = useState<Organization | null>(null);
   const [organizationName, setOrganizationName] = useState('');
@@ -30,7 +30,7 @@ export default function OrganizationSettingsPage() {
 
   useEffect(() => {
     const loadOrganization = async () => {
-      if (!currentOrganization?.id || !user?.apiKey) return;
+      if (!currentOrganization?.id || !isAuthenticated) return;
 
       setIsLoading(true);
       setError(null);
@@ -47,10 +47,10 @@ export default function OrganizationSettingsPage() {
     };
 
     loadOrganization();
-  }, [currentOrganization?.id, user?.apiKey]);
+  }, [currentOrganization?.id, isAuthenticated, user?.apiKey]);
 
   const handleSaveName = async () => {
-    if (!organization || !user?.apiKey) return;
+    if (!organization || !isAuthenticated) return;
 
     if (!organizationName.trim()) {
       setError('Organization name is required');
@@ -87,7 +87,7 @@ export default function OrganizationSettingsPage() {
   };
 
   const handleTransferOwnership = async () => {
-    if (!organization || !user?.apiKey || !newOwner.trim()) return;
+    if (!organization || !isAuthenticated || !newOwner.trim()) return;
 
     setIsSaving(true);
     setError(null);

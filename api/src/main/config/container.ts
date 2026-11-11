@@ -1,3 +1,4 @@
+import { ScoretechIdentityService } from '../services/identity/ScoretechIdentityService';
 import SphereAuthService from '../services/SphereAuthService';
 import ServiceRelocationRepository from '../repositories/mongoose/ServiceRelocationRepository';
 import SphereSyncRepository from '../repositories/mongoose/SphereSyncRepository';
@@ -57,6 +58,7 @@ function initContainer(databaseType: string): AwilixContainer {
     usageConsumptionRepository: asValue(usageConsumptionRepository),
     idempotencyKeyRepository: asValue(idempotencyKeyRepository),
     userService: asClass(UserService).singleton(),
+    scoretechIdentityService: asClass(ScoretechIdentityService).singleton(),
     sphereAuthService: asClass(SphereAuthService).singleton(),
     serviceRelocationRepository: asClass(ServiceRelocationRepository).singleton(),
     sphereSyncRepository: asClass(SphereSyncRepository).singleton(),

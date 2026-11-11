@@ -1,3 +1,4 @@
+import { authProvider } from '../services/identity/config';
 import { randomBytes } from 'node:crypto';
 import type { Request, Response } from 'express';
 import container from '../config/container';
@@ -10,6 +11,10 @@ export default class SphereAuthController {
   handle = async (req: Request, res: Response) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
+    if (authProvider() === 'scoretech') {
+      if (req.path.replace(/\/$/, '').toLowerCase().endsWith('/status')) return res.json({ available: false });
+      return res.status(404).json({ error: 'SPHERE sign-in is disabled' });
+    }
     const service: SphereAuthService = container.resolve('sphereAuthService');
     try {
       if (req.path.endsWith('/status')) return res.json({ available: service.available() });
