@@ -75,26 +75,49 @@ deployment after users have linked their accounts.
 
 ### Recover accounts that signed in through SPHERE
 
-Run the recovery from the SPACE checkout on a machine with Docker Compose
-access to the three production stacks. It reads the SPHERE user ID stored
-in SPACE, the verified SCORETech binding on that SPHERE user, and the
-matching account ID in SCORETech's `score` realm. It uses the existing
-running containers and needs no additional environment variables. The
-running SPACE API must already support SCORETech and have created its
-unique identity index. The recovery can run while users are signed in.
+The recovery reads the SPHERE user ID stored in SPACE, the verified SCORETech
+binding on that SPHERE user, and the matching account ID in SCORETech's
+`score` realm. The running SPACE API must already support SCORETech and
+have created its unique identity index.
+
+If SPACE runs on a separate machine, use a SPACE checkout with this script on
+the SPHERE and Identity host to export the source bindings. Use your actual
+checkout paths.
+
+```sh
+umask 077
+bash docker/link-sphere-scoretech export ../SPHERE ../SCORETech-identity > space-links.jsonl
+```
+
+Transfer `space-links.jsonl` to the SPACE host over SSH or SCP. The file
+contains identity IDs and binding hashes. Keep it private and transfer it
+only between the servers you administer. If SPHERE and Identity also run on
+separate hosts, run `export-sphere <SPHERE checkout>` and
+`export-identity <Identity checkout>` separately from a checkout containing
+the script on each source host. Combine the two output files on the SPACE
+host with the SPHERE line first and the Identity line second.
+
+On the SPACE host, from the updated SPACE checkout, run the dry run and
+review the report. Apply after checking the proposed count.
+
+```sh
+bash docker/link-sphere-scoretech import ./space-links.jsonl
+bash docker/link-sphere-scoretech import ./space-links.jsonl --apply
+```
+
+The dry run writes nothing. Apply writes the verified identity link on the
+original SPACE account, preserving its ID, roles, organizations, password
+and API keys. Run the dry run again to confirm that recovered accounts are
+counted as `alreadyLinked`. Users can then sign in with SCORETech immediately.
+Remove the transferred export when you finish.
+
+If all three stacks run on one host, you can still stream the exports
+directly into SPACE from its checkout:
 
 ```sh
 bash docker/link-sphere-scoretech ../SPHERE ../SCORETech-identity
-# Review the dry run, then apply the unambiguous links:
 bash docker/link-sphere-scoretech ../SPHERE ../SCORETech-identity --apply
 ```
-
-Replace the checkout paths if your directories differ. The dry run reads all
-three databases and writes nothing. Apply only writes the verified identity
-link on the original SPACE account, preserving its ID, roles, organizations,
-password and API keys. It never overwrites a link. Run the dry run again to
-confirm that recovered accounts are now counted as `alreadyLinked`. Users
-can then sign in with SCORETech immediately.
 
 `noSphereLink` means the original SPHERE user is absent or lacks a verified
 SCORETech link. `missingInIdentity` means the binding has no corresponding

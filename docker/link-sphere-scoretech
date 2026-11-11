@@ -1,29 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 3 || ( $# -eq 3 && $3 != --apply ) ]]; then
-  printf 'Usage: bash docker/link-sphere-scoretech <SPHERE checkout> <SCORETech-identity checkout> [--apply]\n' >&2
+usage() {
+  cat >&2 <<'USAGE'
+Usage:
+  bash docker/link-sphere-scoretech <SPHERE checkout> <Identity checkout> [--apply]
+  bash docker/link-sphere-scoretech export <SPHERE checkout> <Identity checkout>
+  bash docker/link-sphere-scoretech export-sphere <SPHERE checkout>
+  bash docker/link-sphere-scoretech export-identity <Identity checkout>
+  bash docker/link-sphere-scoretech import <export file or -> [--apply]
+USAGE
   exit 2
-fi
+}
 
 space_docker=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-sphere_docker=$(cd -- "$1/docker/production" && pwd -P)
-identity_docker=$(cd -- "$2/docker/production" && pwd -P)
-script=$(cat -- "$space_docker/../api/scripts/link-sphere-scoretech.mjs")
-mode=plan
-if [[ ${3:-} == --apply ]]; then mode=apply; fi
 
-sphere_export=$(
-  cd -- "$sphere_docker"
+export_sphere() (
+  cd -- "$1/docker/production"
+  local script
+  script=$(cat -- "$space_docker/../api/scripts/link-sphere-scoretech.mjs")
   docker compose exec -T server node --input-type=module -e "$script" -- export-sphere
 )
-subject_export=$(
-  cd -- "$identity_docker"
+
+export_identity() (
+  cd -- "$1/docker/production"
   docker compose exec -T -e 'PGOPTIONS=-c default_transaction_read_only=on' database \
     psql -X -qAt -w -v ON_ERROR_STOP=1 -U keycloak -d keycloak -c \
     "SELECT COALESCE(json_agg(u.id), '[]'::json) FROM user_entity u JOIN realm r ON r.id = u.realm_id WHERE r.name = 'score'"
 )
-printf '%s\n%s\n' "$sphere_export" "$subject_export" | (
+
+export_bundle() {
+  local sphere_export subject_export
+  sphere_export=$(export_sphere "$1")
+  subject_export=$(export_identity "$2")
+  printf '%s\n%s\n' "$sphere_export" "$subject_export"
+}
+
+import_bundle() (
   cd -- "$space_docker/production"
+  local script mode=plan
+  script=$(cat -- "$space_docker/../api/scripts/link-sphere-scoretech.mjs")
+  if [[ ${1:-} == --apply ]]; then mode=apply; fi
   docker compose exec -T space-server node --input-type=module -e "$script" -- "$mode"
 )
+
+case ${1:-} in
+  export)
+    [[ $# -eq 3 ]] || usage
+    export_bundle "$2" "$3"
+    ;;
+  export-sphere)
+    [[ $# -eq 2 ]] || usage
+    export_sphere "$2"
+    ;;
+  export-identity)
+    [[ $# -eq 2 ]] || usage
+    export_identity "$2"
+    ;;
+  import)
+    [[ $# -eq 2 || ( $# -eq 3 && $3 == --apply ) ]] || usage
+    if [[ $2 == - ]]; then
+      import_bundle "${3:-}"
+    else
+      import_bundle "${3:-}" < "$2"
+    fi
+    ;;
+  *)
+    [[ $# -eq 2 || ( $# -eq 3 && $3 == --apply ) ]] || usage
+    export_bundle "$1" "$2" | import_bundle "${3:-}"
+    ;;
+esac
