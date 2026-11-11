@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 || $# -gt 3 || ( $# -eq 3 && $3 != --apply ) ]]; then
+  printf 'Usage: bash docker/link-sphere-scoretech <SPHERE checkout> <SCORETech-identity checkout> [--apply]\n' >&2
+  exit 2
+fi
+
+space_docker=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+sphere_docker=$(cd -- "$1/docker/production" && pwd -P)
+identity_docker=$(cd -- "$2/docker/production" && pwd -P)
+script=$(cat -- "$space_docker/../api/scripts/link-sphere-scoretech.mjs")
+mode=plan
+if [[ ${3:-} == --apply ]]; then mode=apply; fi
+
+sphere_export=$(
+  cd -- "$sphere_docker"
+  docker compose exec -T server node --input-type=module -e "$script" -- export-sphere
+)
+subject_export=$(
+  cd -- "$identity_docker"
+  docker compose exec -T -e 'PGOPTIONS=-c default_transaction_read_only=on' database \
+    psql -X -qAt -w -v ON_ERROR_STOP=1 -U keycloak -d keycloak -c \
+    "SELECT COALESCE(json_agg(u.id), '[]'::json) FROM user_entity u JOIN realm r ON r.id = u.realm_id WHERE r.name = 'score'"
+)
+printf '%s\n%s\n' "$sphere_export" "$subject_export" | (
+  cd -- "$space_docker/production"
+  docker compose exec -T space-server node --input-type=module -e "$script" -- "$mode"
+)

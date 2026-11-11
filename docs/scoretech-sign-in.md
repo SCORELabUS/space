@@ -73,14 +73,35 @@ account is linked its password stops working for browser sign-in. Set
 `SCORETECH_LEGACY_PASSWORD_LOGIN=false` to retire the fallback for the
 deployment after users have linked their accounts.
 
-Accounts originally created solely through SPHERE may have no local password.
-Handle those individually before cutover. After independently verifying the
-account owner, a SPACE administrator can set a temporary password on the
-existing SPACE account so the owner can link it through Settings. Never use
-a shared temporary password. Once the user has linked, the administrator can
-replace that temporary password with a unique, undisclosed value so it cannot
-be used if the deployment later returns to local mode. The managed login
-does not match accounts by email or create a second SPACE account.
+### Recover accounts that signed in through SPHERE
+
+Run the recovery from the SPACE checkout on a machine with Docker Compose
+access to the three production stacks. It reads the SPHERE user ID stored
+in SPACE, the verified SCORETech binding on that SPHERE user, and the
+matching account ID in SCORETech's `score` realm. It uses the existing
+running containers and needs no additional environment variables. The
+running SPACE API must already support SCORETech and have created its
+unique identity index. The recovery can run while users are signed in.
+
+```sh
+bash docker/link-sphere-scoretech ../SPHERE ../SCORETech-identity
+# Review the dry run, then apply the unambiguous links:
+bash docker/link-sphere-scoretech ../SPHERE ../SCORETech-identity --apply
+```
+
+Replace the checkout paths if your directories differ. The dry run reads all
+three databases and writes nothing. Apply only writes the verified identity
+link on the original SPACE account, preserving its ID, roles, organizations,
+password and API keys. It never overwrites a link. Run the dry run again to
+confirm that recovered accounts are now counted as `alreadyLinked`. Users
+can then sign in with SCORETech immediately.
+
+`noSphereLink` means the original SPHERE user is absent or lacks a verified
+SCORETech link. `missingInIdentity` means the binding has no corresponding
+account ID in the current SCORETech realm. A copy of the user record or a
+matching email is insufficient. Resolve those cases and any reported conflicts
+individually. A SPACE administrator can verify the owner and set a unique
+temporary password on the existing SPACE account if manual linking is needed.
 
 The browser receives an opaque HttpOnly SPACE session cookie. Redis stores
 the refresh token. Once a verification is a minute old, the next authenticated request
