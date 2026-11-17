@@ -14,7 +14,8 @@ interface UserEntry {
 }
 
 export default function UsersPage() {
-  const { user, isAuthenticated } = useAuth();
+  const { user, isAuthenticated, config } = useAuth();
+  const localAccounts = config.provider === 'local';
   const [users, setUsers] = useState<UserEntry[]>([]);
   const [totalUsers, setTotalUsers] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -95,7 +96,7 @@ export default function UsersPage() {
     <div className="max-w-3xl mx-auto py-10 px-2 md:px-0">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-3xl font-bold text-indigo-800 dark:text-gray-100">Users</h1>
-        <button
+        {localAccounts && <button
           className="cursor-pointer flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 text-white font-semibold shadow hover:bg-indigo-700 dark:hover:bg-indigo-800 transition-all focus:outline-none focus:ring-2 focus:ring-indigo-300 dark:focus:ring-indigo-900"
           onClick={() => setAddUserOpen(true)}
         >
@@ -109,7 +110,7 @@ export default function UsersPage() {
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
           </svg>
           Add user
-        </button>
+        </button>}
       </div>
       {alertElement}
       <UsersFilters
@@ -125,14 +126,14 @@ export default function UsersPage() {
         totalPages={totalPages}
         onUserChanged={refreshUsers}
       />
-      <AddUserModal
+      {localAccounts && <AddUserModal
         open={addUserOpen}
         onClose={() => setAddUserOpen(false)}
         onUserCreated={() => {
           showAlert('User created successfully', 'info');
           refreshUsers();
         }}
-      />
+      />}
     </div>
   );
 }

@@ -50,7 +50,8 @@ export default function UsersList({
   totalPages: number;
   onUserChanged?: () => void;
 }) {
-  const { user: loggedUser, updateUser, logout, refreshOrganizations } = useAuth();
+  const { user: loggedUser, updateUser, logout, refreshOrganizations, config } = useAuth();
+  const localAccounts = config.provider === 'local';
   const [editing, setEditing] = useState<string | null>(null);
   const [usernameDraft, setUsernameDraft] = useState('');
   const [roleDropdown, setRoleDropdown] = useState<string | null>(null);
@@ -174,21 +175,21 @@ export default function UsersList({
             <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
               Role
             </th>
-            <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
+            {localAccounts && <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
               Actions
-            </th>
+            </th>}
           </tr>
         </thead>
         <tbody className="bg-white dark:bg-gray-900 divide-y divide-gray-100 dark:divide-gray-800">
           {loading ? (
             <tr>
-              <td colSpan={4} className="py-10 text-center text-indigo-500 font-semibold">
+              <td colSpan={localAccounts ? 4 : 3} className="py-10 text-center text-indigo-500 font-semibold">
                 Loading users...
               </td>
             </tr>
           ) : users.length === 0 ? (
             <tr>
-              <td colSpan={4} className="py-10 text-center text-gray-400 font-medium">
+              <td colSpan={localAccounts ? 4 : 3} className="py-10 text-center text-gray-400 font-medium">
                 No users found
               </td>
             </tr>
@@ -197,7 +198,9 @@ export default function UsersList({
               <tr key={u.username} className="hover:bg-indigo-50/30 transition">
                 {/* Editable username */}
                 <td className="px-4 py-3">
-                  {editing === u.username ? (
+                  {!localAccounts ? (
+                    <span className="font-mono text-sm text-indigo-800 dark:text-white">{u.username}</span>
+                  ) : editing === u.username ? (
                     <div className="flex items-center gap-2">
                       <input
                         className="dark:text-white rounded border border-gray-200 px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
@@ -301,8 +304,7 @@ export default function UsersList({
                     </AnimatePresence>
                   </div>
                 </td>
-                {/* Acciones */}
-                <td className="px-4 py-3">
+                {localAccounts && <td className="px-4 py-3">
                   <div className="flex gap-2 items-center">
                     <button
                       className="flex items-center gap-1 px-3 py-1 rounded bg-indigo-50 text-indigo-700 hover:bg-indigo-100 text-xs font-semibold cursor-pointer disabled:opacity-50"
@@ -335,7 +337,7 @@ export default function UsersList({
                       </button>
                     )}
                   </div>
-                </td>
+                </td>}
               </tr>
             ))
           )}

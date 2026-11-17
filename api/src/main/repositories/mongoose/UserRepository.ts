@@ -34,10 +34,17 @@ class UserRepository extends RepositoryBase {
     };
   }
 
-  async linkScoretechIdentity(userId: string, passwordHash: string, issuer: string, subject: string) {
+  async hasScoretechEmailConflict(email: string, exceptUserId?: string) {
+    return Boolean(await UserMongoose.exists({
+      $or: [{ scoretechEmail: email }, { username: email }],
+      ...(exceptUserId ? { _id: { $ne: exceptUserId } } : {}),
+    }).collation({ locale: 'en', strength: 2 }));
+  }
+
+  async linkScoretechIdentity(userId: string, passwordHash: string, issuer: string, subject: string, email: string) {
     const result = await UserMongoose.updateOne({
       _id: userId, password: passwordHash, scoretechIdentity: { $exists: false },
-    }, { $set: { scoretechIdentity: { issuer, subject } } });
+    }, { $set: { scoretechIdentity: { issuer, subject }, scoretechEmail: email } });
     return result.modifiedCount === 1;
   }
 

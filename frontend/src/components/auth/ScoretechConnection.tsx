@@ -12,7 +12,8 @@ export default function ScoretechConnection({ accountUrl }: { accountUrl: string
   const [error, setError] = useState('');
   const callbackError = searchParams.get('identityError');
   const callbackMessage = callbackError === 'conflict'
-    ? 'That SCORETech Identity account is already connected to SPACE. Choose a different account.'
+    ? 'That SCORETech Identity or email already belongs to another SPACE account.'
+    : callbackError === 'email_required' ? 'Verify your email in SCORETech Identity, then try connecting again.'
     : callbackError ? 'Could not connect SCORETech Identity. Please try again.' : '';
 
   useEffect(() => {

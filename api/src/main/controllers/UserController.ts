@@ -20,9 +20,6 @@ class UserController {
   }
 
   async create(req: any, res: any) {
-    if (authProvider() === 'scoretech' && !req.user) {
-      return res.status(403).json({ error: 'Local registration is disabled' });
-    }
     try {
       const user = await this.userService.create(req.body, req.user);
       res.status(201).json(user);

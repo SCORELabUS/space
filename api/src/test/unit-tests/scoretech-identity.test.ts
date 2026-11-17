@@ -10,13 +10,15 @@ vi.mock('../../main/utils/proxy', () => ({ fetchWithOptionalProxy: mocks.fetch }
 const issuer = 'https://identity.example/identity/auth/realms/score';
 const browser = 'a'.repeat(64);
 const account = { id: 'local-id', username: 'local-name', role: 'USER' };
-const users = { findByScoretechIdentity: vi.fn(), legacyPasswordAccount: vi.fn(), linkScoretechIdentity: vi.fn() };
+const users = { findByScoretechIdentity: vi.fn(), legacyPasswordAccount: vi.fn(), linkScoretechIdentity: vi.fn(), hasScoretechEmailConflict: vi.fn() };
+const userService = { createScoretechProfile: vi.fn() };
 const legacyAccount = { user: account, passwordHash: 'fixture-password-hash' };
 const entries = new Map<string, unknown>();
 let keys: Awaited<ReturnType<typeof generateKeyPair>>;
 let service: ScoretechIdentityService;
 let nonce: string;
 let returnedSubject: string;
+let emailClaims: Record<string, unknown>;
 let beforeRefresh: (() => Promise<void>) | undefined;
 
 beforeAll(async () => {
@@ -30,6 +32,9 @@ beforeEach(() => {
   });
   users.linkScoretechIdentity.mockReset().mockResolvedValue(true);
   returnedSubject = 'scoretech-subject';
+  emailClaims = { email: ' Person@Example.org ', email_verified: true };
+  users.hasScoretechEmailConflict.mockReset().mockResolvedValue(false);
+  userService.createScoretechProfile.mockReset().mockResolvedValue(account);
   beforeRefresh = undefined;
   vi.stubEnv('AUTH_PROVIDER', undefined);
   vi.stubEnv('SPACE_FRONTEND_URL', 'https://space.example/space/');
@@ -60,7 +65,7 @@ beforeEach(() => {
       return true;
     },
   };
-  mocks.resolve.mockImplementation(name => name === 'cacheService' ? cache : users);
+  mocks.resolve.mockImplementation(name => name === 'cacheService' ? cache : name === 'userService' ? userService : users);
   mocks.fetch.mockReset().mockImplementation(async (input: string | URL, options?: RequestInit) => {
     const url = String(input);
     if (url === issuer + '/.well-known/openid-configuration') return Response.json({
@@ -74,7 +79,7 @@ beforeEach(() => {
     if (url !== issuer + '/token') throw new Error('Unexpected token endpoint');
     const refresh = (options?.body as URLSearchParams).get('grant_type') === 'refresh_token';
     if (refresh) await beforeRefresh?.();
-    const idToken = await new SignJWT(refresh ? {} : { nonce })
+    const idToken = await new SignJWT(refresh ? {} : { nonce, ...emailClaims })
       .setProtectedHeader({ alg: 'RS256', kid: 'fixture' })
       .setIssuer(issuer).setSubject(returnedSubject).setAudience('space').setIssuedAt().setExpirationTime('5m')
       .sign(keys.privateKey);
@@ -87,6 +92,7 @@ afterEach(() => vi.unstubAllEnvs());
 
 async function flow(link?: { session: string; password: string }) {
   const authorization = new URL(await service.start(browser, link));
+  expect(authorization.searchParams.get('scope')).toBe('openid email');
   if (link) expect(authorization.searchParams.get('prompt')).toBe('login');
   nonce = authorization.searchParams.get('nonce')!;
   return { state: authorization.searchParams.get('state'), code: 'test-code' };
@@ -108,6 +114,7 @@ describe('SCORETech Identity in SPACE', () => {
   });
 
   it('binds the single-use flow to the browser and uses the exact issuer and subject link', async () => {
+    emailClaims = {};
     const query = await flow();
     await expect(service.callback(query, 'b'.repeat(64))).rejects.toMatchObject({ reason: 'invalid' });
     const session = await service.callback(query, browser);
@@ -116,11 +123,40 @@ describe('SCORETech Identity in SPACE', () => {
     await expect(service.callback(query, browser)).rejects.toMatchObject({ reason: 'invalid' });
   });
 
-  it('does not create a session for a valid but unlinked account', async () => {
+  it('provisions on first sign-in with a normalized verified email and reuses the profile next time', async () => {
+    users.findByScoretechIdentity.mockResolvedValueOnce(null);
+    const first = await service.callback(await flow(), browser);
+    expect(userService.createScoretechProfile).toHaveBeenCalledWith(issuer, returnedSubject, 'person@example.org');
+    expect(await service.authenticate(first.id)).toEqual(account);
+    await service.callback(await flow(), browser);
+    expect(userService.createScoretechProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a matching email without signing in to or modifying the existing account', async () => {
     users.findByScoretechIdentity.mockResolvedValue(null);
-    await expect(service.callback(await flow(), browser)).rejects.toMatchObject({ reason: 'unlinked' });
+    users.hasScoretechEmailConflict.mockResolvedValue(true);
+    await expect(service.callback(await flow(), browser)).rejects.toMatchObject({ reason: 'conflict' });
+    expect(userService.createScoretechProfile).not.toHaveBeenCalled();
+    expect(users.linkScoretechIdentity).not.toHaveBeenCalled();
     expect(entries.size).toBe(0);
   });
+
+  it('reports an email claimed by another callback during profile creation as a conflict', async () => {
+    users.findByScoretechIdentity.mockResolvedValue(null);
+    userService.createScoretechProfile.mockRejectedValueOnce({ code: 11000, keyPattern: { scoretechEmail: 1 } });
+    await expect(service.callback(await flow(), browser)).rejects.toMatchObject({ reason: 'conflict' });
+    expect(entries.size).toBe(0);
+  });
+
+  it.each([{}, { email: 'person@example.org', email_verified: false }])(
+    'requires a verified email before provisioning a profile (%j)', async claims => {
+      emailClaims = claims;
+      users.findByScoretechIdentity.mockResolvedValue(null);
+      await expect(service.callback(await flow(), browser)).rejects.toMatchObject({ reason: 'email_required' });
+      expect(userService.createScoretechProfile).not.toHaveBeenCalled();
+      expect(entries.size).toBe(0);
+    },
+  );
 
   it('rejects renewal when the provider returns a different subject', async () => {
     const { id } = await service.callback(await flow(), browser);
@@ -155,7 +191,7 @@ describe('SCORETech Identity in SPACE', () => {
     const query = await flow({ session: legacy.id, password: 'valid-password' });
     users.findByScoretechIdentity.mockResolvedValueOnce(null);
     const result = await service.callback(query, browser, legacy.id);
-    expect(users.linkScoretechIdentity).toHaveBeenCalledWith(account.id, legacyAccount.passwordHash, issuer, returnedSubject);
+    expect(users.linkScoretechIdentity).toHaveBeenCalledWith(account.id, legacyAccount.passwordHash, issuer, returnedSubject, 'person@example.org');
     expect(result.linked).toBe(true);
     expect(await service.connection(result.id)).toEqual({ linked: true, canLink: false });
     users.legacyPasswordAccount.mockResolvedValue(null);
@@ -173,6 +209,17 @@ describe('SCORETech Identity in SPACE', () => {
     users.findByScoretechIdentity.mockResolvedValueOnce(null);
     users.linkScoretechIdentity.mockRejectedValueOnce({ code: 11000 });
     await expect(service.callback(second, browser, legacy.id)).rejects.toMatchObject({ reason: 'conflict', linking: true });
+    expect(await service.authenticate(legacy.id)).toEqual(account);
+  });
+
+  it('keeps the legacy session when the verified email belongs to another profile', async () => {
+    const legacy = await service.legacyLogin(account.username, 'valid-password');
+    const query = await flow({ session: legacy.id, password: 'valid-password' });
+    users.findByScoretechIdentity.mockResolvedValueOnce(null);
+    users.hasScoretechEmailConflict.mockResolvedValueOnce(true);
+    await expect(service.callback(query, browser, legacy.id)).rejects.toMatchObject({ reason: 'conflict', linking: true });
+    expect(users.hasScoretechEmailConflict).toHaveBeenCalledWith('person@example.org', account.id);
+    expect(users.linkScoretechIdentity).not.toHaveBeenCalled();
     expect(await service.authenticate(legacy.id)).toEqual(account);
   });
 

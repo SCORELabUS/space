@@ -3,6 +3,7 @@ import { startIdentitySignIn } from '@/api/auth/identityApi';
 import FormError from '@/components/FormError';
 
 const messages: Record<string, string> = {
+  email_required: 'Verify your email in SCORETech Identity, then try signing in again.',
   invalid: 'Sign-in could not be verified. Please try again.',
   unavailable: 'SCORETech Identity is temporarily unavailable. Please try again.',
 };
@@ -10,10 +11,10 @@ const messages: Record<string, string> = {
 export default function ScoretechSignIn({ allowLegacy }: { allowLegacy: boolean }) {
   const [error, setError] = useState(() => {
     const code = new URLSearchParams(window.location.search).get('identityError');
-    if (code === 'unlinked') {
+    if (code === 'conflict') {
       return allowLegacy
-        ? 'This SCORETech Identity account is not linked to SPACE. Sign in with your SPACE password and connect your identity in Settings, or contact your SPACE administrator.'
-        : 'This SCORETech Identity account is not linked to SPACE. Contact your SPACE administrator.';
+        ? 'A SPACE account already uses this email. Sign in with your existing SPACE password and connect SCORETech Identity in Settings, or contact your SPACE administrator.'
+        : 'A SPACE account already uses this email. Contact your SPACE administrator to connect it.';
     }
     return code && Object.prototype.hasOwnProperty.call(messages, code) ? messages[code] : '';
   });

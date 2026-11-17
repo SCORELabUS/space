@@ -8,8 +8,9 @@ so the same frontend build works with either mode.
 In SCORETech Identity, register a confidential backend application for SPACE
 with the authorization code flow and S256 PKCE. Set its exact callback to
 `https://space.example.com/api/v1/auth/identity/callback` and configure any
-application access requirements there. SPACE assigns its own roles and
-organization permissions.
+application access requirements there. Include the OIDC `email` client scope
+with `email` and `email_verified` in the ID token. SPACE assigns its own roles
+and organization permissions.
 
 ## Production Compose
 
@@ -61,7 +62,22 @@ then sign in through SCORETech and confirm the account and organizations
 are the same. Confirm that the public `/api/v1/auth/config` (with any path
 prefix) reports `provider: scoretech`.
 
-## Existing accounts
+## First sign-in and existing accounts
+
+In SCORETech mode, users sign in and register through SCORETech Identity.
+After a successful first sign-in with a verified email, SPACE creates its
+internal profile and default organization. The profile has a generated
+username and no SPACE password. SPACE keeps the email private.
+
+SPACE checks for existing profiles by their stored SCORETech email or by a
+legacy username that matches the email, ignoring case. For legacy accounts
+with a non-email username, connect SCORETech Identity before using the main
+sign-in button. If someone already signed in with SCORETech and got a second
+profile, contact a SPACE administrator before proceeding.
+
+The SPACE user directory, roles and organization permissions are still
+managed in SPACE. Creating and deleting local accounts and changing local
+credentials are available only in local mode.
 
 The main button signs in directly with SCORETech Identity. An existing
 account with a local password can choose **Use an existing SPACE password**.

@@ -15,6 +15,13 @@ export const scoretechIdentityIndexOptions = {
   partialFilterExpression: { 'scoretechIdentity.issuer': { $type: 'string' }, 'scoretechIdentity.subject': { $type: 'string' } },
 };
 
+export const scoretechEmailIndex = { scoretechEmail: 1 } as const;
+export const scoretechEmailIndexOptions = {
+  name: 'unique_scoretech_email',
+  unique: true,
+  partialFilterExpression: { scoretechEmail: { $type: 'string' } },
+};
+
 const userSchema = new Schema({
   username: {
     type: String,
@@ -31,6 +38,7 @@ const userSchema = new Schema({
     select: false,
   },
   scoretechIdentity: { type: identitySchema, select: false },
+  scoretechEmail: { type: String, select: false },
   apiKey: {
     type: String,
     unique: true,
@@ -51,6 +59,7 @@ const userSchema = new Schema({
       delete resultObject.password;
       delete resultObject.sphereIdentity;
       delete resultObject.scoretechIdentity;
+      delete resultObject.scoretechEmail;
       return resultObject;
     }
   }
@@ -62,6 +71,7 @@ userSchema.index({ 'sphereIdentity.issuer': 1, 'sphereIdentity.subject': 1 }, {
 });
 
 userSchema.index(scoretechIdentityIndex, scoretechIdentityIndexOptions);
+userSchema.index(scoretechEmailIndex, scoretechEmailIndexOptions);
 
 // Verify password method
 userSchema.methods.verifyPassword = async function(password: string) {
@@ -91,6 +101,7 @@ export interface UserDocument extends Document {
   password?: string;
   sphereIdentity?: { issuer: string; subject: string };
   scoretechIdentity?: { issuer: string; subject: string };
+  scoretechEmail?: string;
   apiKey: string;
   role: UserRole;
   verifyPassword: (password: string) => Promise<boolean>;

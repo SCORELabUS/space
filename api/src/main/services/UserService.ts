@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import container from '../config/container';
 import { authProvider } from './identity/config';
 import UserRepository from '../repositories/mongoose/UserRepository';
@@ -59,7 +60,25 @@ class UserService {
   }
 
   async createFederated(username: string, issuer: string, subject: string) {
-    const user = await this.userRepository.create({ username, sphereIdentity: { issuer, subject }, role: 'USER' });
+    return this.createFederatedProfile({ username, sphereIdentity: { issuer, subject } });
+  }
+
+  async createScoretechProfile(issuer: string, subject: string, email: string) {
+    // Usernames are visible in the directory. Keep the provider email private.
+    return this.createFederatedProfile({
+      username: 'scoretech-' + randomBytes(10).toString('hex'),
+      scoretechIdentity: { issuer, subject },
+      scoretechEmail: email,
+    });
+  }
+
+  private async createFederatedProfile(profile: {
+    username: string;
+    sphereIdentity?: { issuer: string; subject: string };
+    scoretechIdentity?: { issuer: string; subject: string };
+    scoretechEmail?: string;
+  }) {
+    const user = await this.userRepository.create({ ...profile, role: 'USER' });
     try {
       await this.organizationService.create({ name: `${user.username}'s Organization`, owner: user.username, default: true }, user);
     } catch (error) {
@@ -70,6 +89,9 @@ class UserService {
   }
 
   async create(userData: any, creatorData: LeanUser) {
+    if (authProvider() === 'scoretech') {
+      throw new Error('PERMISSION ERROR: User registration is managed by SCORETech Identity.');
+    }
     // Federated identities are server-managed and cannot be set through generic user writes.
     userData = { username: userData.username, password: userData.password, role: userData.role };
 
@@ -100,8 +122,13 @@ class UserService {
 
   async update(username: string, userData: any, creatorData: LeanUser) {
     userData = Object.fromEntries(Object.entries(userData).filter(([key]) => ['username', 'password', 'role'].includes(key)));
-    if (authProvider() === 'scoretech' && creatorData?.role !== 'ADMIN' && creatorData?.username !== username) {
-      throw new Error('PERMISSION ERROR: Only admins can update other accounts.');
+    if (authProvider() === 'scoretech') {
+      if ('username' in userData || 'password' in userData) {
+        throw new Error('PERMISSION ERROR: Sign-in credentials are managed by SCORETech Identity.');
+      }
+      if (creatorData?.role !== 'ADMIN') {
+        throw new Error('PERMISSION ERROR: Only admins can change SPACE roles.');
+      }
     }
 
     
@@ -210,6 +237,9 @@ class UserService {
   }
 
   async destroy(username: string, reqUser: LeanUser) {
+    if (authProvider() === 'scoretech') {
+      throw new Error('PERMISSION ERROR: User accounts are managed by SCORETech Identity.');
+    }
     // Comprobar si el usuario a eliminar es admin
     const user = await this.userRepository.findByUsername(username);
     if (!user) {

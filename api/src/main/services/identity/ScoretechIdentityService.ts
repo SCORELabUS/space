@@ -43,7 +43,7 @@ interface Metadata {
 
 export class IdentityError extends Error {
   constructor(
-    readonly reason: 'invalid' | 'unlinked' | 'unavailable' | 'conflict',
+    readonly reason: 'invalid' | 'email_required' | 'unavailable' | 'conflict',
     readonly linking = false,
   ) {
     super(reason);
@@ -104,7 +104,7 @@ export class ScoretechIdentityService {
     await this.cache.set(namespace + 'flow:' + state, flow, FLOW_TTL);
     const url = new URL(metadata.authorization_endpoint);
     url.search = new URLSearchParams({
-      client_id: config.clientId, redirect_uri: config.callback, response_type: 'code', scope: 'openid',
+      client_id: config.clientId, redirect_uri: config.callback, response_type: 'code', scope: 'openid email',
       state, nonce: flow.nonce, code_challenge_method: 'S256',
       code_challenge: createHash('sha256').update(flow.verifier).digest('base64url'),
     }).toString();
@@ -144,8 +144,12 @@ export class ScoretechIdentityService {
       (Array.isArray(payload.aud) && payload.aud.length > 1 && payload.azp !== config.clientId)) {
       throw new IdentityError('invalid');
     }
+    const email = typeof payload.email === 'string' && payload.email_verified === true
+      ? payload.email.trim().toLowerCase()
+      : '';
     return {
       subject: payload.sub,
+      email: email.length <= 254 && /^[^\s@]+@[^\s@]+$/.test(email) ? email : undefined,
       refreshToken: tokens.refresh_token,
       verifiedUntil: Math.min(payload.exp! * 1000, Date.now() + 60_000),
     };
@@ -160,6 +164,7 @@ export class ScoretechIdentityService {
       throw new IdentityError('invalid');
     }
     const linking = Boolean(pending.link);
+    let refreshToken: string | undefined;
     try {
       if (query.error || typeof code !== 'string' || !code || code.length > 2048) throw new IdentityError('invalid');
       if (pending.link && (!current || digest(current) !== pending.link.sessionHash)) throw new IdentityError('invalid');
@@ -168,13 +173,18 @@ export class ScoretechIdentityService {
       const verified = await this.exchange({
         grant_type: 'authorization_code', code, code_verifier: pending.verifier, redirect_uri: config.callback,
       }, { nonce: pending.nonce });
+      refreshToken = verified.refreshToken;
       if (pending.link) {
         const account = await this.legacyAccount(current);
         if (account?.user.id !== pending.link.userId) throw new IdentityError('invalid');
         const existing = await this.users.findByScoretechIdentity(config.issuer, verified.subject);
         if (existing) throw new IdentityError('conflict');
+        if (!verified.email) throw new IdentityError('email_required');
+        if (await this.users.hasScoretechEmailConflict(verified.email, account.user.id)) {
+          throw new IdentityError('conflict');
+        }
         const linked = await this.users.linkScoretechIdentity(
-          account.user.id, account.passwordHash, config.issuer, verified.subject,
+          account.user.id, account.passwordHash, config.issuer, verified.subject, verified.email,
         ).catch((error: unknown) => {
           if (error && typeof error === 'object' && 'code' in error && error.code === 11000) throw new IdentityError('conflict');
           throw error;
@@ -183,22 +193,48 @@ export class ScoretechIdentityService {
         const session = await this.openIdentitySession(account.user, config.issuer, verified);
         return { ...session, linked: true };
       }
-      const account = await this.users.findByScoretechIdentity(config.issuer, verified.subject);
-      if (!account) {
-        await this.revoke(verified.refreshToken);
-        throw new IdentityError('unlinked');
-      }
+      const account = await this.signInProfile(config.issuer, verified.subject, verified.email);
       const session = await this.openIdentitySession(account, config.issuer, verified);
       return { ...session, linked: false };
     } catch (error) {
+      if (refreshToken) await this.revoke(refreshToken);
       if (linking) throw new IdentityError(error instanceof IdentityError ? error.reason : 'unavailable', true);
       throw error;
     }
   }
 
+  private async signInProfile(issuer: string, subject: string, email?: string) {
+    // Keep another callback from opening a session halfway through profile setup.
+    const key = namespace + 'profile:' + digest(JSON.stringify([issuer, subject]));
+    const owner = random();
+    if (!await this.cache.setIfAbsent(key, owner, 30)) throw new IdentityError('unavailable');
+    try {
+      const existing = await this.users.findByScoretechIdentity(issuer, subject);
+      if (existing) return existing;
+      if (!email) throw new IdentityError('email_required');
+      if (await this.users.hasScoretechEmailConflict(email)) throw new IdentityError('conflict');
+
+      try {
+        return await container.resolve('userService').createScoretechProfile(issuer, subject, email);
+      } catch (error) {
+        // A different identity can claim this email between the lookup and insert.
+        if (error && typeof error === 'object' && 'code' in error && error.code === 11000
+          && 'keyPattern' in error && (error.keyPattern as { scoretechEmail?: number } | undefined)?.scoretechEmail === 1) {
+          throw new IdentityError('conflict');
+        }
+        throw error;
+      }
+    } finally {
+      await this.cache.replaceIfCurrent(key, owner);
+    }
+  }
+
   private async openIdentitySession(account: LeanUser, issuer: string, verified: Pick<Session, 'subject' | 'refreshToken' | 'verifiedUntil'>) {
     const id = random();
-    const session: Session = { ...verified, issuer, userId: account.id, expiresAt: Date.now() + SESSION_TTL * 1000 };
+    const session: Session = {
+      subject: verified.subject, refreshToken: verified.refreshToken, verifiedUntil: verified.verifiedUntil,
+      issuer, userId: account.id, expiresAt: Date.now() + SESSION_TTL * 1000,
+    };
     await this.cache.set(this.sessionKey(id), session, SESSION_TTL);
     return { id, maxAge: SESSION_TTL * 1000 };
   }
@@ -270,7 +306,7 @@ export class ScoretechIdentityService {
       const verified = await this.exchange({
         grant_type: 'refresh_token', refresh_token: previous.refreshToken,
       }, { subject: previous.subject });
-      const session = { ...previous, ...verified };
+      const session = { ...previous, refreshToken: verified.refreshToken, verifiedUntil: verified.verifiedUntil };
       const seconds = Math.ceil((session.expiresAt - Date.now()) / 1000);
       if (seconds <= 0 || !await this.cache.replaceIfCurrent(key, previous, { value: session, seconds })) {
         await this.revoke(verified.refreshToken);

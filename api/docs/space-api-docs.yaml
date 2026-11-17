@@ -566,6 +566,11 @@ paths:
   /auth/identity/callback:
     get:
       summary: Exchange the SCORETech authorization code and open a SPACE browser session
+      description: |
+        A linked identity signs in using its existing SPACE profile. On first sign-in,
+        SPACE provisions a profile without a password using the verified SCORETech email.
+        If that email is already associated with a SPACE account, the callback redirects
+        with identityError=conflict. An email match never links an account automatically.
       security: []
       parameters:
         - in: query
@@ -1333,7 +1338,7 @@ paths:
     post:
       summary: Create a new user
       description: |
-        Creates a new user account with the specified credentials and role.
+        Creates a new user account with the specified credentials and role. Available only in local authentication mode.
 
         **Authentication**: Public (with restrictions) or User API Key
 
@@ -1446,6 +1451,7 @@ paths:
       summary: Update user
       description: |
         Updates a user's information including username, password, and role.
+        In SCORETech mode only SPACE role changes are accepted.
 
         **Authentication**: User API Key
 
@@ -1490,7 +1496,7 @@ paths:
     delete:
       summary: Delete user
       description: |
-        Deletes a user account and handles organization ownership transfer/deletion.
+        Deletes a user account and handles organization ownership transfer/deletion. Available only in local authentication mode.
 
         **Authentication**: User API Key
 

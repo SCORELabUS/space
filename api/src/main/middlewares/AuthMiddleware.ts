@@ -168,8 +168,7 @@ const checkPermissions = async (req: Request, res: Response, next: NextFunction)
     }
 
     // Allow public routes without authentication
-    const managedRegistration = authProvider() === 'scoretech' && method === 'POST' && matchPath('/users', apiPath);
-    if (matchingRule.isPublic && !managedRegistration) {
+    if (matchingRule.isPublic) {
       return next();
     }
 
@@ -194,11 +193,6 @@ const checkPermissions = async (req: Request, res: Response, next: NextFunction)
           return res.status(503).json({ error: 'SPACE cannot verify your session right now' });
         }
       }
-    }
-
-    if (managedRegistration) {
-      if (req.authType === 'user' && req.user) return next();
-      return res.status(403).json({ error: 'Local registration is disabled' });
     }
 
     // Protected route - require authentication
