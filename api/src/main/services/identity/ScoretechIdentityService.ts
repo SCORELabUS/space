@@ -3,6 +3,7 @@ import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
 import container from '../../config/container';
 import { fetchWithOptionalProxy } from '../../utils/proxy';
 import { identityConfig } from './config';
+import { scoretechAlias } from './scoretechAlias';
 import type { LeanUser } from '../../types/models/User';
 import type UserRepository from '../../repositories/mongoose/UserRepository';
 
@@ -24,6 +25,8 @@ interface Session {
   issuer: string;
   subject: string;
   refreshToken: string;
+  displayName?: string;
+  identityAlias?: string;
   verifiedUntil: number;
   expiresAt: number;
 }
@@ -104,7 +107,7 @@ export class ScoretechIdentityService {
     await this.cache.set(namespace + 'flow:' + state, flow, FLOW_TTL);
     const url = new URL(metadata.authorization_endpoint);
     url.search = new URLSearchParams({
-      client_id: config.clientId, redirect_uri: config.callback, response_type: 'code', scope: 'openid email',
+      client_id: config.clientId, redirect_uri: config.callback, response_type: 'code', scope: 'openid email profile',
       state, nonce: flow.nonce, code_challenge_method: 'S256',
       code_challenge: createHash('sha256').update(flow.verifier).digest('base64url'),
     }).toString();
@@ -147,9 +150,14 @@ export class ScoretechIdentityService {
     const email = typeof payload.email === 'string' && payload.email_verified === true
       ? payload.email.trim().toLowerCase()
       : '';
+    const verifiedEmail = email.length <= 254 && /^[^\s@]+@[^\s@]+$/.test(email) ? email : undefined;
+    const displayName = [payload.scoretech_display_name, payload.name]
+      .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
     return {
       subject: payload.sub,
-      email: email.length <= 254 && /^[^\s@]+@[^\s@]+$/.test(email) ? email : undefined,
+      email: verifiedEmail,
+      identityAlias: verifiedEmail ? scoretechAlias(verifiedEmail) : undefined,
+      displayName: displayName?.trim().slice(0, 100),
       refreshToken: tokens.refresh_token,
       verifiedUntil: Math.min(payload.exp! * 1000, Date.now() + 60_000),
     };
@@ -229,13 +237,25 @@ export class ScoretechIdentityService {
     }
   }
 
-  private async openIdentitySession(account: LeanUser, issuer: string, verified: Pick<Session, 'subject' | 'refreshToken' | 'verifiedUntil'>) {
+  private async syncUsername(session: Session, verified: { email?: string; identityAlias?: string }) {
+    if (!verified.email || !verified.identityAlias) return;
+    try {
+      await this.users.syncScoretechUsername(session.userId, session.issuer, session.subject, verified.email, verified.identityAlias);
+    } catch {
+      // The verified session can still show its username; retry the directory update on renewal.
+      console.warn('Could not synchronize the SCORETech username in the SPACE directory.');
+    }
+  }
+
+  private async openIdentitySession(account: LeanUser, issuer: string, verified: Awaited<ReturnType<ScoretechIdentityService['exchange']>>) {
     const id = random();
     const session: Session = {
       subject: verified.subject, refreshToken: verified.refreshToken, verifiedUntil: verified.verifiedUntil,
+      displayName: verified.displayName, identityAlias: verified.identityAlias,
       issuer, userId: account.id, expiresAt: Date.now() + SESSION_TTL * 1000,
     };
     await this.cache.set(this.sessionKey(id), session, SESSION_TTL);
+    await this.syncUsername(session, verified);
     return { id, maxAge: SESSION_TTL * 1000 };
   }
 
@@ -288,7 +308,12 @@ export class ScoretechIdentityService {
       if (!session) return null;
     }
     const account = await this.users.findByScoretechIdentity(session.issuer, session.subject);
-    return account?.id === session.userId ? account : null;
+    if (account?.id !== session.userId) return null;
+    return {
+      ...account,
+      displayName: session.displayName,
+      identityAlias: session.identityAlias ?? account.identityAlias,
+    };
   }
 
   private async refresh(key: string, previous: Session): Promise<Session | null> {
@@ -306,12 +331,19 @@ export class ScoretechIdentityService {
       const verified = await this.exchange({
         grant_type: 'refresh_token', refresh_token: previous.refreshToken,
       }, { subject: previous.subject });
-      const session = { ...previous, refreshToken: verified.refreshToken, verifiedUntil: verified.verifiedUntil };
+      const session = {
+        ...previous,
+        refreshToken: verified.refreshToken,
+        verifiedUntil: verified.verifiedUntil,
+        displayName: verified.displayName,
+        identityAlias: verified.identityAlias ?? previous.identityAlias,
+      };
       const seconds = Math.ceil((session.expiresAt - Date.now()) / 1000);
       if (seconds <= 0 || !await this.cache.replaceIfCurrent(key, previous, { value: session, seconds })) {
         await this.revoke(verified.refreshToken);
         return null;
       }
+      await this.syncUsername(session, verified);
       return session;
     } catch (error) {
       if (error instanceof IdentityError && error.reason === 'invalid') {

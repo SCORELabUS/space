@@ -58,7 +58,12 @@ class UserController {
       }
 
       const user = await this.userService.findByUsername(req.user.username, req.user);
-      res.json({ username: user.username, role: user.role });
+      res.json({
+        username: user.username,
+        role: user.role,
+        displayName: req.user.displayName,
+        identityAlias: req.user.identityAlias,
+      });
     } catch (err: any) {
       res.status(500).send({ error: err.message });
     }

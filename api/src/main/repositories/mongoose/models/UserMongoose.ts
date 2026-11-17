@@ -39,6 +39,7 @@ const userSchema = new Schema({
   },
   scoretechIdentity: { type: identitySchema, select: false },
   scoretechEmail: { type: String, select: false },
+  identityAlias: { type: String },
   apiKey: {
     type: String,
     unique: true,
@@ -102,6 +103,7 @@ export interface UserDocument extends Document {
   sphereIdentity?: { issuer: string; subject: string };
   scoretechIdentity?: { issuer: string; subject: string };
   scoretechEmail?: string;
+  identityAlias?: string;
   apiKey: string;
   role: UserRole;
   verifyPassword: (password: string) => Promise<boolean>;

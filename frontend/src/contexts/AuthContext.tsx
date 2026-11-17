@@ -9,6 +9,8 @@ export interface UserData {
   username: string;
   apiKey: string;
   role: string;
+  displayName?: string;
+  identityAlias?: string;
 }
 
 export interface AuthContextType {
@@ -97,6 +99,43 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     void bootstrap();
     return () => controller.abort();
   }, [retry]);
+
+  useEffect(() => {
+    if (!usesIdentity || !isAuthenticated) return;
+
+    const controller = new AbortController();
+    const { signal } = controller;
+    let pending = false;
+    async function refreshProfile() {
+      if (pending || document.visibilityState !== 'visible') return;
+      pending = true;
+      try {
+        const { data } = await axios.get<Omit<UserData, 'apiKey'>>('/users/me', {
+          withCredentials: true, timeout: 5000, signal,
+        });
+        if (signal.aborted) return;
+        setUser(current => {
+          if (current.username !== data.username) return current;
+          const { displayName, identityAlias } = data;
+          return current.displayName === displayName && current.identityAlias === identityAlias
+            ? current
+            : { ...current, displayName, identityAlias };
+        });
+      } catch {
+        // Keep the current profile during transient provider failures.
+      } finally {
+        pending = false;
+      }
+    }
+
+    window.addEventListener('focus', refreshProfile);
+    const interval = window.setInterval(refreshProfile, 60_000);
+    return () => {
+      controller.abort();
+      window.removeEventListener('focus', refreshProfile);
+      window.clearInterval(interval);
+    };
+  }, [usesIdentity, isAuthenticated]);
 
   // Load user role from API in development mode
   useEffect(() => {

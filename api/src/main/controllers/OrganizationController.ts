@@ -1,5 +1,6 @@
 import container from '../config/container.js';
 import OrganizationService from '../services/OrganizationService.js';
+import type { LeanOrganization } from '../types/models/Organization.js';
 
 class OrganizationController {
   private organizationService: OrganizationService;
@@ -16,6 +17,12 @@ class OrganizationController {
     this.removeApiKey = this.removeApiKey.bind(this);
     this.removeMember = this.removeMember.bind(this);
     this.delete = this.delete.bind(this);
+  }
+
+  private async organizationResponse(organization: LeanOrganization | null) {
+    if (!organization) return null;
+    const [response] = await this.organizationService.withIdentityAliases([organization]);
+    return response;
   }
 
   async getAll(req: any, res: any) {
@@ -54,7 +61,7 @@ class OrganizationController {
         const pages = Math.ceil(total / parsedLimit) || 1;
 
         return res.json({
-          data: organizations,
+          data: await this.organizationService.withIdentityAliases(organizations),
           pagination: {
             offset: parsedOffset,
             limit: parsedLimit,
@@ -66,7 +73,7 @@ class OrganizationController {
       } else {
         // Non-admin users see organizations where they are owner or member (no pagination for now)
         organizations = await this.organizationService.findByUser(req.user.username);
-        res.json({ data: organizations });
+        res.json({ data: await this.organizationService.withIdentityAliases(organizations) });
       }
     } catch (err: any) {
       if (err.message.includes('PERMISSION ERROR')) {
@@ -85,7 +92,7 @@ class OrganizationController {
         return res.status(404).send({ error: `Organization with ID ${organizationId} not found` });
       }
 
-      res.json(organization);
+      res.json(await this.organizationResponse(organization));
     } catch (err: any) {
       if (err.message.includes('PERMISSION ERROR')) {
         return res.status(403).send({ error: err.message });
@@ -98,7 +105,7 @@ class OrganizationController {
     try {
       const organizationData = req.body;
       const organization = await this.organizationService.create(organizationData, req.user);
-      res.status(201).json(organization);
+      res.status(201).json(await this.organizationResponse(organization));
     } catch (err: any) {
       if (err.message.includes('PERMISSION ERROR')) {
         return res.status(403).send({ error: err.message });
@@ -129,7 +136,7 @@ class OrganizationController {
       await this.organizationService.addMember(organizationId, { username, role }, req.user);
 
       const updatedOrganization = await this.organizationService.findById(organizationId);
-      res.json(updatedOrganization);
+      res.json(await this.organizationResponse(updatedOrganization));
     } catch (err: any) {
       if (err.message.includes('PERMISSION ERROR')) {
         return res.status(403).send({ error: err.message });
@@ -158,7 +165,7 @@ class OrganizationController {
       await this.organizationService.updateMemberRole(organizationId, username, role, req.user);
 
       const updatedOrganization = await this.organizationService.findById(organizationId);
-      res.json(updatedOrganization);
+      res.json(await this.organizationResponse(updatedOrganization));
     } catch (err: any) {
       if (err.message.includes('PERMISSION ERROR')) {
         return res.status(403).send({ error: err.message });
@@ -186,7 +193,7 @@ class OrganizationController {
       await this.organizationService.update(organizationId, updateData, req.user);
 
       const updatedOrganization = await this.organizationService.findById(organizationId);
-      res.json(updatedOrganization);
+      res.json(await this.organizationResponse(updatedOrganization));
     } catch (err: any) {
       if (err.message.includes('PERMISSION ERROR')) {
         return res.status(403).send({ error: err.message });
@@ -217,7 +224,7 @@ class OrganizationController {
       await this.organizationService.addApiKey(organizationId, scope, req.user);
       const updatedOrganization = await this.organizationService.findById(organizationId);
 
-      res.json(updatedOrganization);
+      res.json(await this.organizationResponse(updatedOrganization));
     } catch (err: any) {
       if (err.message.includes('PERMISSION ERROR')) {
         return res.status(403).send({ error: err.message });
@@ -244,7 +251,7 @@ class OrganizationController {
       await this.organizationService.removeApiKey(organizationId, apiKey, req.user);
       const updatedOrganization = await this.organizationService.findById(organizationId);
 
-      return res.json(updatedOrganization);
+      return res.json(await this.organizationResponse(updatedOrganization));
     } catch (err: any) {
       if (err.message.includes('PERMISSION ERROR')) {
         return res.status(403).send({ error: err.message });
@@ -286,7 +293,7 @@ class OrganizationController {
       await this.organizationService.removeMember(organizationId, username, req.user);
       const updatedOrganization = await this.organizationService.findById(organizationId);
 
-      res.json(updatedOrganization);
+      res.json(await this.organizationResponse(updatedOrganization));
     } catch (err: any) {
       if (err.message.includes('PERMISSION ERROR')) {
         return res.status(403).send({ error: err.message });

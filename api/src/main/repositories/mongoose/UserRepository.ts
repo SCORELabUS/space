@@ -20,6 +20,29 @@ class UserRepository extends RepositoryBase {
     return user ? user.toObject({ virtuals: true }) as unknown as LeanUser : null;
   }
 
+  async syncScoretechUsername(userId: string, issuer: string, subject: string, email: string, identityAlias: string) {
+    const identity = { _id: userId, 'scoretechIdentity.issuer': issuer, 'scoretechIdentity.subject': subject };
+    try {
+      await UserMongoose.updateOne({
+        ...identity,
+        $or: [{ scoretechEmail: { $ne: email } }, { identityAlias: { $ne: identityAlias } }],
+      }, { $set: { scoretechEmail: email, identityAlias } });
+    } catch (error) {
+      if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 11000
+        || !('keyPattern' in error) || (error.keyPattern as { scoretechEmail?: number } | undefined)?.scoretechEmail !== 1) {
+        throw error;
+      }
+      // A changed email never transfers a binding from another SPACE account.
+      await UserMongoose.updateOne({ ...identity, identityAlias: { $ne: identityAlias } }, { $set: { identityAlias } });
+    }
+  }
+
+  async findIdentityAliases(usernames: string[]) {
+    const users = await UserMongoose.find({ username: { $in: usernames }, identityAlias: { $type: 'string' } })
+      .select('username identityAlias -_id').lean();
+    return new Map(users.map(user => [user.username, user.identityAlias]));
+  }
+
   async legacyPasswordAccount(query: { username: string } | { _id: string }, password?: string) {
     const document = await UserMongoose.findOne({
       ...query, scoretechIdentity: { $exists: false }, password: { $type: 'string' },
@@ -73,18 +96,24 @@ class UserRepository extends RepositoryBase {
     }
   }
 
-  async find(username: string, limit: number = 10, offset: number = 0): Promise<LeanUser[]> {
+  private searchFilter(query: string, includeAliases: boolean) {
+    const match = { $regex: query, $options: 'i' };
+    return includeAliases ? { $or: [{ username: match }, { identityAlias: match }] } : { username: match };
+  }
+
+  async find(username: string, limit: number = 10, offset: number = 0, includeAliases = false): Promise<LeanUser[]> {
     try {
-      const users = await UserMongoose.find({ username: { $regex: username, $options: 'i' } }).select({ password: 0 }).skip(offset).limit(limit).exec();
+      const users = await UserMongoose.find(this.searchFilter(username, includeAliases))
+        .select(includeAliases ? '-password' : '-password -identityAlias').skip(offset).limit(limit).exec();
       return users.map(user => user.toObject({ getters: true, virtuals: true, versionKey: false }) as unknown as LeanUser);
     } catch (err) {
       return [];
     }
   }
 
-  async count(query: string = '') {
+  async count(query: string = '', includeAliases = false) {
     try {
-      return await UserMongoose.countDocuments({ username: { $regex: query, $options: 'i' } });
+      return await UserMongoose.countDocuments(this.searchFilter(query, includeAliases));
     } catch (err) {
       return 0;
     }

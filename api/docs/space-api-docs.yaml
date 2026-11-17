@@ -1204,7 +1204,7 @@ paths:
         **Two modes of operation**:
         
         1. **Search Mode** (when `q` parameter is provided):
-           - Searches for users whose usernames match (case-insensitive regex)
+           - Searches for users whose usernames match (case-insensitive regex). In SCORETech mode, also searches their current identity aliases.
            - Returns a paginated list of matching users
            - Optimized for autocomplete and user lookup
            - `offset` and `limit` apply to search results, not the full user database
@@ -1406,6 +1406,12 @@ paths:
                     $ref: '#/components/schemas/Username'
                   role:
                     $ref: '#/components/schemas/Role'
+                  displayName:
+                    type: string
+                    description: Current shared display name for a SCORETech browser session, when provided.
+                  identityAlias:
+                    type: string
+                    description: Current username from the verified SCORETech sign-in email. The username field remains the stable SPACE account reference.
         '401':
           description: Unauthorized or missing API key
 
@@ -5902,6 +5908,9 @@ components:
     User:
       type: object
       properties:
+        identityAlias:
+          type: string
+          description: Current SCORETech username where available. Use username for existing SPACE API account references.
         username:
           $ref: '#/components/schemas/Username'
         apiKey:
@@ -5924,6 +5933,9 @@ components:
         owner:
           type: string
           example: john_doe
+        ownerAlias:
+          type: string
+          description: Current SCORETech username of the owner, when available.
         default:
           type: boolean
           example: false
@@ -5934,6 +5946,9 @@ components:
             properties:
               username:
                 type: string
+              identityAlias:
+                type: string
+                description: Current SCORETech username of the member, when available.
               role:
                 type: string
                 enum: [OWNER, ADMIN, MANAGER, EVALUATOR]

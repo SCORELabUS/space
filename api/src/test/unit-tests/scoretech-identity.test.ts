@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 import { authProvider, identityConfig } from '../../main/services/identity/config';
+import { scoretechAlias } from '../../main/services/identity/scoretechAlias';
 import { ScoretechIdentityService } from '../../main/services/identity/ScoretechIdentityService';
 
 const mocks = vi.hoisted(() => ({ resolve: vi.fn(), fetch: vi.fn() }));
@@ -10,7 +11,7 @@ vi.mock('../../main/utils/proxy', () => ({ fetchWithOptionalProxy: mocks.fetch }
 const issuer = 'https://identity.example/identity/auth/realms/score';
 const browser = 'a'.repeat(64);
 const account = { id: 'local-id', username: 'local-name', role: 'USER' };
-const users = { findByScoretechIdentity: vi.fn(), legacyPasswordAccount: vi.fn(), linkScoretechIdentity: vi.fn(), hasScoretechEmailConflict: vi.fn() };
+const users = { findByScoretechIdentity: vi.fn(), legacyPasswordAccount: vi.fn(), linkScoretechIdentity: vi.fn(), hasScoretechEmailConflict: vi.fn(), syncScoretechUsername: vi.fn() };
 const userService = { createScoretechProfile: vi.fn() };
 const legacyAccount = { user: account, passwordHash: 'fixture-password-hash' };
 const entries = new Map<string, unknown>();
@@ -19,6 +20,7 @@ let service: ScoretechIdentityService;
 let nonce: string;
 let returnedSubject: string;
 let emailClaims: Record<string, unknown>;
+let profileClaims: Record<string, unknown>;
 let beforeRefresh: (() => Promise<void>) | undefined;
 
 beforeAll(async () => {
@@ -34,8 +36,10 @@ beforeEach(() => {
   returnedSubject = 'scoretech-subject';
   emailClaims = { email: ' Person@Example.org ', email_verified: true };
   users.hasScoretechEmailConflict.mockReset().mockResolvedValue(false);
+  users.syncScoretechUsername.mockReset().mockResolvedValue(undefined);
   userService.createScoretechProfile.mockReset().mockResolvedValue(account);
   beforeRefresh = undefined;
+  profileClaims = {};
   vi.stubEnv('AUTH_PROVIDER', undefined);
   vi.stubEnv('SPACE_FRONTEND_URL', 'https://space.example/space/');
   vi.stubEnv('SCORETECH_IDENTITY_ISSUER', issuer);
@@ -79,7 +83,7 @@ beforeEach(() => {
     if (url !== issuer + '/token') throw new Error('Unexpected token endpoint');
     const refresh = (options?.body as URLSearchParams).get('grant_type') === 'refresh_token';
     if (refresh) await beforeRefresh?.();
-    const idToken = await new SignJWT(refresh ? {} : { nonce, ...emailClaims })
+    const idToken = await new SignJWT({ ...emailClaims, ...profileClaims, ...(refresh ? {} : { nonce }) })
       .setProtectedHeader({ alg: 'RS256', kid: 'fixture' })
       .setIssuer(issuer).setSubject(returnedSubject).setAudience('space').setIssuedAt().setExpirationTime('5m')
       .sign(keys.privateKey);
@@ -92,7 +96,7 @@ afterEach(() => vi.unstubAllEnvs());
 
 async function flow(link?: { session: string; password: string }) {
   const authorization = new URL(await service.start(browser, link));
-  expect(authorization.searchParams.get('scope')).toBe('openid email');
+  expect(authorization.searchParams.get('scope')).toBe('openid email profile');
   if (link) expect(authorization.searchParams.get('prompt')).toBe('login');
   nonce = authorization.searchParams.get('nonce')!;
   return { state: authorization.searchParams.get('state'), code: 'test-code' };
@@ -127,9 +131,50 @@ describe('SCORETech Identity in SPACE', () => {
     users.findByScoretechIdentity.mockResolvedValueOnce(null);
     const first = await service.callback(await flow(), browser);
     expect(userService.createScoretechProfile).toHaveBeenCalledWith(issuer, returnedSubject, 'person@example.org');
-    expect(await service.authenticate(first.id)).toEqual(account);
+    expect(await service.authenticate(first.id)).toEqual({ ...account, identityAlias: 'person' });
     await service.callback(await flow(), browser);
     expect(userService.createScoretechProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it('synchronizes the current verified username for an existing account without changing its stable reference', async () => {
+    const { id } = await service.callback(await flow(), browser);
+    expect(await service.authenticate(id)).toMatchObject({ ...account, identityAlias: 'person' });
+    expect(users.syncScoretechUsername).toHaveBeenLastCalledWith(account.id, issuer, returnedSubject, 'person@example.org', 'person');
+
+    expireVerification();
+    emailClaims = { email: 'new-name@example.org', email_verified: false };
+    expect(await service.authenticate(id)).toMatchObject({ ...account, identityAlias: 'person' });
+    expect(users.syncScoretechUsername).toHaveBeenCalledTimes(1);
+
+    expireVerification();
+    emailClaims.email_verified = true;
+    expect(await service.authenticate(id)).toMatchObject({ ...account, identityAlias: 'new-name' });
+    expect(users.syncScoretechUsername).toHaveBeenLastCalledWith(account.id, issuer, returnedSubject, 'new-name@example.org', 'new-name');
+    expect(userService.createScoretechProfile).not.toHaveBeenCalled();
+    expect(users.linkScoretechIdentity).not.toHaveBeenCalled();
+  });
+
+  it('refreshes the display name without renaming a previously generated account', async () => {
+    const existing = { ...account, username: 'scoretech-1234567890abcdef1234' };
+    users.findByScoretechIdentity.mockResolvedValue(existing);
+    profileClaims = { scoretech_display_name: 'First name', name: 'Fallback name' };
+    const { id } = await service.callback(await flow(), browser);
+    expect(await service.authenticate(id)).toEqual({ ...existing, displayName: 'First name', identityAlias: 'person' });
+
+    expireVerification();
+    profileClaims.scoretech_display_name = 'New name';
+    expect(await service.authenticate(id)).toEqual({ ...existing, displayName: 'New name', identityAlias: 'person' });
+
+    expireVerification();
+    profileClaims.scoretech_display_name = '';
+    expect(await service.authenticate(id)).toEqual({ ...existing, displayName: 'Fallback name', identityAlias: 'person' });
+  });
+
+  it('derives a bounded handle from the local part of the email', () => {
+    expect(scoretechAlias('Alejandro.Prueba@example.org')).toBe('alejandro.prueba');
+    expect(scoretechAlias('ana+tag@example.org')).toBe('ana-tag');
+    expect(scoretechAlias('a@example.org')).toBe('scoretech-a');
+    expect(scoretechAlias('x'.repeat(50) + '@example.org')).toHaveLength(30);
   });
 
   it('refuses a matching email without signing in to or modifying the existing account', async () => {

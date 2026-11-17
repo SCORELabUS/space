@@ -199,7 +199,9 @@ export default function UsersList({
                 {/* Editable username */}
                 <td className="px-4 py-3">
                   {!localAccounts ? (
-                    <span className="font-mono text-sm text-indigo-800 dark:text-white">{u.username}</span>
+                    <span title={u.username} className="font-mono text-sm text-indigo-800 dark:text-white">
+                      {u.identityAlias ?? u.username}
+                    </span>
                   ) : editing === u.username ? (
                     <div className="flex items-center gap-2">
                       <input

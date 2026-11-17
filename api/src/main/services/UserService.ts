@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { scoretechAlias } from './identity/scoretechAlias';
 import container from '../config/container';
 import { authProvider } from './identity/config';
 import UserRepository from '../repositories/mongoose/UserRepository';
@@ -34,13 +35,13 @@ class UserService {
 
   async getUsers(reqUser: LeanUser, query: string = '', limit: number = 10, offset: number = 0): Promise<LeanUser[]> {
     
-    const users = await this.userRepository.find(query.trim(), limit, offset);
+    const users = await this.userRepository.find(query.trim(), limit, offset, authProvider() === 'scoretech');
 
     return users.map(user => this.sanitizeUserForRequester(user, reqUser, user.username));
   }
 
   async countUsers(query: string = '') {
-    return this.userRepository.count(query.trim());
+    return this.userRepository.count(query.trim(), authProvider() === 'scoretech');
   }
 
   async findByUsername(username: string, reqUser: LeanUser): Promise<LeanUser> {
@@ -64,12 +65,18 @@ class UserService {
   }
 
   async createScoretechProfile(issuer: string, subject: string, email: string) {
-    // Usernames are visible in the directory. Keep the provider email private.
-    return this.createFederatedProfile({
-      username: 'scoretech-' + randomBytes(10).toString('hex'),
-      scoretechIdentity: { issuer, subject },
-      scoretechEmail: email,
-    });
+    const alias = scoretechAlias(email);
+    const profile = { scoretechIdentity: { issuer, subject }, scoretechEmail: email, identityAlias: alias };
+    try {
+      return await this.createFederatedProfile({ ...profile, username: alias });
+    } catch (error) {
+      if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 11000
+        || !('keyPattern' in error) || (error.keyPattern as { username?: number } | undefined)?.username !== 1) {
+        throw error;
+      }
+      const suffix = randomBytes(5).toString('hex');
+      return this.createFederatedProfile({ ...profile, username: alias.slice(0, 19) + '-' + suffix });
+    }
   }
 
   private async createFederatedProfile(profile: {
@@ -77,6 +84,7 @@ class UserService {
     sphereIdentity?: { issuer: string; subject: string };
     scoretechIdentity?: { issuer: string; subject: string };
     scoretechEmail?: string;
+    identityAlias?: string;
   }) {
     const user = await this.userRepository.create({ ...profile, role: 'USER' });
     try {
