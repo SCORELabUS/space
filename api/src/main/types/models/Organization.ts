@@ -4,6 +4,7 @@ export interface LeanOrganization {
   id?: string;
   name: string;
   owner: string;
+  ownerAlias?: string;
   default?: boolean;
   apiKeys: LeanApiKey[];
   members: OrganizationMember[];
@@ -25,5 +26,6 @@ export interface OrganizationFilter {
 
 export interface OrganizationMember {
   username: string;
+  identityAlias?: string;
   role: OrganizationUserRole;
 }

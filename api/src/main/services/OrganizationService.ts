@@ -11,6 +11,7 @@ import { generateOrganizationApiKey } from '../utils/users/helpers';
 import UserRepository from '../repositories/mongoose/UserRepository';
 import { validateOrganizationData } from './validation/OrganizationServiceValidations';
 import ServiceService from './ServiceService';
+import { authProvider } from './identity/config';
 
 class OrganizationService {
   private organizationRepository: OrganizationRepository;
@@ -26,6 +27,17 @@ class OrganizationService {
   async find(filters: OrganizationFilter, limit?: number, offset?: number): Promise<LeanOrganization[]> {
     const organizations = await this.organizationRepository.find(filters, limit, offset);
     return organizations;
+  }
+
+  async withIdentityAliases(organizations: LeanOrganization[]): Promise<LeanOrganization[]> {
+    if (!organizations.length || authProvider() !== 'scoretech') return organizations;
+    const usernames = [...new Set(organizations.flatMap(org => [org.owner, ...org.members.map(member => member.username)]))];
+    const aliases = await this.userRepository.findIdentityAliases(usernames);
+    return organizations.map(org => ({
+      ...org,
+      ownerAlias: aliases.get(org.owner),
+      members: org.members.map(member => ({ ...member, identityAlias: aliases.get(member.username) })),
+    }));
   }
 
   async count(filters: OrganizationFilter): Promise<number> {

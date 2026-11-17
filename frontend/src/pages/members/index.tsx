@@ -7,10 +7,12 @@ import { useCustomAlert } from '@/hooks/useCustomAlert';
 import { useCustomConfirm } from '@/hooks/useCustomConfirm';
 import { getOrganization, getOrganizations, addMember, removeMember, updateMemberRole, updateOrganization } from '@/api/organizations/organizationsApi';
 import { searchUsers } from '@/api/users/usersApi';
-import type { OrganizationMember } from '@/types/Organization';
+import type { Organization, OrganizationMember } from '@/types/Organization';
+import type { User } from '@/types/User';
 
-interface SelectedUser {
-  username: string;
+type DirectoryUser = Pick<User, 'username' | 'identityAlias'> & { role?: string };
+
+interface SelectedUser extends DirectoryUser {
   role: 'ADMIN' | 'MANAGER' | 'EVALUATOR';
 }
 
@@ -21,13 +23,13 @@ export default function MembersPage() {
   const { showConfirm, confirmElement } = useCustomConfirm();
 
   const [members, setMembers] = useState<OrganizationMember[]>([]);
-  const [owner, setOwner] = useState<string>('');
+  const [{ owner, ownerAlias }, setOwner] = useState<Pick<Organization, 'owner' | 'ownerAlias'>>({ owner: '' });
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [showAddModal, setShowAddModal] = useState(false);
   const [selectedUsers, setSelectedUsers] = useState<SelectedUser[]>([]);
   const [userSearchQuery, setUserSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<Array<{ username: string; role: string }>>([]);
+  const [searchResults, setSearchResults] = useState<DirectoryUser[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -115,7 +117,7 @@ export default function MembersPage() {
     try {
       const org = await getOrganization(user.apiKey, currentOrganization.id);
       setMembers(org.members || []);
-      setOwner(org.owner);
+      setOwner({ owner: org.owner, ownerAlias: org.ownerAlias });
     } catch (error: any) {
       showAlert('Error', error.message || 'Failed to load members');
     } finally {
@@ -193,7 +195,7 @@ export default function MembersPage() {
   const handleSelectUser = (username: string) => {
     const user = searchResults.find((u) => u.username === username);
     if (user && !selectedUsers.some((u) => u.username === username)) {
-      setSelectedUsers([...selectedUsers, { username: user.username, role: 'EVALUATOR' }]);
+      setSelectedUsers([...selectedUsers, { ...user, role: 'EVALUATOR' }]);
       setUserSearchQuery('');
       setSearchResults([]);
       setShowDropdown(false);
@@ -223,7 +225,7 @@ export default function MembersPage() {
     try {
       const updatedOrg = await removeMember(user.apiKey, currentOrganization.id, username);
       setMembers(updatedOrg.members || []);
-      setOwner(updatedOrg.owner);
+      setOwner({ owner: updatedOrg.owner, ownerAlias: updatedOrg.ownerAlias });
       showAlert('Member removed successfully', 'success');
     } catch (error: any) {
       showAlert(error.message || 'Failed to remove member', 'danger');
@@ -236,21 +238,24 @@ export default function MembersPage() {
     try {
       const updatedOrg = await updateMemberRole(user.apiKey, currentOrganization.id, username, newRole);
       setMembers(updatedOrg.members || []);
-      setOwner(updatedOrg.owner);
+      setOwner({ owner: updatedOrg.owner, ownerAlias: updatedOrg.ownerAlias });
       showAlert('Member role updated successfully', 'success');
     } catch (error: any) {
       showAlert(error.message || 'Failed to update member role', 'danger');
     }
   };
 
+  const memberName = (member: Pick<OrganizationMember, 'username' | 'identityAlias'>) =>
+    (member.username === user.username ? user.identityAlias : undefined) ?? member.identityAlias ?? member.username;
+  const memberQuery = searchTerm.toLowerCase();
   const filteredMembers = members.filter(member =>
-    member.username.toLowerCase().includes(searchTerm.toLowerCase())
+    memberName(member).toLowerCase().includes(memberQuery) || member.username.toLowerCase().includes(memberQuery)
   );
 
   // Build display list: owner first, then other members
   const displayMembers = owner
     ? [
-        { username: owner, role: 'OWNER' as const },
+        { username: owner, identityAlias: ownerAlias, role: 'OWNER' as const },
         ...filteredMembers
       ]
     : filteredMembers;
@@ -340,12 +345,12 @@ export default function MembersPage() {
           owner: nextOwner,
         });
         setMembers(transferredOrg.members || []);
-        setOwner(transferredOrg.owner);
+        setOwner({ owner: transferredOrg.owner, ownerAlias: transferredOrg.ownerAlias });
       }
 
       const updatedOrg = await removeMember(user.apiKey, currentOrganization.id, user.username);
       setMembers(updatedOrg.members || []);
-      setOwner(updatedOrg.owner);
+      setOwner({ owner: updatedOrg.owner, ownerAlias: updatedOrg.ownerAlias });
       await refreshOrganizations();
       showAlert('You left the organization successfully.', 'success');
     } catch (error: any) {
@@ -404,7 +409,7 @@ export default function MembersPage() {
       >
         <div className="flex items-center gap-2">
           <span className="text-sm font-semibold text-indigo-900 dark:text-indigo-300">Owner:</span>
-          <span className="text-sm text-indigo-700 dark:text-indigo-400">{owner}</span>
+          <span className="text-sm text-indigo-700 dark:text-indigo-400">{memberName({ username: owner, identityAlias: ownerAlias })}</span>
           <span className="ml-auto px-2 py-1 text-xs font-medium bg-indigo-200 text-indigo-900 dark:bg-indigo-800 dark:text-indigo-100 rounded">
             Full Control
           </span>
@@ -467,12 +472,12 @@ export default function MembersPage() {
                   <div className="flex items-center gap-4">
                     <div className="w-10 h-10 rounded-full bg-indigo-100 dark:bg-indigo-900/30 flex items-center justify-center">
                       <span className="text-indigo-600 dark:text-indigo-400 font-semibold">
-                        {member.username.charAt(0).toUpperCase()}
+                        {memberName(member).charAt(0).toUpperCase()}
                       </span>
                     </div>
                     <div>
                       <div className="font-medium text-gray-900 dark:text-gray-100">
-                        {member.username}
+                        {memberName(member)}
                       </div>
                       {canChangeRole(member.username, member.role) && member.role !== 'OWNER' ? (
                         <select
@@ -592,15 +597,15 @@ export default function MembersPage() {
                               >
                                 <div className="w-8 h-8 rounded-full bg-indigo-100 dark:bg-indigo-900/30 flex items-center justify-center flex-shrink-0">
                                   <span className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm">
-                                    {result.username.charAt(0).toUpperCase()}
+                                    {(result.identityAlias ?? result.username).charAt(0).toUpperCase()}
                                   </span>
                                 </div>
                                 <div>
                                   <div className="text-sm font-medium text-gray-900 dark:text-gray-100">
-                                    {result.username}
+                                    {result.identityAlias ?? result.username}
                                   </div>
                                   <div className="text-xs text-gray-500 dark:text-gray-400">
-                                    {result.role}
+                                    {result.identityAlias && result.identityAlias !== result.username ? result.username : result.role}
                                   </div>
                                 </div>
                               </button>
@@ -637,11 +642,11 @@ export default function MembersPage() {
                               <div className="flex items-center gap-2 flex-1">
                                 <div className="w-8 h-8 rounded-full bg-indigo-100 dark:bg-indigo-900/30 flex items-center justify-center flex-shrink-0">
                                   <span className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm">
-                                    {selectedUser.username.charAt(0).toUpperCase()}
+                                    {(selectedUser.identityAlias ?? selectedUser.username).charAt(0).toUpperCase()}
                                   </span>
                                 </div>
                                 <span className="text-sm font-medium text-gray-900 dark:text-gray-100 flex-shrink-0">
-                                  {selectedUser.username}
+                                  {selectedUser.identityAlias ?? selectedUser.username}
                                 </span>
                               </div>
                               <select

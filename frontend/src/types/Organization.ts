@@ -1,5 +1,6 @@
 export interface OrganizationMember {
   username: string;
+  identityAlias?: string;
   role: 'ADMIN' | 'MANAGER' | 'EVALUATOR';
 }
 
@@ -12,6 +13,7 @@ export interface Organization {
   id: string;
   name: string;
   owner: string;
+  ownerAlias?: string;
   default?: boolean;
   apiKeys: OrganizationApiKey[];
   members: OrganizationMember[];

@@ -188,7 +188,7 @@ export default function OrganizationsList({
                 </td>
                 {/* Owner */}
                 <td className="px-4 py-3">
-                  <span className="text-sm text-gray-700 dark:text-gray-300">{org.owner}</span>
+                  <span className="text-sm text-gray-700 dark:text-gray-300">{org.ownerAlias ?? org.owner}</span>
                 </td>
                 {/* Members dropdown */}
                 <td className="px-4 py-3">
@@ -224,7 +224,7 @@ export default function OrganizationsList({
                                   className="px-4 py-2 hover:bg-gray-50 dark:hover:bg-gray-700 flex items-center justify-between"
                                 >
                                   <span className="text-sm text-gray-700 dark:text-gray-200 font-medium">
-                                    {member.username}
+                                    {member.identityAlias ?? member.username}
                                   </span>
                                   <span className={`px-2 py-0.5 text-xs font-semibold rounded ${ROLE_COLORS[member.role] || 'bg-gray-100 text-gray-600'}`}>
                                     {member.role}

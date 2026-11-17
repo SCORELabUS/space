@@ -6,17 +6,12 @@ import UsersList from '@/components/users/UsersList';
 import AddUserModal from '@/components/users/AddUserModal';
 import { getUsers } from '@/api/users/usersApi';
 
-// Tipado para usuario
-interface UserEntry {
-  username: string;
-  apiKey: string;
-  role: 'ADMIN' | 'USER';
-}
+import type { User } from '@/types/User';
 
 export default function UsersPage() {
   const { user, isAuthenticated, config } = useAuth();
   const localAccounts = config.provider === 'local';
-  const [users, setUsers] = useState<UserEntry[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
   const [totalUsers, setTotalUsers] = useState(0);
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState<{

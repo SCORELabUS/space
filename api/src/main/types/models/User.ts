@@ -7,4 +7,6 @@ export interface LeanUser {
   apiKey: string;
   role: UserRole;
   orgRole?: string;
+  displayName?: string;
+  identityAlias?: string;
 }

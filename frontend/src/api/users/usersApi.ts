@@ -1,4 +1,5 @@
 import axios from "@/lib/axios";
+import type { User } from "@/types/User";
 
 const DEFAULT_TIMEOUT = 5000;
 
@@ -24,7 +25,7 @@ export async function getUsers(
   offset: number = 0,
   limit: number = 10,
   query: string = ''
-): Promise<{ data: Array<{ username: string; apiKey: string; role: 'ADMIN' | 'USER' }>; pagination: { offset: number; limit: number; total: number; page: number; pages: number } }> {
+): Promise<{ data: User[]; pagination: { offset: number; limit: number; total: number; page: number; pages: number } }> {
   return axios
     .get('/users', {
       params: { offset, limit, q: query },
@@ -155,7 +156,7 @@ export async function registerUser(user: { username: string; password: string })
     });
 }
 
-export async function searchUsers(apiKey: string, query: string, limit: number = 10): Promise<{ data: Array<{ username: string; role: string }>; pagination: {offset: number, total: number, limit: number, page: number, pages: number} }> {
+export async function searchUsers(apiKey: string, query: string, limit: number = 10): Promise<{ data: Array<Pick<User, 'username' | 'identityAlias'> & { role?: string }>; pagination: {offset: number, total: number, limit: number, page: number, pages: number} }> {
   return axios
     .get('/users', {
       params: { q: query, limit },

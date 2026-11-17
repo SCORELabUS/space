@@ -228,7 +228,7 @@ export default function OrganizationSettingsPage() {
               Owner
             </label>
             <div className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-gray-50 dark:bg-gray-700 text-gray-700 dark:text-gray-300">
-              {organization.owner}
+              {(organization.owner === user.username ? user.identityAlias ?? organization.ownerAlias : organization.ownerAlias) ?? organization.owner}
               {organization.owner === user?.username && (
                 <span className="ml-2 inline-block px-2 py-1 bg-indigo-100 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-400 text-xs rounded font-medium">
                   You
@@ -273,7 +273,7 @@ export default function OrganizationSettingsPage() {
                   <option value="">Select a member...</option>
                   {organization.members.map(member => (
                     <option key={member.username} value={member.username}>
-                      {member.username} ({member.role})
+                      {member.identityAlias ?? member.username} ({member.role})
                     </option>
                   ))}
                 </select>
@@ -334,12 +334,12 @@ export default function OrganizationSettingsPage() {
                 <div className="flex items-center gap-3">
                   <div className="w-10 h-10 rounded-full bg-indigo-100 dark:bg-indigo-900/30 flex items-center justify-center">
                     <span className="text-indigo-600 dark:text-indigo-400 font-bold text-sm">
-                      {member.username.charAt(0).toUpperCase()}
+                      {(member.identityAlias ?? member.username).charAt(0).toUpperCase()}
                     </span>
                   </div>
                   <div>
                     <p className="text-sm font-medium text-gray-900 dark:text-gray-100">
-                      {member.username}
+                      {member.identityAlias ?? member.username}
                     </p>
                     <p className="text-xs text-gray-600 dark:text-gray-400">
                       {member.role}

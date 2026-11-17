@@ -9,8 +9,13 @@ In SCORETech Identity, register a confidential backend application for SPACE
 with the authorization code flow and S256 PKCE. Set its exact callback to
 `https://space.example.com/api/v1/auth/identity/callback` and configure any
 application access requirements there. Include the OIDC `email` client scope
-with `email` and `email_verified` in the ID token. SPACE assigns its own roles
-and organization permissions.
+with `email` and `email_verified` in the ID token, plus the OIDC `profile` scope.
+Deploy the SCORETech provider with its updated authentication-policy mapper.
+On the SPACE OIDC client set the Keycloak client attribute
+`scoretech.shared-display-name` to the string `true` to receive
+`scoretech_display_name` on issuance and renewal. SPACE shows it in
+the sidebar and picks up edits during session renewal. SPACE assigns its own
+roles and organization permissions.
 
 ## Production Compose
 
@@ -67,7 +72,13 @@ prefix) reports `provider: scoretech`.
 In SCORETech mode, users sign in and register through SCORETech Identity.
 After a successful first sign-in with a verified email, SPACE creates its
 internal profile and default organization. The profile has a generated
-username and no SPACE password. SPACE keeps the email private.
+username based on the part of the email before `@`, with a suffix when
+necessary to keep usernames unique, and no SPACE password. Existing
+usernames remain the keys for organizations and contracts. The sidebar and member directory show the current SCORETech username for
+every linked account. Change the sign-in address in SCORETech and verify it
+there; SPACE updates the username on the next successful session renewal. The
+part before `@` is the visible username and may be shared by accounts from
+different domains. Directory searches also accept the stable SPACE reference.
 
 SPACE checks for existing profiles by their stored SCORETech email or by a
 legacy username that matches the email, ignoring case. For legacy accounts

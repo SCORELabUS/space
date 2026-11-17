@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { useLocation, useNavigate } from 'react-router';
+import { Link, useLocation, useNavigate } from 'react-router';
 import useAuth from '@/hooks/useAuth';
 import { FiHome, FiUsers, FiServer, FiSettings, FiChevronRight, FiKey, FiActivity, FiUser, FiLayers } from 'react-icons/fi';
 import { AiOutlineDashboard } from 'react-icons/ai';
@@ -47,7 +47,11 @@ export default function Sidebar({
   collapsed,
   setCollapsed,
 }: SidebarProps) {
-  const { user } = useAuth();
+  const { user, config } = useAuth();
+  const usesIdentity = config.provider === 'scoretech';
+  const handle = user.identityAlias || user.username;
+  const profileName = user.displayName || handle;
+  const initials = profileName.trim().split(/\s+/).slice(0, 2).map(part => Array.from(part)[0]).join('').toLocaleUpperCase();
   const location = useLocation();
   const navigate = useNavigate();
   const selected = getSelectedTab(location.pathname);
@@ -77,7 +81,7 @@ export default function Sidebar({
       <div className="flex flex-col items-center py-6 px-4">
         <div className="w-full flex items-center justify-between">
           <div className="text-xs text-gray-500 font-semibold uppercase tracking-widest dark:text-gray-300">
-            {collapsed ? '' : `Welcome, ${user?.username ?? 'Anonymous'}`}
+            {collapsed || usesIdentity ? '' : `Welcome, ${user?.username ?? 'Anonymous'}`}
           </div>
           <button
             className="ml-2 p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 transition cursor-pointer"
@@ -195,9 +199,34 @@ export default function Sidebar({
           </>
         )}
       </nav>
-      <div className="flex-0 p-4 text-xs text-gray-400 mt-auto text-center">
-        {!collapsed && <span>SPACE &copy; {new Date().getFullYear()}</span>}
-      </div>
+      {usesIdentity ? (
+        <div className="mt-auto shrink-0 border-t border-gray-200 p-2 dark:border-gray-800">
+          <Link
+            to="/settings"
+            aria-label={`Profile settings for ${profileName}`}
+            className={`flex min-h-12 cursor-pointer items-center gap-3 rounded-lg hover:bg-indigo-100 focus-visible:outline-2 focus-visible:outline-indigo-500 dark:hover:bg-gray-800 ${collapsed ? 'justify-center' : 'px-2'}`}
+          >
+            <span aria-hidden="true" className="grid size-9 shrink-0 place-items-center rounded-lg bg-indigo-100 text-xs font-bold text-indigo-800 dark:bg-indigo-950 dark:text-indigo-200">
+              {initials || <FiUser size={17} />}
+            </span>
+            {!collapsed && (
+              <>
+                <span className="min-w-0 flex-1">
+                  <strong title={profileName} className="block truncate text-sm text-gray-900 dark:text-gray-100">{profileName}</strong>
+                  <small className="block truncate text-xs text-gray-600 dark:text-gray-300">
+                    {user.displayName && user.displayName !== handle ? '@' + handle : 'SCORETech Identity'}
+                  </small>
+                </span>
+                <FiChevronRight aria-hidden="true" className="shrink-0 text-gray-500 dark:text-gray-400" size={17} />
+              </>
+            )}
+          </Link>
+        </div>
+      ) : (
+        <div className="flex-0 p-4 text-xs text-gray-400 mt-auto text-center">
+          {!collapsed && <span>SPACE &copy; {new Date().getFullYear()}</span>}
+        </div>
+      )}
     </motion.aside>
   );
 }
